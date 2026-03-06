@@ -1,0 +1,16 @@
+# Build outputs
+applet/cap/*.cap
+applet/cap/*.jca
+build/
+.gradle/
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Secrets
+*.key
+*.pem
+*.p12
