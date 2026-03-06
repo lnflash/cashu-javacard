@@ -12,10 +12,11 @@ This NUT defines a protocol for storing and spending Cashu `Proof`s on physical 
 
 Two card profiles are defined to accommodate different chip capabilities and deployment contexts:
 
-- **Profile A** — Reference (online): server-side balance, hardware AES authentication, BoltCard-compatible
 - **Profile B** — Bearer (offline): on-card proof storage, hardware secp256k1 signing, internet-optional
+- **Profile A** — Reference (online): server-side balance, hardware AES authentication, BoltCard-compatible *(informal — community contributions welcome)*
+- **Profile B+** — Bearer with PIN-gated spending: Profile B variant with optional PIN enforcement on `SPEND_PROOF`
 
-This document specifies **Profile B**. Profile A is referenced informally for completeness.
+This document fully specifies **Profile B** and briefly describes Profile B+ as a variant. Profile A is referenced informally.
 
 ---
 
@@ -52,7 +53,9 @@ This enables:
 | Double-spend prevention | Server-side |
 | Reference | [cashubtc/Numo](https://github.com/cashubtc/Numo) |
 
-Profile A is not further specified here. See [cashubtc/Numo](https://github.com/cashubtc/Numo) for the reference implementation.
+Profile A is not formally specified here. The [cashubtc/Numo](https://github.com/cashubtc/Numo) project provides a working Profile A implementation for Android.
+
+> **Community contribution welcome**: A formal Profile A spec (AES CMAC authentication flow, server-side balance API, LNURL-withdraw compatibility) would be a valuable addition. If you are building on NTAG 424 DNA and want to contribute a Profile A spec, please open a PR or discussion.
 
 ---
 
@@ -111,6 +114,40 @@ proof = {
 ```
 
 The `secret` JSON MUST be serialized **without spaces** and with keys in the order shown above to ensure a consistent serialization for signing.
+
+### Concrete Example
+
+Given:
+- Card pubkey (`P_card`): `02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2`
+- Nonce (`x`): `916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e`
+- Keyset ID: `0059534ce0bfa19a` (8 bytes binary: `00 59 53 4c e0 bf a1 9a`)
+- Amount: `8` sats
+- Mint signature (`C`): `024a43eddcf0e42dad32ca5c0e82e51d7a38e7a48b80e89d2e17cc94abb02c04c3`
+
+The reconstructed `Proof.secret` is the following string (key order and no spaces are mandatory):
+
+```
+["P2PK",{"nonce":"916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e","data":"02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2","tags":[["sigflag","SIG_INPUTS"]]}]
+```
+
+The message sent to `SPEND_PROOF` is:
+
+```
+msg = SHA256("["P2PK",{"nonce":"916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e","data":"02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2","tags":[["sigflag","SIG_INPUTS"]]}]")
+    = SHA256(UTF8(Proof.secret))
+```
+
+After calling `SPEND_PROOF`, the reader assembles the full proof for mint redemption:
+
+```json
+{
+  "id": "0059534ce0bfa19a",
+  "amount": 8,
+  "secret": "[\"P2PK\",{\"nonce\":\"916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e\",\"data\":\"02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2\",\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]]}]",
+  "C": "024a43eddcf0e42dad32ca5c0e82e51d7a38e7a48b80e89d2e17cc94abb02c04c3",
+  "witness": "{\"signatures\":[\"<64-byte Schnorr signature from card hex-encoded>\"]}"
+}
+```
 
 ---
 
@@ -310,6 +347,26 @@ This is compatible with NUT-11 P2PK signature verification.
 
 ---
 
+## Profile B+ — Bearer with PIN-Gated Spending
+
+Profile B+ is a variant of Profile B in which `SPEND_PROOF` requires a valid PIN to have been presented in the current NFC session (via `VERIFY_PIN`) before the card will authorize a spend.
+
+This variant is suitable for higher-value cards where the issuer or user wants an additional factor beyond physical possession.
+
+**Changes from Profile B:**
+
+- `SPEND_PROOF` checks `pinVerifiedFlag` before signing; returns `6982 (SECURITY STATUS NOT SATISFIED)` if PIN not verified
+- Reader flow adds `VERIFY_PIN` step before Step 4 in the payment flow
+- Card MUST have a PIN set (`SET_PIN` called during provisioning)
+
+**Advertising Profile B+:**
+
+Cards running Profile B+ SHOULD set a capability flag in the `GET_INFO` response indicating PIN-gated spending is enforced. Readers MUST check this flag and prompt the user for their PIN before attempting `SPEND_PROOF`.
+
+**NUT scope:** Profile B+ is not formally specified in this NUT. Implementors are encouraged to propose a Profile B+ amendment or separate NUT once the base Profile B implementation is stable.
+
+---
+
 ## Security Model
 
 ### Threat: Physical card theft
@@ -406,19 +463,15 @@ Wallets or POS applications implementing NUT-XX MUST:
 
 The following design questions are open for community discussion:
 
-1. **Profile A formal spec**: Should Profile A (NTAG 424 / server-side balance) be specified in this NUT or a separate NUT?
+1. **Profile A formal spec**: Profile A (NTAG 424 / server-side balance) is informally referenced in this NUT. A full Profile A spec is deferred — community contributions welcome (see Profile A section above).
 
-2. **Denomination scheme**: Should the NUT mandate power-of-2 denominations for card proofs, or leave denomination selection to the provisioner?
+2. **Denomination scheme**: The NUT currently recommends (SHOULD) power-of-2 denominations. Should this be stronger (MUST)? Or is denomination selection best left entirely to the provisioner?
 
-3. **Change handling**: Should a formal change-return protocol be specified (e.g., the merchant returns change proofs to the card via a follow-up LOAD_PROOF session)?
+3. **Key derivation for recovery**: Should card keypairs be derivable from a BIP-39 seed for recovery? Currently, a lost or damaged card means lost funds — same as physical cash. Derivable keys would allow card replacement at the cost of requiring the user to manage a seed.
 
-4. **Key derivation for recovery**: Should card keypairs be derivable from a BIP-39 seed for card recovery? (Currently, loss of card = loss of funds for bearer cards.)
+4. **Multiple mints / keysets**: Should a single card support proofs from multiple mints simultaneously? The current design stores keyset IDs per proof, which technically allows it, but there is no discovery mechanism defined.
 
-5. **Multiple keysets**: Should a single card support proofs from multiple mints / keysets simultaneously?
-
-6. **PIN semantics**: Should PIN protection for `SPEND_PROOF` be an optional profile variant (Profile B+)?
-
-7. **Proof encoding**: Should the compact binary slot format be a formal encoding standard, or left to implementation?
+5. **Proof encoding standard**: Should the compact binary slot format (78 bytes) be formalized as a CBOR or TLV encoding, or remain an opaque implementation detail of the APDU interface?
 
 ---
 
