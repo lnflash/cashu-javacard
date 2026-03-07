@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  build.xml — ant-javacard build for CashuApplet.cap
+  ENG-182: GlobalPlatform packaging
+
+  Prerequisites:
+    1. Apache Ant  ≥ 1.10  (brew install ant)
+    2. ant-javacard plugin  (auto-downloaded by this script)
+    3. Java 11+  (required for ant-javacard itself; the cap targets JC 3.0.4)
+
+  Build:
+    ant cap            → applet/target/cashu-javacard-0.1.0.cap
+    ant cap-debug      → same but with debug info
+    ant verify         → run cap-lint checks (requires gp.jar on PATH)
+
+  Deploy (after build):
+    gp --install target/cashu-javacard-0.1.0.cap
+    gp --list
+
+  Reference:
+    https://github.com/martinpaljak/ant-javacard
+    https://github.com/martinpaljak/GlobalPlatformPro
+-->
+<project name="CashuJavaCard" default="cap" basedir=".">
+
+    <property name="ant.javacard.version" value="21.11.25"/>
+    <property name="src.dir"    value="src/main/java"/>
+    <property name="target.dir" value="target"/>
+    <property name="cap.file"   value="${target.dir}/cashu-javacard-0.1.0.cap"/>
+
+    <!-- ── Download ant-javacard plugin ───────────────────────────────── -->
+    <property name="ant.javacard.jar"
+              value="${user.home}/.ant/lib/ant-javacard-${ant.javacard.version}.jar"/>
+    <available file="${ant.javacard.jar}" property="ant.javacard.present"/>
+
+    <target name="download-plugin" unless="ant.javacard.present"
+            description="Download ant-javacard plugin if missing">
+        <mkdir dir="${user.home}/.ant/lib"/>
+        <get src="https://github.com/martinpaljak/ant-javacard/releases/download/${ant.javacard.version}/ant-javacard.jar"
+             dest="${ant.javacard.jar}"
+             verbose="true"
+             usetimestamp="true"/>
+    </target>
+
+    <!-- ── Register ant-javacard task ─────────────────────────────────── -->
+    <target name="setup" depends="download-plugin">
+        <taskdef name="javacard"
+                 classname="pro.javacard.ant.JavaCard"
+                 classpath="${ant.javacard.jar}"/>
+        <mkdir dir="${target.dir}"/>
+    </target>
+
+    <!-- ── Main cap build target ──────────────────────────────────────── -->
+    <!--
+      Targets JavaCard API 3.0.4 (Feitian JavaCard 3.0.4, NXP JCOP4).
+      ant-javacard auto-downloads the matching JCDK SDK if not present.
+
+      AID breakdown:
+        Package AID : D2 76 00 00 85 01 02      (7 bytes)
+        Applet  AID : D2 76 00 00 85 01 02 01   (8 bytes, package + 01)
+
+      The package AID is also the SELECT AID used by NFC readers.
+    -->
+    <target name="cap" depends="setup"
+            description="Build CashuApplet.cap (JavaCard 3.0.4)">
+        <javacard>
+            <cap
+                jckit="3.0.4"
+                sources="${src.dir}"
+                package="me.flashapp.cashu"
+                version="0.1"
+                aid="D2:76:00:00:85:01:02"
+                output="${cap.file}">
+                <applet class="me.flashapp.cashu.CashuApplet"
+                        aid="D2:76:00:00:85:01:02:01"/>
+            </cap>
+        </javacard>
+        <echo message="CAP file: ${cap.file}"/>
+    </target>
+
+    <!-- ── Debug cap (includes line-number table) ─────────────────────── -->
+    <target name="cap-debug" depends="setup"
+            description="Build CashuApplet.cap with debug symbols">
+        <javacard>
+            <cap
+                jckit="3.0.4"
+                sources="${src.dir}"
+                package="me.flashapp.cashu"
+                version="0.1"
+                aid="D2:76:00:00:85:01:02"
+                output="${target.dir}/cashu-javacard-0.1.0-debug.cap"
+                debug="true">
+                <applet class="me.flashapp.cashu.CashuApplet"
+                        aid="D2:76:00:00:85:01:02:01"/>
+            </cap>
+        </javacard>
+    </target>
+
+    <!-- ── Clean ──────────────────────────────────────────────────────── -->
+    <target name="clean" description="Remove build artefacts">
+        <delete dir="${target.dir}"/>
+    </target>
+
+    <!-- ── List installed applets (requires gp.jar on PATH) ──────────── -->
+    <target name="list" description="List applets on connected card (requires gp)">
+        <exec executable="gp" failonerror="true">
+            <arg value="--list"/>
+        </exec>
+    </target>
+
+    <!-- ── Install cap (requires gp.jar on PATH) ──────────────────────── -->
+    <target name="install" depends="cap" description="Install cap onto connected card">
+        <exec executable="gp" failonerror="true">
+            <arg value="--install"/>
+            <arg value="${cap.file}"/>
+        </exec>
+        <echo message="Installed. Use 'ant list' to verify."/>
+    </target>
+
+    <!-- ── Delete applet (for reinstall) ─────────────────────────────── -->
+    <target name="delete" description="Delete CashuApplet from connected card">
+        <exec executable="gp" failonerror="true">
+            <arg value="--delete"/>
+            <arg value="D276000085010201"/>
+        </exec>
+    </target>
+
+</project>

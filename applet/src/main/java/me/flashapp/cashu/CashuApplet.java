@@ -171,6 +171,17 @@ public class CashuApplet extends Applet {
     private ECPublicKey  cardPubKey;
 
     // -------------------------------------------------------------------------
+    // Hardware Schnorr engine (ENG-182)
+    //
+    // HARDWARE = true  → uses SchnorrHW (JavaCard-native, no BigInteger)
+    //                    Required for real .cap deployment.
+    // HARDWARE = false → uses signMessage() BigInteger simulation (jCardSim only)
+    //                    Set false for test builds / jCardSim.
+    // -------------------------------------------------------------------------
+    static final boolean HARDWARE = false; // ← flip to true for .cap build
+    private SchnorrHW schnorrHW;           // null when HARDWARE=false
+
+    // -------------------------------------------------------------------------
     // Transient state (RAM, cleared on deselect)
     // -------------------------------------------------------------------------
 
@@ -196,6 +207,12 @@ public class CashuApplet extends Applet {
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         scratch         = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
         initCardKeypair();
+
+        if (HARDWARE) {
+            schnorrHW = new SchnorrHW(SECP256K1_G, SECP256K1_P,
+                                      SECP256K1_A, SECP256K1_B, SECP256K1_N);
+            schnorrHW.init();
+        }
     }
 
     /**
@@ -386,7 +403,7 @@ public class CashuApplet extends Applet {
         // attacker from aborting the transaction to reset the spent flag.
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
 
-        short sigLen = signMessage(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
+        short sigLen = doSign(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
 
@@ -395,7 +412,7 @@ public class CashuApplet extends Applet {
         short msgLen = apdu.setIncomingAndReceive();
         if (msgLen != (short) 32) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
-        short sigLen = signMessage(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
+        short sigLen = doSign(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
 
@@ -543,16 +560,33 @@ public class CashuApplet extends Applet {
     }
 
     // -------------------------------------------------------------------------
-    // Crypto — BIP-340 Schnorr signature
+    // Signing dispatch — hardware vs. simulation
+    // -------------------------------------------------------------------------
+
+    /**
+     * Route BIP-340 signing to hardware (SchnorrHW) or JVM simulation.
+     * HARDWARE flag controls which path is compiled active.
+     */
+    private short doSign(byte[] msg, short msgOff, short msgLen,
+                         byte[] out, short outOff) {
+        if (HARDWARE) {
+            // Hardware path: JavaCard-native crypto, no BigInteger.
+            // SchnorrHW uses ALG_EC_SVDP_DH_PLAIN_XY + int[] modular arithmetic.
+            return schnorrHW.sign(cardPrivKey, cardPubKey, msg, msgOff, out, outOff);
+        } else {
+            // Simulation path: BigInteger-based, correct on JVM / jCardSim.
+            return signMessage(msg, msgOff, msgLen, out, outOff);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Crypto — BIP-340 Schnorr signature (SIMULATION — JVM / jCardSim only)
     //
-    // ⚠️  SIMULATION ONLY — uses java.math.BigInteger and java.security.MessageDigest
-    // which are NOT available in the real JavaCard class library.
+    // ⚠️  Uses java.math.BigInteger, java.security.MessageDigest, java.util.Arrays,
+    // and System.arraycopy — NONE of which are available in the JavaCard runtime.
     //
     // This implementation is correct for jCardSim testing on the JVM.
-    // For hardware deployment (ENG-182), replace signMessage() with:
-    //   1. ALG_EC_SVDP_DH_PLAIN_XY to compute k*G via the crypto coprocessor
-    //   2. Manual 256-bit modular addition/multiplication for s = k + e*d mod n
-    //      using JavaCard Util and the coprocessor's modular exponentiation
+    // For hardware deployment: HARDWARE=true routes through SchnorrHW instead.
     // -------------------------------------------------------------------------
 
     /**
