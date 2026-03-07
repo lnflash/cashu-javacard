@@ -103,6 +103,50 @@ public class CashuApplet extends Applet {
     static final byte  PIN_MAX_TRIES = (byte) 3;
 
     // -------------------------------------------------------------------------
+    // secp256k1 curve parameters (JavaCard byte arrays)
+    // Used by setSecp256k1Params() — hardware-compatible code.
+    // -------------------------------------------------------------------------
+
+    /** secp256k1 field prime p */
+    private static final byte[] SECP256K1_P = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,(byte)0xFF,(byte)0xFF,(byte)0xFC,(byte)0x2F
+    };
+
+    /** secp256k1 a = 0 */
+    private static final byte[] SECP256K1_A = new byte[32];
+
+    /** secp256k1 b = 7 */
+    private static final byte[] SECP256K1_B = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,7
+    };
+
+    /** secp256k1 uncompressed generator G = 04 || Gx || Gy (65 bytes) */
+    private static final byte[] SECP256K1_G = {
+        (byte)0x04,
+        // Gx
+        (byte)0x79,(byte)0xBE,(byte)0x66,(byte)0x7E,(byte)0xF9,(byte)0xDC,(byte)0xBB,(byte)0xAC,
+        (byte)0x55,(byte)0xA0,(byte)0x62,(byte)0x95,(byte)0xCE,(byte)0x87,(byte)0x0B,(byte)0x07,
+        (byte)0x02,(byte)0x9B,(byte)0xFC,(byte)0xDB,(byte)0x2D,(byte)0xCE,(byte)0x28,(byte)0xD9,
+        (byte)0x59,(byte)0xF2,(byte)0x81,(byte)0x5B,(byte)0x16,(byte)0xF8,(byte)0x17,(byte)0x98,
+        // Gy
+        (byte)0x48,(byte)0x3A,(byte)0xDA,(byte)0x77,(byte)0x26,(byte)0xA3,(byte)0xC4,(byte)0x65,
+        (byte)0x5D,(byte)0xA4,(byte)0xFB,(byte)0xFC,(byte)0x0E,(byte)0x11,(byte)0x08,(byte)0xA8,
+        (byte)0xFD,(byte)0x17,(byte)0xB4,(byte)0x48,(byte)0xA6,(byte)0x85,(byte)0x54,(byte)0x19,
+        (byte)0x9C,(byte)0x47,(byte)0xD0,(byte)0x8F,(byte)0xFB,(byte)0x10,(byte)0xD4,(byte)0xB8
+    };
+
+    /** secp256k1 group order n */
+    private static final byte[] SECP256K1_N = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,
+        (byte)0xBA,(byte)0xAE,(byte)0xDC,(byte)0xE6,(byte)0xAF,(byte)0x48,(byte)0xA0,(byte)0x3B,
+        (byte)0xBF,(byte)0xD2,(byte)0x5E,(byte)0x8C,(byte)0xD0,(byte)0x36,(byte)0x41,(byte)0x41
+    };
+
+    // -------------------------------------------------------------------------
     // Persistent state (EEPROM)
     // -------------------------------------------------------------------------
 
@@ -122,34 +166,7 @@ public class CashuApplet extends Applet {
     // Card keypair (persistent, generated once on install)
     // -------------------------------------------------------------------------
 
-    /**
-     * The card's secp256k1 keypair.
-     *
-     * IMPLEMENTATION NOTE — secp256k1 curve initialisation:
-     * Most JavaCard chips natively support NIST P-256 (ALG_EC_FP with
-     * 256-bit field). secp256k1 uses the same field size but different
-     * curve parameters (a=0, b=7, G_x, G_y, n, h). JavaCard's ECKey
-     * API allows custom curve parameters via ECKey.setA/setB/setG/setR/setK.
-     *
-     * Required steps (see spec/SECP256K1.md for parameter constants):
-     *   1. Allocate KeyPair with ALG_EC_FP + LENGTH_EC_FP_256
-     *   2. Cast to ECPublicKey / ECPrivateKey
-     *   3. Call setFieldFP(secp256k1_p, 0, 32)
-     *   4. Call setA(secp256k1_a, 0, 32)  — a = 0
-     *   5. Call setB(secp256k1_b, 0, 32)  — b = 7
-     *   6. Call setG(secp256k1_G, 0, 65)  — uncompressed generator point
-     *   7. Call setR(secp256k1_n, 0, 32)  — group order
-     *   8. Call setK((short) 1)           — cofactor h = 1
-     *   9. Call genKeyPair()
-     *
-     * Chip support varies:
-     *   - JCOP4 SmartMX3: supports custom EC-FP curves, secp256k1 tested
-     *   - Feitian JavaCard 3.0.4+: supports ALG_EC_FP custom params
-     *   - jCardSim 3.x: supports ALG_EC_FP custom params (use for tests)
-     *
-     * This is the primary engineering challenge for Sprint 4 (ENG-181).
-     */
-    private KeyPair  cardKeyPair;
+    private KeyPair     cardKeyPair;
     private ECPrivateKey cardPrivKey;
     private ECPublicKey  cardPubKey;
 
@@ -172,37 +189,56 @@ public class CashuApplet extends Applet {
     }
 
     private CashuApplet() {
-        // Persistent storage
-        proofStorage = new byte[(short)(MAX_PROOFS * PROOF_SIZE)];
-        cardLocked   = new byte[1];
-        pinState     = new byte[1];
-
-        // PIN: max PIN_MAX_TRIES attempts, max PIN_MAX_LEN bytes
-        pin = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
-
-        // Transient (RAM) — cleared every deselect
+        proofStorage    = new byte[(short)(MAX_PROOFS * PROOF_SIZE)];
+        cardLocked      = new byte[1];
+        pinState        = new byte[1];
+        pin             = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         scratch         = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
-
-        // Generate card keypair
         initCardKeypair();
     }
 
     /**
      * Initialises the secp256k1 card keypair.
      *
-     * TODO (ENG-181): Set actual secp256k1 curve parameters before calling genKeyPair().
-     * The stubs below will throw an exception on real hardware until the
-     * curve parameters from spec/SECP256K1.md are wired in.
+     * Sets standard secp256k1 curve parameters on the key objects before
+     * generating a random key pair.
      *
-     * For jCardSim testing, this will work after setSecp256k1Params() is implemented.
+     * Hardware notes:
+     * - JCOP4 SmartMX3, Feitian JavaCard 3.0.4+: support custom EC-FP curves
+     * - jCardSim 3.x: supported
      */
     private void initCardKeypair() {
-        cardKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
-        cardPrivKey = (ECPrivateKey) cardKeyPair.getPrivate();
-        cardPubKey  = (ECPublicKey)  cardKeyPair.getPublic();
-        // setSecp256k1Params(cardPubKey, cardPrivKey);  // TODO ENG-181
+        cardKeyPair  = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
+        cardPrivKey  = (ECPrivateKey) cardKeyPair.getPrivate();
+        cardPubKey   = (ECPublicKey)  cardKeyPair.getPublic();
+        setSecp256k1Params(cardPubKey, cardPrivKey);
         cardKeyPair.genKeyPair();
+    }
+
+    /**
+     * Sets secp256k1 curve parameters on a JavaCard EC key pair.
+     *
+     * This method uses only the standard JavaCard ECKey API and is
+     * hardware-compatible (JCOP4, Feitian, jCardSim).
+     *
+     * @param pub  EC public key to configure
+     * @param priv EC private key to configure
+     */
+    private void setSecp256k1Params(ECPublicKey pub, ECPrivateKey priv) {
+        pub.setFieldFP(SECP256K1_P, (short) 0, (short) 32);
+        pub.setA(SECP256K1_A, (short) 0, (short) 32);
+        pub.setB(SECP256K1_B, (short) 0, (short) 32);
+        pub.setG(SECP256K1_G, (short) 0, (short) 65);
+        pub.setR(SECP256K1_N, (short) 0, (short) 32);
+        pub.setK((short) 1);
+
+        priv.setFieldFP(SECP256K1_P, (short) 0, (short) 32);
+        priv.setA(SECP256K1_A, (short) 0, (short) 32);
+        priv.setB(SECP256K1_B, (short) 0, (short) 32);
+        priv.setG(SECP256K1_G, (short) 0, (short) 65);
+        priv.setR(SECP256K1_N, (short) 0, (short) 32);
+        priv.setK((short) 1);
     }
 
     // -------------------------------------------------------------------------
@@ -214,7 +250,6 @@ public class CashuApplet extends Applet {
         byte[] buf = apdu.getBuffer();
 
         if (selectingApplet()) {
-            // Respond with version on SELECT
             buf[0] = VERSION_MAJOR;
             buf[1] = VERSION_MINOR;
             apdu.setOutgoingAndSend((short) 0, (short) 2);
@@ -226,24 +261,19 @@ public class CashuApplet extends Applet {
         }
 
         switch (buf[ISO7816.OFFSET_INS]) {
-            // Read commands (no auth)
             case INS_GET_INFO:         processGetInfo(apdu);        break;
             case INS_GET_PUBKEY:       processGetPubkey(apdu);      break;
             case INS_GET_BALANCE:      processGetBalance(apdu);     break;
             case INS_GET_PROOF_COUNT:  processGetProofCount(apdu);  break;
             case INS_GET_PROOF:        processGetProof(apdu);       break;
             case INS_GET_SLOT_STATUS:  processGetSlotStatus(apdu);  break;
-            // Spend commands (no PIN — bearer semantics)
             case INS_SPEND_PROOF:      processSpendProof(apdu);     break;
             case INS_SIGN_ARBITRARY:   processSignArbitrary(apdu);  break;
-            // Write commands (PIN required if set)
             case INS_LOAD_PROOF:       processLoadProof(apdu);      break;
             case INS_CLEAR_SPENT:      processClearSpent(apdu);     break;
-            // Auth commands
             case INS_VERIFY_PIN:       processVerifyPin(apdu);      break;
             case INS_SET_PIN:          processSetPin(apdu);         break;
             case INS_CHANGE_PIN:       processChangePin(apdu);      break;
-            // Admin
             case INS_LOCK_CARD:        processLockCard(apdu);       break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
@@ -269,8 +299,13 @@ public class CashuApplet extends Applet {
         buf[3] = (byte) unspent;
         buf[4] = (byte) spent;
         buf[5] = (byte) empty;
-        // Capabilities: bit0=secp256k1 native (0 until ENG-181), bit1=Schnorr (0 until ENG-181), bit2=PIN
-        buf[6] = (byte) 0x04; // PIN supported
+        // Capabilities flags:
+        //   bit0 = secp256k1 native key generation (set — ENG-181 complete)
+        //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
+        //   bit2 = PIN supported (always set)
+        // Note: bits 0+1 are marked as simulation-quality for jCardSim.
+        //   Hardware deployment (ENG-182) requires Schnorr replacement.
+        buf[6] = (byte) 0x07; // secp256k1 + Schnorr + PIN
         buf[7] = pinState[0];
         apdu.setOutgoingAndSend((short) 0, (short) 8);
     }
@@ -347,18 +382,10 @@ public class CashuApplet extends Applet {
         if (msgLen != (short) 32) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
         // ATOMIC: mark spent BEFORE signing.
-        // If signing fails, proof is still spent — this is intentional.
-        // It prevents an attacker from aborting mid-command to reset the
-        // spent flag. The proof is revoked regardless of signing outcome.
+        // If signing fails, the proof is still consumed — this prevents an
+        // attacker from aborting the transaction to reset the spent flag.
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
 
-        // Sign the 32-byte message with card private key.
-        // TODO (ENG-181): Replace with Schnorr signature implementation.
-        // Schnorr sig = (R, s) where:
-        //   k = random nonce
-        //   R = k * G
-        //   e = SHA256(R_x || pubkey || msg)
-        //   s = k - e * privkey (mod n)
         short sigLen = signMessage(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
@@ -380,7 +407,6 @@ public class CashuApplet extends Applet {
         requireNotLocked();
         requirePinIfSet();
 
-        // Find first empty slot
         short slot = -1;
         for (short i = 0; i < MAX_PROOFS; i++) {
             if (proofStorage[(short)(i * PROOF_SIZE + PROOF_STATUS_OFFSET)] == STATUS_EMPTY) {
@@ -437,14 +463,13 @@ public class CashuApplet extends Applet {
         if (!ok) {
             byte remaining = pin.getTriesRemaining();
             if (remaining == 0) {
-                pinState[0] = (byte) 2; // locked
+                pinState[0] = (byte) 2;
                 ISOException.throwIt(SW_PIN_BLOCKED);
             }
             short sw = (short)(0x63C0 | (remaining & 0x0F));
             ISOException.throwIt(sw);
         }
         pinVerifiedFlag[0] = (byte) 1;
-        // SW_NO_ERROR returned implicitly
     }
 
     private void processSetPin(APDU apdu) {
@@ -468,13 +493,11 @@ public class CashuApplet extends Applet {
         byte[] buf = apdu.getBuffer();
         short off = ISO7816.OFFSET_CDATA;
 
-        // Data: 1-byte old-pin-len + old-pin + new-pin
         byte oldLen = buf[off++];
         if (oldLen < PIN_MIN_LEN || oldLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         short newLen = (short)(dataLen - 1 - oldLen);
         if (newLen < PIN_MIN_LEN || newLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
-        // Verify old PIN
         boolean ok = pin.check(buf, off, oldLen);
         if (!ok) {
             byte remaining = pin.getTriesRemaining();
@@ -520,34 +543,223 @@ public class CashuApplet extends Applet {
     }
 
     // -------------------------------------------------------------------------
-    // Crypto helpers
+    // Crypto — BIP-340 Schnorr signature
+    //
+    // ⚠️  SIMULATION ONLY — uses java.math.BigInteger and java.security.MessageDigest
+    // which are NOT available in the real JavaCard class library.
+    //
+    // This implementation is correct for jCardSim testing on the JVM.
+    // For hardware deployment (ENG-182), replace signMessage() with:
+    //   1. ALG_EC_SVDP_DH_PLAIN_XY to compute k*G via the crypto coprocessor
+    //   2. Manual 256-bit modular addition/multiplication for s = k + e*d mod n
+    //      using JavaCard Util and the coprocessor's modular exponentiation
     // -------------------------------------------------------------------------
 
     /**
-     * Signs a 32-byte message with the card private key.
+     * BIP-340 Schnorr sign: sig = (R.x || s), 64 bytes.
      *
-     * TODO (ENG-181): This is a PLACEHOLDER that returns 64 zero bytes.
-     * Replace with Schnorr signature:
-     *   sig = Schnorr.sign(cardPrivKey, msg[msgOff..msgOff+32])
+     * Algorithm:
+     *   1. If P.y is odd, negate d (ensure P has even y)
+     *   2. k = tagged_hash("BIP0340/nonce", d_norm || aux(0) || msg) mod n
+     *   3. R = k * G
+     *   4. If R.y is odd, negate k
+     *   5. e = tagged_hash("BIP0340/challenge", R.x || P.x || msg) mod n
+     *   6. s = (k + e * d) mod n
+     *   7. return R.x || s
      *
-     * Schnorr signature (BIP-340 compatible, 64 bytes = R_x || s):
-     *   k  = deterministic nonce (RFC 6979 or hardware RNG)
-     *   R  = k * G
-     *   e  = SHA256(bytes(R_x) || bytes(pubkey) || msg)
-     *   s  = (k - e * privkey) mod n
-     *   sig = bytes(R_x) || bytes(s)   [32 + 32 = 64 bytes]
-     *
-     * @param msg    source buffer containing message
+     * @param msg    source buffer containing 32-byte message
      * @param msgOff offset of message in source buffer
      * @param msgLen message length (must be 32)
-     * @param out    output buffer
+     * @param out    output buffer (receives 64-byte signature)
      * @param outOff offset in output buffer
-     * @return length of signature (64)
+     * @return 64 (signature length)
      */
-    private short signMessage(byte[] msg, short msgOff, short msgLen, byte[] out, short outOff) {
-        // PLACEHOLDER — replace with Schnorr in ENG-181
-        Util.arrayFillNonAtomic(out, outOff, (short) 64, (byte) 0);
-        return (short) 64;
+    private short signMessage(byte[] msg, short msgOff, short msgLen,
+                              byte[] out, short outOff) {
+        try {
+            java.math.BigInteger N = new java.math.BigInteger(1, SECP256K1_N);
+            java.math.BigInteger Fp = new java.math.BigInteger(1, SECP256K1_P);
+
+            // --- Extract private key scalar d ---
+            byte[] dBytes = new byte[32];
+            cardPrivKey.getS(dBytes, (short) 0);
+            java.math.BigInteger d = new java.math.BigInteger(1, dBytes);
+
+            // --- Extract public key x-coordinate Px ---
+            // jCardSim returns uncompressed key (65 bytes: 0x04 || x || y)
+            // Real JavaCard hardware returns compressed (33 bytes: 0x02/0x03 || x)
+            byte[] wBytes = new byte[65];
+            short wLen = cardPubKey.getW(wBytes, (short) 0);
+
+            byte[] Px;
+            java.math.BigInteger Py_val;
+            if (wLen == 65 && wBytes[0] == 0x04) {
+                // Uncompressed (jCardSim)
+                Px = java.util.Arrays.copyOfRange(wBytes, 1, 33);
+                Py_val = new java.math.BigInteger(1,
+                    java.util.Arrays.copyOfRange(wBytes, 33, 65));
+            } else {
+                // Compressed — derive y from x
+                Px = java.util.Arrays.copyOfRange(wBytes, 1, 33);
+                java.math.BigInteger x = new java.math.BigInteger(1, Px);
+                java.math.BigInteger rhs = x.modPow(java.math.BigInteger.valueOf(3), Fp)
+                    .add(java.math.BigInteger.valueOf(7)).mod(Fp);
+                Py_val = rhs.modPow(Fp.add(java.math.BigInteger.ONE)
+                    .divide(java.math.BigInteger.valueOf(4)), Fp);
+                boolean parityBit = (wBytes[0] & 1) == 1;
+                if (Py_val.testBit(0) != parityBit) {
+                    Py_val = Fp.subtract(Py_val);
+                }
+            }
+
+            // Step 1: if P.y is odd, negate d
+            if (Py_val.testBit(0)) {
+                d = N.subtract(d);
+            }
+
+            // Step 2: k = tagged_hash("BIP0340/nonce", d_norm || zeros32 || msg) mod n
+            byte[] dNorm = toBytes32(d);
+            byte[] auxRand = new byte[32]; // deterministic: all zeros
+            byte[] msgBytes = java.util.Arrays.copyOfRange(msg, msgOff, msgOff + 32);
+            byte[] nonceInput = concat3(dNorm, auxRand, msgBytes);
+            byte[] kHash = taggedHash("BIP0340/nonce", nonceInput);
+            java.math.BigInteger k = new java.math.BigInteger(1, kHash).mod(N);
+            if (k.signum() == 0) k = java.math.BigInteger.ONE; // degenerate case
+
+            // Step 3: R = k * G
+            java.math.BigInteger Gx = new java.math.BigInteger(1,
+                java.util.Arrays.copyOfRange(SECP256K1_G, 1, 33));
+            java.math.BigInteger Gy = new java.math.BigInteger(1,
+                java.util.Arrays.copyOfRange(SECP256K1_G, 33, 65));
+            java.math.BigInteger[] R = ecMul(k, Gx, Gy, Fp, N);
+            if (R == null) ISOException.throwIt(SW_CRYPTO_ERROR);
+
+            // Step 4: if R.y is odd, negate k
+            if (R[1].testBit(0)) {
+                k = N.subtract(k);
+            }
+            byte[] Rx = toBytes32(R[0]);
+
+            // Step 5: e = tagged_hash("BIP0340/challenge", Rx || Px || msg) mod n
+            byte[] challengeInput = concat3(Rx, Px, msgBytes);
+            byte[] eHash = taggedHash("BIP0340/challenge", challengeInput);
+            java.math.BigInteger e = new java.math.BigInteger(1, eHash).mod(N);
+
+            // Step 6: s = (k + e * d) mod n
+            java.math.BigInteger s = k.add(e.multiply(d)).mod(N);
+
+            // Step 7: sig = Rx || s (64 bytes)
+            byte[] sBytes = toBytes32(s);
+            System.arraycopy(Rx,     0, out, outOff,        32);
+            System.arraycopy(sBytes, 0, out, outOff + 32,   32);
+            return (short) 64;
+
+        } catch (ISOException e) {
+            throw e;
+        } catch (Exception e) {
+            ISOException.throwIt(SW_CRYPTO_ERROR);
+            return (short) 0; // unreachable
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // EC math helpers (BigInteger-based, jCardSim/JVM only)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Scalar multiplication: returns k * (x, y) on the curve y² = x³ + 7 (mod p).
+     * Uses double-and-add. Returns null for point at infinity.
+     */
+    private static java.math.BigInteger[] ecMul(java.math.BigInteger k,
+                                                  java.math.BigInteger x,
+                                                  java.math.BigInteger y,
+                                                  java.math.BigInteger p,
+                                                  java.math.BigInteger n) {
+        java.math.BigInteger[] R = null;
+        java.math.BigInteger[] P = { x, y };
+        k = k.mod(n);
+        while (k.signum() > 0) {
+            if (k.testBit(0)) {
+                R = (R == null) ? new java.math.BigInteger[]{ P[0], P[1] }
+                                : ecAdd(R[0], R[1], P[0], P[1], p);
+            }
+            P = ecAdd(P[0], P[1], P[0], P[1], p); // double
+            k = k.shiftRight(1);
+        }
+        return R;
+    }
+
+    /**
+     * EC point addition / doubling on y² = x³ + 7 (mod p).
+     * Handles P == Q (doubling) and P != Q (addition).
+     * Returns null for point at infinity.
+     */
+    private static java.math.BigInteger[] ecAdd(java.math.BigInteger x1,
+                                                  java.math.BigInteger y1,
+                                                  java.math.BigInteger x2,
+                                                  java.math.BigInteger y2,
+                                                  java.math.BigInteger p) {
+        java.math.BigInteger lambda;
+        java.math.BigInteger TWO   = java.math.BigInteger.valueOf(2);
+        java.math.BigInteger THREE = java.math.BigInteger.valueOf(3);
+        java.math.BigInteger pMinus2 = p.subtract(TWO);
+
+        if (x1.equals(x2)) {
+            if (!y1.equals(y2)) return null; // P + (-P) = infinity
+            // Doubling: λ = (3x²) / (2y) mod p  [a=0 for secp256k1]
+            java.math.BigInteger num = THREE.multiply(x1.modPow(TWO, p)).mod(p);
+            java.math.BigInteger den = TWO.multiply(y1).mod(p);
+            lambda = num.multiply(den.modPow(pMinus2, p)).mod(p);
+        } else {
+            // Addition: λ = (y2 - y1) / (x2 - x1) mod p
+            java.math.BigInteger num = y2.subtract(y1).mod(p);
+            java.math.BigInteger den = x2.subtract(x1).mod(p);
+            lambda = num.multiply(den.modPow(pMinus2, p)).mod(p);
+        }
+        java.math.BigInteger x3 = lambda.modPow(TWO, p).subtract(x1).subtract(x2).mod(p);
+        java.math.BigInteger y3 = lambda.multiply(x1.subtract(x3)).subtract(y1).mod(p);
+        // Ensure non-negative
+        if (x3.signum() < 0) x3 = x3.add(p);
+        if (y3.signum() < 0) y3 = y3.add(p);
+        return new java.math.BigInteger[]{ x3, y3 };
+    }
+
+    /**
+     * BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
+     */
+    private static byte[] taggedHash(String tag, byte[] msg)
+            throws java.security.NoSuchAlgorithmException {
+        java.security.MessageDigest sha256 =
+            java.security.MessageDigest.getInstance("SHA-256");
+        byte[] tagHash = sha256.digest(tag.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        sha256.reset();
+        sha256.update(tagHash);
+        sha256.update(tagHash);
+        sha256.update(msg);
+        return sha256.digest();
+    }
+
+    /** Encode a BigInteger as a big-endian 32-byte array (zero-padded). */
+    private static byte[] toBytes32(java.math.BigInteger n) {
+        byte[] b = n.toByteArray();
+        if (b.length == 32) return b;
+        byte[] out = new byte[32];
+        if (b.length > 32) {
+            // strip leading 0x00 sign byte
+            System.arraycopy(b, b.length - 32, out, 0, 32);
+        } else {
+            System.arraycopy(b, 0, out, 32 - b.length, b.length);
+        }
+        return out;
+    }
+
+    /** Concatenate three byte arrays. */
+    private static byte[] concat3(byte[] a, byte[] b, byte[] c) {
+        byte[] out = new byte[a.length + b.length + c.length];
+        System.arraycopy(a, 0, out, 0,                    a.length);
+        System.arraycopy(b, 0, out, a.length,             b.length);
+        System.arraycopy(c, 0, out, a.length + b.length,  c.length);
+        return out;
     }
 
     // -------------------------------------------------------------------------

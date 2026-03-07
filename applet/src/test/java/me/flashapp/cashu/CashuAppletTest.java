@@ -20,8 +20,8 @@ import static org.junit.jupiter.api.Assertions.*;
  *   - Auth:     VERIFY_PIN, SET_PIN, CHANGE_PIN
  *   - Admin:    LOCK_CARD
  *
- * NOTE: secp256k1 curve params and Schnorr signing are stubs (ENG-181).
- * Signature tests verify format/length only, not cryptographic correctness.
+ * ENG-181 complete: secp256k1 curve params set + BIP-340 Schnorr implemented.
+ * Signature tests verify cryptographic correctness using BigInteger Schnorr verify.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class CashuAppletTest {
@@ -119,8 +119,8 @@ class CashuAppletTest {
         assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
         assertEquals(0, d[4] & 0xFF, "spent = 0 initially");
         assertEquals(MAX_PROOFS, d[5] & 0xFF, "empty = 32 initially");
-        // bit2 = PIN supported
-        assertTrue((d[6] & 0x04) != 0, "PIN capability flag must be set");
+        // bit0 = secp256k1 native, bit1 = Schnorr, bit2 = PIN (all set after ENG-181)
+        assertEquals(0x07, d[6] & 0xFF, "Capabilities must be 0x07 (secp256k1+Schnorr+PIN)");
         assertEquals(0, d[7] & 0xFF, "PIN state = 0 (unset) initially");
     }
 
@@ -331,7 +331,9 @@ class CashuAppletTest {
 
         ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
         assertEquals(SW_OK, resp.getSW());
-        assertEquals(64, resp.getData().length, "Signature must be 64 bytes");
+        byte[] sig = resp.getData();
+        assertEquals(64, sig.length, "Signature must be 64 bytes");
+        assertFalse(isAllZeros(sig), "Signature must not be all zeros (stub check)");
 
         // Verify slot is now SPENT
         ResponseAPDU proofResp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
@@ -409,6 +411,91 @@ class CashuAppletTest {
     void testSignArbitraryWrongLength() {
         ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, new byte[16], 0, 16, 64));
         assertEquals(SW_WRONG_LENGTH, resp.getSW());
+    }
+
+    // =========================================================================
+    // Schnorr signature cryptographic verification (ENG-181)
+    // =========================================================================
+
+    @Test @Order(24)
+    @DisplayName("SIGN_ARBITRARY produces a valid BIP-340 Schnorr signature")
+    void testSignArbitrarySchnorrValid() throws Exception {
+        // Get card public key
+        byte[] pubBytes = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
+
+        // Sign a known 32-byte message
+        byte[] msg = new byte[32];
+        for (int i = 0; i < 32; i++) msg[i] = (byte)(i + 1);
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
+        assertEquals(SW_OK, resp.getSW());
+        byte[] sig = resp.getData();
+        assertEquals(64, sig.length);
+        assertFalse(isAllZeros(sig), "Signature must not be all zeros");
+
+        // Extract 32-byte x-coordinate of public key
+        byte[] pubX = extractPubkeyX(pubBytes);
+
+        // Verify BIP-340 Schnorr signature
+        assertTrue(schnorrVerify(pubX, msg, sig),
+            "Schnorr signature must verify against the card's public key");
+    }
+
+    @Test @Order(25)
+    @DisplayName("SPEND_PROOF produces a valid BIP-340 Schnorr signature")
+    void testSpendProofSchnorrValid() throws Exception {
+        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
+
+        byte[] pubBytes = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
+        byte[] pubX = extractPubkeyX(pubBytes);
+
+        byte[] msg = new byte[32];
+        for (int i = 0; i < 32; i++) msg[i] = (byte)(0xAB ^ i);
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
+        assertEquals(SW_OK, resp.getSW());
+        byte[] sig = resp.getData();
+
+        assertTrue(schnorrVerify(pubX, msg, sig),
+            "SPEND_PROOF Schnorr signature must verify");
+    }
+
+    @Test @Order(26)
+    @DisplayName("Different messages produce different signatures (non-determinism test)")
+    void testSignArbitraryDifferentMessages() throws Exception {
+        byte[] msg1 = new byte[32];
+        byte[] msg2 = new byte[32];
+        java.util.Arrays.fill(msg1, (byte) 0x01);
+        java.util.Arrays.fill(msg2, (byte) 0x02);
+
+        // Need two proofs since SPEND_PROOF marks slots spent
+        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
+        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1));
+
+        byte[] sig1 = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg1, 0, 32, 64)).getData();
+        byte[] sig2 = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg2, 0, 32, 64)).getData();
+
+        assertFalse(java.util.Arrays.equals(sig1, sig2),
+            "Different messages must produce different signatures");
+    }
+
+    @Test @Order(27)
+    @DisplayName("Signature for wrong message does not verify")
+    void testSignArbitraryWrongMsgDoesNotVerify() throws Exception {
+        byte[] pubBytes = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
+        byte[] pubX = extractPubkeyX(pubBytes);
+
+        byte[] msg = new byte[32];
+        java.util.Arrays.fill(msg, (byte) 0x42);
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
+        byte[] sig = resp.getData();
+
+        byte[] wrongMsg = new byte[32];
+        java.util.Arrays.fill(wrongMsg, (byte) 0x99);
+
+        assertFalse(schnorrVerify(pubX, wrongMsg, sig),
+            "Signature must not verify against a different message");
     }
 
     // =========================================================================
@@ -674,6 +761,169 @@ class CashuAppletTest {
              | ((long)(buf[offset + 1] & 0xFF) << 16)
              | ((long)(buf[offset + 2] & 0xFF) << 8)
              |  (long)(buf[offset + 3] & 0xFF);
+    }
+
+    // =========================================================================
+    // Schnorr / EC helpers (BigInteger, jCardSim/JVM only)
+    // =========================================================================
+
+    static final java.math.BigInteger SECP_P = new java.math.BigInteger(
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
+    static final java.math.BigInteger SECP_N = new java.math.BigInteger(
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
+    static final java.math.BigInteger SECP_GX = new java.math.BigInteger(
+        "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16);
+    static final java.math.BigInteger SECP_GY = new java.math.BigInteger(
+        "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16);
+
+    /**
+     * BIP-340 Schnorr verify.
+     * sig = R.x (32) || s (32)
+     */
+    static boolean schnorrVerify(byte[] pubX, byte[] msg, byte[] sig)
+            throws java.security.NoSuchAlgorithmException {
+        java.math.BigInteger p = SECP_P;
+        java.math.BigInteger n = SECP_N;
+
+        java.math.BigInteger r = new java.math.BigInteger(1,
+            java.util.Arrays.copyOfRange(sig, 0, 32));
+        java.math.BigInteger s = new java.math.BigInteger(1,
+            java.util.Arrays.copyOfRange(sig, 32, 64));
+
+        if (r.compareTo(p) >= 0) return false;
+        if (s.compareTo(n) >= 0) return false;
+
+        // P = lift_x(pubX) — even-y point
+        java.math.BigInteger[] P = liftX(new java.math.BigInteger(1, pubX));
+        if (P == null) return false;
+
+        // e = tagged_hash("BIP0340/challenge", bytes(r) || bytes(P.x) || msg) mod n
+        byte[] rBytes  = toBytes32Test(r);
+        byte[] PxBytes = toBytes32Test(P[0]);
+        byte[] challengeInput = new byte[96];
+        System.arraycopy(rBytes,  0, challengeInput,  0, 32);
+        System.arraycopy(PxBytes, 0, challengeInput, 32, 32);
+        System.arraycopy(msg,     0, challengeInput, 64, 32);
+        java.math.BigInteger e = new java.math.BigInteger(1,
+            taggedHashTest("BIP0340/challenge", challengeInput)).mod(n);
+
+        // R = s*G - e*P  (subtract = add negated point: -P = (P.x, p - P.y))
+        java.math.BigInteger[] sG  = ecMulTest(s,  SECP_GX, SECP_GY);
+        java.math.BigInteger[] eP  = ecMulTest(e,  P[0],    P[1]);
+        if (sG == null || eP == null) return false;
+
+        // Negate eP: (eP.x, p - eP.y)
+        java.math.BigInteger[] negEP = { eP[0], p.subtract(eP[1]) };
+        java.math.BigInteger[] R = ecAddTest(sG[0], sG[1], negEP[0], negEP[1]);
+        if (R == null) return false;
+
+        // R.y must be even, R.x must equal r
+        if (R[1].testBit(0)) return false;
+        return R[0].equals(r);
+    }
+
+    /** lift_x: find the even-y point on secp256k1 with the given x-coordinate. */
+    static java.math.BigInteger[] liftX(java.math.BigInteger x) {
+        java.math.BigInteger p = SECP_P;
+        if (x.compareTo(p) >= 0) return null;
+        java.math.BigInteger rhs = x.modPow(java.math.BigInteger.valueOf(3), p)
+            .add(java.math.BigInteger.valueOf(7)).mod(p);
+        java.math.BigInteger y = rhs.modPow(p.add(java.math.BigInteger.ONE)
+            .divide(java.math.BigInteger.valueOf(4)), p);
+        // Verify it's actually a square root
+        if (!y.modPow(java.math.BigInteger.TWO, p).equals(rhs)) return null;
+        // Choose even y
+        if (y.testBit(0)) y = p.subtract(y);
+        return new java.math.BigInteger[]{ x, y };
+    }
+
+    /** Extract 32-byte x-coordinate from a compressed (33) or uncompressed (65) public key. */
+    static byte[] extractPubkeyX(byte[] pubBytes) {
+        if (pubBytes.length == 65 && pubBytes[0] == 0x04) {
+            return java.util.Arrays.copyOfRange(pubBytes, 1, 33);
+        } else if (pubBytes.length == 33) {
+            return java.util.Arrays.copyOfRange(pubBytes, 1, 33);
+        }
+        throw new IllegalArgumentException("Unexpected pubkey length: " + pubBytes.length);
+    }
+
+    /** Returns true if every byte in the array is 0x00. */
+    static boolean isAllZeros(byte[] b) {
+        for (byte v : b) if (v != 0) return false;
+        return true;
+    }
+
+    /** Scalar multiplication: k * (x,y) using double-and-add. */
+    static java.math.BigInteger[] ecMulTest(java.math.BigInteger k,
+                                             java.math.BigInteger x,
+                                             java.math.BigInteger y) {
+        java.math.BigInteger[] R = null;
+        java.math.BigInteger[] P = { x, y };
+        k = k.mod(SECP_N);
+        while (k.signum() > 0) {
+            if (k.testBit(0)) {
+                R = (R == null) ? new java.math.BigInteger[]{ P[0], P[1] }
+                                : ecAddTest(R[0], R[1], P[0], P[1]);
+            }
+            P = ecAddTest(P[0], P[1], P[0], P[1]);
+            k = k.shiftRight(1);
+        }
+        return R;
+    }
+
+    /** EC point addition / doubling on secp256k1. Returns null for point at infinity. */
+    static java.math.BigInteger[] ecAddTest(java.math.BigInteger x1,
+                                             java.math.BigInteger y1,
+                                             java.math.BigInteger x2,
+                                             java.math.BigInteger y2) {
+        java.math.BigInteger p  = SECP_P;
+        java.math.BigInteger p2 = p.subtract(java.math.BigInteger.TWO);
+        java.math.BigInteger lambda;
+        if (x1.equals(x2)) {
+            if (!y1.equals(y2)) return null; // point at infinity
+            // doubling
+            java.math.BigInteger num = java.math.BigInteger.valueOf(3)
+                .multiply(x1.modPow(java.math.BigInteger.TWO, p)).mod(p);
+            java.math.BigInteger den = java.math.BigInteger.valueOf(2).multiply(y1).mod(p);
+            lambda = num.multiply(den.modPow(p2, p)).mod(p);
+        } else {
+            java.math.BigInteger num = y2.subtract(y1).mod(p);
+            java.math.BigInteger den = x2.subtract(x1).mod(p);
+            lambda = num.multiply(den.modPow(p2, p)).mod(p);
+        }
+        java.math.BigInteger x3 = lambda.modPow(java.math.BigInteger.TWO, p)
+            .subtract(x1).subtract(x2).mod(p);
+        java.math.BigInteger y3 = lambda.multiply(x1.subtract(x3)).subtract(y1).mod(p);
+        if (x3.signum() < 0) x3 = x3.add(p);
+        if (y3.signum() < 0) y3 = y3.add(p);
+        return new java.math.BigInteger[]{ x3, y3 };
+    }
+
+    /** BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg) */
+    static byte[] taggedHashTest(String tag, byte[] msg)
+            throws java.security.NoSuchAlgorithmException {
+        java.security.MessageDigest sha =
+            java.security.MessageDigest.getInstance("SHA-256");
+        byte[] tagHash = sha.digest(
+            tag.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        sha.reset();
+        sha.update(tagHash);
+        sha.update(tagHash);
+        sha.update(msg);
+        return sha.digest();
+    }
+
+    /** BigInteger → big-endian 32-byte array (zero-padded / sign-stripped). */
+    static byte[] toBytes32Test(java.math.BigInteger n) {
+        byte[] b = n.toByteArray();
+        if (b.length == 32) return b;
+        byte[] out = new byte[32];
+        if (b.length > 32) {
+            System.arraycopy(b, b.length - 32, out, 0, 32);
+        } else {
+            System.arraycopy(b, 0, out, 32 - b.length, b.length);
+        }
+        return out;
     }
 
     // Expose ISO7816 constants for tests

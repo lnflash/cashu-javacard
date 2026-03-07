@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: me.flashapp.cashu.CashuAppletTest
+-------------------------------------------------------------------------------
+Tests run: 44, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.030 s -- in me.flashapp.cashu.CashuAppletTest
