@@ -4,7 +4,7 @@
 
 `depends on: NUT-00, NUT-01, NUT-03, NUT-04, NUT-05, NUT-10, NUT-11`
 
-> **Status: Draft** — Reference implementation in progress at [lnflash/cashu-javacard](https://github.com/lnflash/cashu-javacard). Targeting submission to cashubtc/nuts after reference implementation is complete.
+> **Status: Draft** — Reference implementation at [lnflash/cashu-javacard](https://github.com/lnflash/cashu-javacard). Open for community review.
 
 ---
 
@@ -34,10 +34,10 @@ This enables:
 
 ## Definitions
 
-- **Card**: A JavaCard 3.0.4+ NFC smartcard running the Cashu applet (AID: `D2 76 00 00 85 01 02`)
-- **Card pubkey** (`P_card`): A secp256k1 public key generated on-chip at install time; the corresponding private key never leaves the card
+- **Card**: An ISO 14443-4 compliant NFC device running the Cashu card applet (AID: `D2 76 00 00 85 01 02`)
+- **Card pubkey** (`P_card`): A secp256k1 public key generated on-device at install time; the corresponding private key never leaves the device
 - **Card proof**: A Cashu `Proof` whose `secret` is a NUT-10 `Secret` of kind `P2PK` with `data = hex(P_card)`
-- **Reader**: Any NFC-capable application (POS terminal, mobile wallet) that communicates with the card
+- **Reader**: Any NFC-capable application (POS terminal, mobile wallet) that communicates with the card via ISO 7816-4 APDUs
 - **Provisioner**: The entity responsible for loading proofs onto the card (typically a POS terminal or wallet connected to the mint)
 
 ---
@@ -46,16 +46,16 @@ This enables:
 
 | Property | Value |
 |----------|-------|
-| Chip | NTAG 424 DNA or equivalent (AES-128 CMAC) |
+| Tag type | NDEF-capable NFC tag with AES-128 CMAC authentication |
 | Balance storage | Server-side (mint or backend) |
-| Authentication | Hardware AES CMAC (SUN message authentication) |
+| Authentication | Hardware AES-128 CMAC (e.g. SUN message authentication) |
 | Connectivity | Online required per payment |
 | Double-spend prevention | Server-side |
 | Reference | [cashubtc/Numo](https://github.com/cashubtc/Numo) |
 
-Profile A is not formally specified here. The [cashubtc/Numo](https://github.com/cashubtc/Numo) project provides a working Profile A implementation for Android.
+Profile A is not formally specified here. The [cashubtc/Numo](https://github.com/cashubtc/Numo) project provides a working Profile A implementation for Android using NDEF tags with CMAC authentication.
 
-> **Community contribution welcome**: A formal Profile A spec (AES CMAC authentication flow, server-side balance API, LNURL-withdraw compatibility) would be a valuable addition. If you are building on NTAG 424 DNA and want to contribute a Profile A spec, please open a PR or discussion.
+> **Community contribution welcome**: A formal Profile A spec (AES CMAC authentication flow, server-side balance API, LNURL-withdraw compatibility) would be a valuable addition. If you are implementing Profile A and want to contribute a spec, please open a PR or discussion.
 
 ---
 
@@ -65,11 +65,12 @@ Profile A is not formally specified here. The [cashubtc/Numo](https://github.com
 
 | Property | Value |
 |----------|-------|
-| Chip | JavaCard 3.0.4+ with secp256k1 EC-FP support |
-| Examples | Feitian JavaCard 3.0.4+, NXP JCOP4 SmartMX3 |
-| EEPROM | ≥ 8 KB (2,496 bytes proof storage + OS overhead) |
+| Interface | ISO 14443-4 (NFC Type A/B), ISO 7816-4 APDU transport |
+| Cryptography | secp256k1 key-pair generation; BIP-340 Schnorr signing |
+| Persistent storage | ≥ 8 KB non-volatile (2,496 bytes proof storage + OS overhead) |
 | AID | `D2 76 00 00 85 01 02` |
-| Interface | ISO 14443-4 (NFC Type A/B) |
+
+> **Note**: Any ISO 7816-4 compliant NFC device capable of secp256k1 key generation and Schnorr signing may implement Profile B. Example chips known to meet these requirements: NXP JCOP4 SmartMX3 (CC EAL 5+), Feitian JavaCard 3.0.4+.
 
 ### Proof Format on Card
 
@@ -331,19 +332,25 @@ where `Proof.secret` is the serialized P2PK secret string (no spaces, determinis
 
 ### SPEND_PROOF — Signature Format
 
-The 64-byte response is a BIP-340 Schnorr signature:
+The 64-byte response is a [BIP-340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki) Schnorr signature:
 
 ```
 [R_x (32 bytes)] [s (32 bytes)]
 ```
 
-where:
-- `k` = deterministic nonce (RFC 6979 or on-chip RNG)
-- `R = k * G`
-- `e = SHA256(bytes(R_x) || bytes(P_card) || msg)`
-- `s = (k - e * privkey) mod n`
+Signing algorithm (BIP-340):
 
-This is compatible with NUT-11 P2PK signature verification.
+1. Let `d` = card private key scalar; `P` = `d * G`
+2. If `P.y` is odd, let `d' = n - d`, else `d' = d`
+3. Let `k` = `tagged_hash("BIP0340/nonce", d' || zeros32 || msg) mod n`
+4. Let `R = k * G`; if `R.y` is odd, let `k = n - k`
+5. Let `e = tagged_hash("BIP0340/challenge", bytes(R.x) || bytes(P.x) || msg) mod n`
+6. Let `s = (k + e * d') mod n`
+7. Return `bytes(R.x) || bytes(s)`
+
+where `tagged_hash(tag, msg) = SHA256(SHA256(tag) || SHA256(tag) || msg)`.
+
+This is compatible with standard BIP-340 verification and NUT-11 P2PK signature verification.
 
 ---
 
@@ -379,10 +386,10 @@ Cards running Profile B+ SHOULD set a capability flag in the `GET_INFO` response
 
 **Risk**: A sophisticated attacker with chip-level access and invasive probing equipment could extract proof data from EEPROM before spend.
 
-**Mitigation**: 
-- JCOP4 (CC EAL 5+) provides hardware protection against invasive attacks
-- Card private key is generated on-chip, stored in secure memory, and never exported — cloning the EEPROM gives the attacker the proof secrets but NOT the card key. They can attempt to redeem proofs without the P2PK signature, but the mint rejects these if P2PK is enforced.
-- For high-value cards, use chips with higher security certification
+**Mitigation**:
+- Cards certified to CC EAL 5+ or higher provide hardware protection against invasive attacks
+- The card private key is generated on-device, stored in secure non-volatile memory, and never exported — cloning the EEPROM gives the attacker the proof secrets but NOT the card key. Proofs without a valid P2PK signature are rejected by the mint.
+- For high-value cards, implementors SHOULD use devices with formal tamper-resistance certification
 
 ### Threat: Offline double-spend window
 
@@ -479,7 +486,7 @@ The following design questions are open for community discussion:
 
 | Property | Profile A | Profile B |
 |----------|-----------|-----------|
-| Chip | NTAG 424 DNA | JavaCard 3.0.4+ |
+| Device type | NDEF tag with AES-128 CMAC | ISO 7816-4 smart card with secp256k1 |
 | Approx. cost | $0.50–1.00/card | $1.50–8.00/card |
 | Balance storage | Server-side | On-card EEPROM |
 | Internet at payment | Required | Optional (offline) |
@@ -504,8 +511,8 @@ The following design questions are open for community discussion:
 - [NUT-11][11]: Pay to Public Key (P2PK)
 - [cashubtc/Numo](https://github.com/cashubtc/Numo): Android Cashu NFC POS (Profile A reference)
 - [lnflash/cashu-javacard](https://github.com/lnflash/cashu-javacard): Profile B reference implementation
-- [NXP JCOP4 SmartMX3](https://www.nxp.com/products/security-and-authentication/secure-service-2go/jcop-4): Recommended chip (CC EAL 5+)
-- [Feitian JavaCard](https://www.ftsafe.com/Products/Java_Card): Alternative chip (JavaCard 3.0.4+)
+- [NXP JCOP4 SmartMX3](https://www.nxp.com/products/security-and-authentication/secure-service-2go/jcop-4): Example Profile B chip (CC EAL 5+)
+- [Feitian JavaCard 3.0.4+](https://www.ftsafe.com/Products/Java_Card): Example Profile B chip
 - [BIP-340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki): Schnorr signatures
 
 [00]: https://github.com/cashubtc/nuts/blob/main/00.md
