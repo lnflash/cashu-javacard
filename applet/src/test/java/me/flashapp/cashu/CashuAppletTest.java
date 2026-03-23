@@ -203,14 +203,14 @@ class CashuAppletTest {
     @Test @Order(8)
     @DisplayName("GET_PROOF on empty slot returns SW_SLOT_EMPTY")
     void testGetProofSlotEmpty() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 82));
         assertEquals(SW_SLOT_EMPTY, resp.getSW());
     }
 
     @Test @Order(9)
     @DisplayName("GET_PROOF with out-of-range index returns SW_SLOT_OUT_OF_RANGE")
     void testGetProofOutOfRange() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, MAX_PROOFS, 0, 78));
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, MAX_PROOFS, 0, 82));
         assertEquals(SW_SLOT_OUT_OF_RANGE, resp.getSW());
     }
 
@@ -256,10 +256,10 @@ class CashuAppletTest {
         // Load proof into slot 0
         transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
 
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 82));
         assertEquals(SW_OK, resp.getSW());
         byte[] data = resp.getData();
-        assertEquals(78, data.length, "Proof data must be 78 bytes");
+        assertEquals(82, data.length, "Proof data must be 82 bytes");
         assertEquals(0x01, data[0] & 0xFF, "Status must be UNSPENT (0x01)");
 
         // Verify the proof payload matches what we loaded (bytes 1..77)
@@ -336,7 +336,7 @@ class CashuAppletTest {
         assertFalse(isAllZeros(sig), "Signature must not be all zeros (stub check)");
 
         // Verify slot is now SPENT
-        ResponseAPDU proofResp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
+        ResponseAPDU proofResp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 82));
         assertEquals(SW_OK, proofResp.getSW());
         assertEquals(0x02, proofResp.getData()[0] & 0xFF, "Status must be SPENT after spend");
     }

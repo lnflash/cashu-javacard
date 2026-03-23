@@ -2,7 +2,7 @@
 
 ## On-Card Data Model
 
-Each proof occupies exactly 78 bytes of EEPROM:
+Each proof occupies exactly 82 bytes of EEPROM:
 
 ```
 Offset  Size  Field
@@ -11,9 +11,10 @@ Offset  Size  Field
 9       4     amount (uint32, big-endian, sats)
 13      32    secret (x — the Cashu proof secret)
 45      33    C (compressed secp256k1 point — the mint's blind signature)
+78      4     locktime (uint32, big-endian, unix timestamp; 0 = no refund)
 ```
 
-With 32 slots × 78 bytes = 2,496 bytes of proof storage, plus the EC keypair (~64 bytes) and applet code.
+With 32 slots × 82 bytes = 2,624 bytes of proof storage, plus the EC keypair (~64 bytes), refund pubkey P_app (33 bytes), and applet code.
 
 ## Key Management
 

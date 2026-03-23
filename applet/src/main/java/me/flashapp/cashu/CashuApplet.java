@@ -21,10 +21,12 @@ import javacardx.crypto.*;
  *   0x12  GET_PROOF_COUNT  — count of non-empty slots
  *   0x13  GET_PROOF        — full proof data at slot index
  *   0x14  GET_SLOT_STATUS  — bulk 1-byte status for all slots
+ *   0x15  GET_REFUND_INFO  — recovery pubkey P_app (33 bytes)
  *   0x20  SPEND_PROOF      — mark spent + return NUT-11 Schnorr signature
  *   0x21  SIGN_ARBITRARY   — sign 32-byte message (no proof consumed)
  *   0x30  LOAD_PROOF       — store new proof (PIN required if set)
  *   0x31  CLEAR_SPENT      — free spent slots (PIN required)
+ *   0x32  SET_REFUND_INFO  — set recovery pubkey P_app (PIN required)
  *   0x40  VERIFY_PIN       — verify provisioning PIN
  *   0x41  SET_PIN          — set PIN (first-time, personalization only)
  *   0x42  CHANGE_PIN       — change PIN (current PIN session required)
@@ -51,10 +53,12 @@ public class CashuApplet extends Applet {
     static final byte INS_GET_PROOF_COUNT  = (byte) 0x12;
     static final byte INS_GET_PROOF        = (byte) 0x13;
     static final byte INS_GET_SLOT_STATUS  = (byte) 0x14;
+    static final byte INS_GET_REFUND_INFO  = (byte) 0x15;
     static final byte INS_SPEND_PROOF      = (byte) 0x20;
     static final byte INS_SIGN_ARBITRARY   = (byte) 0x21;
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
+    static final byte INS_SET_REFUND_INFO  = (byte) 0x32;
     static final byte INS_VERIFY_PIN       = (byte) 0x40;
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
@@ -63,14 +67,16 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
     // Proof slot layout constants (78 bytes per slot)
     // -------------------------------------------------------------------------
-    static final short PROOF_SIZE          = (short) 78;
-    static final short PROOF_STATUS_OFFSET = (short) 0;
-    static final short PROOF_KEYSET_OFFSET = (short) 1;
-    static final short PROOF_AMOUNT_OFFSET = (short) 9;
-    static final short PROOF_SECRET_OFFSET = (short) 13;
-    static final short PROOF_C_OFFSET      = (short) 45;
+    static final short PROOF_SIZE            = (short) 82;
+    static final short PROOF_STATUS_OFFSET   = (short) 0;
+    static final short PROOF_KEYSET_OFFSET   = (short) 1;
+    static final short PROOF_AMOUNT_OFFSET   = (short) 9;
+    static final short PROOF_SECRET_OFFSET   = (short) 13;
+    static final short PROOF_C_OFFSET        = (short) 45;
+    static final short PROOF_LOCKTIME_OFFSET = (short) 78;
 
-    static final short PROOF_DATA_LEN      = (short) 77;  // PROOF_SIZE - 1 (no status byte on input)
+    static final short PROOF_DATA_LEN        = (short) 81;  // PROOF_SIZE - 1 (no status byte on input)
+    static final short PROOF_DATA_LEN_LEGACY = (short) 77;  // without locktime (backward compat)
 
     static final byte STATUS_EMPTY   = (byte) 0x00;
     static final byte STATUS_UNSPENT = (byte) 0x01;
@@ -156,6 +162,12 @@ public class CashuApplet extends Applet {
     /** Card locked flag — once set to 1, write operations are disabled */
     private byte[] cardLocked;   // 1-byte array (persistent)
 
+    /** Refund recovery pubkey P_app (33-byte compressed secp256k1) */
+    private byte[] refundPubkey; // 33 bytes (persistent)
+
+    /** Refund configured flag: 0=unset, 1=set */
+    private byte[] refundSet;    // 1-byte array (persistent)
+
     /** PIN state: 0=unset, 1=set, 2=locked */
     private byte[] pinState;     // 1-byte array (persistent)
 
@@ -202,6 +214,8 @@ public class CashuApplet extends Applet {
     private CashuApplet() {
         proofStorage    = new byte[(short)(MAX_PROOFS * PROOF_SIZE)];
         cardLocked      = new byte[1];
+        refundPubkey    = new byte[33];
+        refundSet       = new byte[1];
         pinState        = new byte[1];
         pin             = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
@@ -284,10 +298,12 @@ public class CashuApplet extends Applet {
             case INS_GET_PROOF_COUNT:  processGetProofCount(apdu);  break;
             case INS_GET_PROOF:        processGetProof(apdu);       break;
             case INS_GET_SLOT_STATUS:  processGetSlotStatus(apdu);  break;
+            case INS_GET_REFUND_INFO:  processGetRefundInfo(apdu);  break;
             case INS_SPEND_PROOF:      processSpendProof(apdu);     break;
             case INS_SIGN_ARBITRARY:   processSignArbitrary(apdu);  break;
             case INS_LOAD_PROOF:       processLoadProof(apdu);      break;
             case INS_CLEAR_SPENT:      processClearSpent(apdu);     break;
+            case INS_SET_REFUND_INFO:  processSetRefundInfo(apdu);  break;
             case INS_VERIFY_PIN:       processVerifyPin(apdu);      break;
             case INS_SET_PIN:          processSetPin(apdu);         break;
             case INS_CHANGE_PIN:       processChangePin(apdu);      break;
@@ -320,9 +336,12 @@ public class CashuApplet extends Applet {
         //   bit0 = secp256k1 native key generation (set — ENG-181 complete)
         //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
         //   bit2 = PIN supported (always set)
+        //   bit3 = refund info configured (set when SET_REFUND_INFO has been called)
         // Note: bits 0+1 are marked as simulation-quality for jCardSim.
         //   Hardware deployment (ENG-182) requires Schnorr replacement.
-        buf[6] = (byte) 0x07; // secp256k1 + Schnorr + PIN
+        byte caps = (byte) 0x07; // secp256k1 + Schnorr + PIN
+        if (refundSet[0] == (byte) 1) caps |= (byte) 0x08; // refund configured
+        buf[6] = caps;
         buf[7] = pinState[0];
         apdu.setOutgoingAndSend((short) 0, (short) 8);
     }
@@ -380,6 +399,13 @@ public class CashuApplet extends Applet {
         apdu.setOutgoingAndSend((short) 0, MAX_PROOFS);
     }
 
+    private void processGetRefundInfo(APDU apdu) {
+        if (refundSet[0] == (byte) 0) ISOException.throwIt(SW_SLOT_EMPTY); // 6A88: not configured
+        byte[] buf = apdu.getBuffer();
+        Util.arrayCopy(refundPubkey, (short) 0, buf, (short) 0, (short) 33);
+        apdu.setOutgoingAndSend((short) 0, (short) 33);
+    }
+
     // -------------------------------------------------------------------------
     // Category 0x2x — Spend commands (no PIN — bearer)
     // -------------------------------------------------------------------------
@@ -434,12 +460,22 @@ public class CashuApplet extends Applet {
         if (slot < 0) ISOException.throwIt(SW_NO_SPACE);
 
         short dataLen = apdu.setIncomingAndReceive();
-        if (dataLen != PROOF_DATA_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (dataLen != PROOF_DATA_LEN && dataLen != PROOF_DATA_LEN_LEGACY) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
 
         byte[] buf = apdu.getBuffer();
         short base = (short)(slot * PROOF_SIZE);
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_UNSPENT;
-        Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
+        // Copy keyset_id(8) + amount(4) + secret(32) + C(33) = 77 bytes
+        Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN_LEGACY);
+        // Copy locktime(4) if provided, else zero
+        if (dataLen == PROOF_DATA_LEN) {
+            Util.arrayCopy(buf, (short)(ISO7816.OFFSET_CDATA + PROOF_DATA_LEN_LEGACY),
+                           proofStorage, (short)(base + PROOF_LOCKTIME_OFFSET), (short) 4);
+        } else {
+            Util.arrayFillNonAtomic(proofStorage, (short)(base + PROOF_LOCKTIME_OFFSET), (short) 4, (byte) 0);
+        }
 
         buf[0] = (byte) slot;
         apdu.setOutgoingAndSend((short) 0, (short) 1);
@@ -460,6 +496,16 @@ public class CashuApplet extends Applet {
         }
         buf[0] = (byte) freed;
         apdu.setOutgoingAndSend((short) 0, (short) 1);
+    }
+
+    private void processSetRefundInfo(APDU apdu) {
+        requireNotLocked();
+        requirePinIfSet();
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen != (short) 33) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte[] buf = apdu.getBuffer();
+        Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, refundPubkey, (short) 0, (short) 33);
+        refundSet[0] = (byte) 1;
     }
 
     // -------------------------------------------------------------------------
