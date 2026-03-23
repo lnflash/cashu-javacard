@@ -56,7 +56,8 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 0 | secp256k1 native (1) or software (0) |
 | 1 | Schnorr signing supported |
 | 2 | PIN protection available |
-| 3–7 | Reserved (0) |
+| 3 | Refund info configured (P_app set via `SET_REFUND_INFO`) |
+| 4–7 | Reserved (0) |
 
 ---
 
@@ -115,9 +116,9 @@ Returns full proof data at a given slot index. Slot must be non-empty.
 | INS | 13 |
 | P1 | Slot index (0-based) |
 | P2 | 00 |
-| Le | 4E (78 bytes) |
+| Le | 52 (82 bytes) |
 
-**Response (78 bytes):**
+**Response (82 bytes):**
 
 | Offset | Length | Description |
 |--------|--------|-------------|
@@ -126,6 +127,7 @@ Returns full proof data at a given slot index. Slot must be non-empty.
 | 9 | 4 | Amount (big-endian uint32) |
 | 13 | 32 | Secret (x) |
 | 45 | 33 | C point (compressed secp256k1) |
+| 78 | 4 | Locktime (big-endian uint32 unix timestamp; `00000000` = no refund) |
 
 **Errors:**
 
@@ -148,6 +150,27 @@ Lightweight bulk status read. Returns a 1-byte status for every slot (0=empty, 1
 | P2 | 00 |
 | Le | 20 (32 bytes, one per slot) |
 | Response | 32 bytes: one status byte per slot |
+
+---
+
+### GET_REFUND_INFO (0x15)
+
+Returns the card's recovery public key (`P_app`) if configured via `SET_REFUND_INFO`. Used by readers to reconstruct `Proof.secret` with refund tags for proofs that have a non-zero locktime.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 15 |
+| P1 | 00 |
+| P2 | 00 |
+| Le | 21 |
+| Response | 33-byte compressed secp256k1 public key (`P_app`) |
+
+**Errors:**
+
+| SW | Meaning |
+|----|---------|
+| 6A88 | Refund info not configured |
 
 ---
 
@@ -225,8 +248,8 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | INS | 30 |
 | P1 | 00 |
 | P2 | 00 |
-| Lc | 4D (77 bytes) |
-| Data | 8-byte keyset_id + 4-byte amount + 32-byte secret + 33-byte C point |
+| Lc | 51 (81 bytes) or 4D (77 bytes, legacy without locktime) |
+| Data | 8-byte keyset_id + 4-byte amount + 32-byte secret + 33-byte C point [+ 4-byte locktime] |
 | Le | 01 |
 | Response | 1-byte slot index assigned |
 
@@ -257,6 +280,28 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 | SW | Meaning |
 |----|---------|
 | 6982 | Security condition not satisfied |
+
+---
+
+### SET_REFUND_INFO (0x32)
+
+Sets the card-level recovery public key (`P_app`). Once set, any reader can retrieve it via `GET_REFUND_INFO` and use it to reconstruct `Proof.secret` with refund tags. Can be updated by calling again. Requires PIN.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 32 |
+| P1 | 00 |
+| P2 | 00 |
+| Lc | 21 (33 bytes) |
+| Data | 33-byte compressed secp256k1 public key (`P_app`) |
+
+**Errors:**
+
+| SW | Meaning |
+|----|---------|
+| 6982 | Security condition not satisfied (PIN required) |
+| 6700 | Wrong data length (must be 33 bytes) |
 
 ---
 
@@ -373,7 +418,7 @@ Permanently disables all write operations. Useful for lost/stolen card mitigatio
 
 ## Proof Slot Layout
 
-Each proof occupies exactly **78 bytes** of persistent EEPROM:
+Each proof occupies exactly **82 bytes** of persistent EEPROM:
 
 ```
 Offset  Len  Field
@@ -383,9 +428,12 @@ Offset  Len  Field
 9       4    Amount (big-endian uint32)
 13      32   Secret (x)
 45      33   C point (compressed secp256k1, 02/03 prefix)
+78      4    Locktime (big-endian uint32 unix timestamp; 0 = no refund)
 ```
 
-Total: 32 slots × 78 bytes = **2,496 bytes** EEPROM for proof storage.
+Total: 32 slots × 82 bytes = **2,624 bytes** EEPROM for proof storage.
+
+Additionally, the card stores a card-level recovery public key (`P_app`, 33 bytes) set via `SET_REFUND_INFO`.
 
 ---
 
@@ -408,6 +456,8 @@ Reader                          Card
   |<-- 90 00 -------------------|
   |--- VERIFY_PIN (0x40) ------> |  (PIN set at personalization)
   |<-- 90 00 -------------------|
+  |--- SET_REFUND_INFO (0x32) -> |  (set P_app, first time only)
+  |<-- 90 00 -------------------|
   |--- CLEAR_SPENT (0x31) -----> |  (reclaim spent slots)
   |<-- count + 90 00 -----------|
   |--- LOAD_PROOF (0x30) ------> |  (repeat for each proof)
@@ -423,6 +473,8 @@ POS Terminal                    Card
   |                              |
   |--- SELECT APPLICATION -----> |
   |<-- 90 00 -------------------|
+  |--- GET_REFUND_INFO (0x15) -> |  (read P_app for secret reconstruction)
+  |<-- P_app (33B) or 6A88 -----|
   |--- GET_BALANCE (0x11) -----> |
   |<-- balance + 90 00 ---------|
   |--- GET_SLOT_STATUS (0x14) -> |
