@@ -67,10 +67,13 @@ See [`spec/APDU.md`](spec/APDU.md) for full command reference.
 ```
 applet/         JavaCard applet source (Java Card 3.0.4+)
 spec/           Protocol specs (APDU.md, NUT-XX.md)
-test/           jCardSim-based test suite
-docs/           Architecture and provisioning guides
+docs/           User guide, architecture, provisioning guides
 scripts/        Provisioning helpers for flash-pos
 ```
+
+## Quick Start
+
+**New to Cashu cards?** See the **[User Guide](docs/USER_GUIDE.md)** — explains what the card does, how to load it, and how to tap to pay.
 
 ## Building
 
