@@ -62,13 +62,22 @@ See [`spec/APDU.md`](spec/APDU.md) for full command reference.
 
 `D2 76 00 00 85 01 02` (Cashu, v2)
 
+## Documentation
+
+- **[User Guide](docs/USER_GUIDE.md)** — What it is, how to set up a card, load money, and pay. Start here if you're new.
+- **[Payment Flow](docs/PAYMENT_FLOW.md)** — Detailed NFC tap payment flow with diagrams (top-up → spend → redeem).
+- **[APDU Command Reference](spec/APDU.md)** — Full byte-level command specification for integrators.
+- **[NUT-XX Protocol Spec](spec/NUT-XX.md)** — Complete protocol specification (draft).
+- **[Architecture](docs/ARCHITECTURE.md)** — On-card data model and key management.
+- **[Hardware Deployment](docs/HARDWARE_DEPLOYMENT.md)** — Building, installing, and managing the applet on physical cards.
+
 ## Project Structure
 
 ```
 applet/         JavaCard applet source (Java Card 3.0.4+)
 spec/           Protocol specs (APDU.md, NUT-XX.md)
 test/           jCardSim-based test suite
-docs/           Architecture and provisioning guides
+docs/           User guides, architecture, and deployment docs
 scripts/        Provisioning helpers for flash-pos
 ```
 
