@@ -2,11 +2,23 @@
 
 A JavaCard applet implementing the [Cashu](https://cashu.space) ecash protocol for offline NFC bearer payments.
 
+> 💳 **New to Cashu NFC cards?** Check out the **[User Guide](docs/USER_GUIDE.md)** for a friendly introduction!
+
 ## Overview
 
 This applet runs on NFC JavaCard chips (ISO 14443-4 Type 4) and enables **true offline Cashu payments** — customers tap a physical card at a merchant terminal, and the merchant receives valid Cashu proofs without requiring an internet connection at point of sale.
 
 This is the reference implementation for **NUT-XX: Cashu NFC Card Protocol**, Profile B (Bearer/Offline).
+
+### Quick Links
+
+| Document | Description |
+|----------|-------------|
+| 📖 [User Guide](docs/USER_GUIDE.md) | How to use a Cashu NFC card (for end users) |
+| 🔧 [Hardware Deployment](docs/HARDWARE_DEPLOYMENT.md) | Loading the applet onto a JavaCard |
+| 📐 [Architecture](docs/ARCHITECTURE.md) | Technical design and data model |
+| 📋 [APDU Reference](spec/APDU.md) | Full command set documentation |
+| 📜 [NUT-XX Spec](spec/NUT-XX.md) | Protocol specification |
 
 ## Architecture
 
