@@ -58,6 +58,11 @@ See [`spec/APDU.md`](spec/APDU.md) for full command reference.
 | 0xB0 | 0x30 | LOAD_PROOF | Store a new proof (provisioning, authenticated) |
 | 0xB0 | 0x31 | CLEAR_SPENT | Garbage-collect spent proof slots |
 
+## User-Facing Documentation
+
+For setup guidance, compatible card notes, and tap payment flows, see
+[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md).
+
 ## AID
 
 `D2 76 00 00 85 01 02` (Cashu, v2)
