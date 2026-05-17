@@ -47,6 +47,8 @@ This is the reference implementation for **NUT-XX: Cashu NFC Card Protocol**, Pr
 
 See [`spec/APDU.md`](spec/APDU.md) for full command reference.
 
+For user-facing setup, card compatibility, and NFC tap payment flows, see [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md).
+
 | CLA | INS | Command | Description |
 |-----|-----|---------|-------------|
 | 0xB0 | 0x01 | SELECT | Standard ISO SELECT AID |
