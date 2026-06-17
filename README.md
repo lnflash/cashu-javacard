@@ -8,6 +8,8 @@ This applet runs on NFC JavaCard chips (ISO 14443-4 Type 4) and enables **true o
 
 This is the reference implementation for **NUT-XX: Cashu NFC Card Protocol**, Profile B (Bearer/Offline).
 
+Start with [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for a user-facing explanation, JavaCard loading steps, supported hardware, and the NFC tap-to-pay / tap-to-receive flow.
+
 ## Architecture
 
 ```
@@ -74,18 +76,20 @@ scripts/        Provisioning helpers for flash-pos
 
 ## Building
 
-Requires [JavaCard SDK 3.0.4+](https://www.oracle.com/java/technologies/javacard-downloads.html) and JDK 11+.
+Requires [JavaCard SDK 3.0.4+](https://www.oracle.com/java/technologies/javacard-downloads.html), JDK 11+, and Apache Ant.
 
 ```bash
-./gradlew buildCap
-# Output: applet/cap/CashuApplet.cap
+cd applet
+ant clean cap
+# Output: applet/target/cashu-javacard-0.1.0.cap
 ```
 
 ## Testing
 
 ```bash
-./gradlew test
-# Runs full jCardSim test suite (no hardware required)
+cd applet
+mvn test
+# Runs the jCardSim test suite (no hardware required)
 ```
 
 ## Spec: NUT-XX
