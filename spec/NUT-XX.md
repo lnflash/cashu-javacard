@@ -76,7 +76,7 @@ Profile A is not formally specified here. The [cashubtc/Numo](https://github.com
 
 Card proofs are Cashu `Proof`s locked with a NUT-11 P2PK spending condition to the card's public key. When loaded onto the card, they are stored in a compact binary format.
 
-**Binary proof slot (78 bytes):**
+**Binary proof slot (82 bytes):**
 
 ```
 Offset  Len  Field        Description
@@ -86,6 +86,7 @@ Offset  Len  Field        Description
 9       4    amount       Big-endian uint32, in keyset's base unit (sats or cents)
 13      32   nonce        The 32-byte random nonce from the P2PK Secret
 45      33   C            Compressed secp256k1 mint signature point
+78      4    locktime     Big-endian uint32 unix timestamp (0 = no refund)
 ```
 
 **Maximum slots**: 32 (configurable at install time, limited by available EEPROM)
@@ -95,13 +96,23 @@ Offset  Len  Field        Description
 Given the stored fields and the card's public key (`P_card` from `GET_PUBKEY`), a reader reconstructs the full `Proof` as follows:
 
 ```python
+# Read refund info from card (card-level, shared by all proofs)
+P_app = GET_REFUND_INFO()  # 33-byte compressed pubkey, or empty if not configured
+locktime = proof_slot[78:82]  # per-proof, from GET_PROOF response
+
+# Build tags
+tags = [["sigflag", "SIG_INPUTS"]]
+if P_app and locktime > 0:
+    tags.append(["refund", P_app.compressed_hex()])
+    tags.append(["locktime", str(locktime)])
+
 # Reconstruct Proof.secret (NUT-10 well-known secret of kind P2PK)
 secret = json.dumps([
     "P2PK",
     {
         "nonce": nonce.hex(),
         "data": P_card.compressed_hex(),
-        "tags": [["sigflag", "SIG_INPUTS"]]
+        "tags": tags
     }
 ], separators=(",", ":"))
 
@@ -114,7 +125,7 @@ proof = {
 }
 ```
 
-The `secret` JSON MUST be serialized **without spaces** and with keys in the order shown above to ensure a consistent serialization for signing.
+The `secret` JSON MUST be serialized **without spaces** and with keys in the order shown above to ensure a consistent serialization for signing. The reader MUST call `GET_REFUND_INFO` and include the refund/locktime tags in reconstruction if present — the `Proof.secret` must exactly match the original to verify against `C`.
 
 ### Concrete Example
 
@@ -156,13 +167,24 @@ After calling `SPEND_PROOF`, the reader assembles the full proof for mint redemp
 
 Provisioning loads signed Cashu proofs onto the card. Proofs MUST be locked to the card's public key using NUT-11 P2PK spending conditions before loading.
 
-### Step 1 — Discover Card Pubkey
+### Step 1 — Discover Card Pubkey and Refund Info
 
 ```
 Reader  -->  Card: SELECT APPLICATION (AID: D2 76 00 00 85 01 02)
 Reader  -->  Card: GET_PUBKEY (INS: 0x10)
 Card    -->  Reader: P_card (33-byte compressed secp256k1 public key)
+Reader  -->  Card: GET_REFUND_INFO (INS: 0x15) [optional]
+Card    -->  Reader: P_app (33 bytes) or SW 6A88 if not configured
 ```
+
+If refund recovery is desired and `GET_REFUND_INFO` returns `6A88` (not configured), the provisioner SHOULD set up the refund key before minting proofs:
+
+```
+Reader  -->  Card: VERIFY_PIN
+Reader  -->  Card: SET_REFUND_INFO (INS: 0x32, Data: P_app[33])
+```
+
+`P_app` is a recovery public key generated and stored securely by the provisioning wallet app (e.g. derived from the wallet's BIP-39 seed).
 
 ### Step 2 — Mint Locked Proofs
 
@@ -180,6 +202,29 @@ For each desired denomination, generate a nonce `x` (32 random bytes) and constr
 }]
 ```
 
+**Optional refund path (recommended):** To enable card loss recovery, the provisioner SHOULD include NUT-11 `refund` and `locktime` tags:
+
+```json
+["P2PK", {
+  "nonce": "<hex(x)>",
+  "data": "<hex(P_card)>",
+  "tags": [
+    ["sigflag", "SIG_INPUTS"],
+    ["refund", "<hex(P_app)>"],
+    ["locktime", "<unix_timestamp>"]
+  ]
+}]
+```
+
+Where:
+
+- `P_app` is a recovery public key generated and stored securely by the provisioning wallet app
+- `locktime` is a unix timestamp representing the recovery deadline (e.g. 7 days from provisioning)
+- Before `locktime`: only the card can spend (P2PK signature with `P_card` required)
+- After `locktime`: the wallet app can recover unspent proofs by signing with the private key corresponding to `P_app`
+
+The refund tags are part of the `Proof.secret` and are baked into the mint's blinded signature (`C`). The card stores `P_app` at the card level (via `SET_REFUND_INFO`) and `locktime` per proof slot (4-byte field at offset 78). Any reader can call `GET_REFUND_INFO` and read the locktime from `GET_PROOF` to reconstruct the correct secret, enabling third-party POS compatibility. The provisioning wallet SHOULD also retain full proof data for recovery. See [Recovery](#recovery) for the full recovery flow.
+
 Serialize this JSON (no spaces) and use it as the secret for blind signature request per NUT-03/NUT-04.
 
 **Denomination selection**: Proofs SHOULD follow standard Cashu power-of-2 denominations to enable exact-amount payment selection. The provisioner splits the desired total into an optimal denomination set.
@@ -191,7 +236,7 @@ For each proof received from the mint, write it to the card:
 ```
 Reader  -->  Card: VERIFY_PIN (if PIN is set; required for LOAD_PROOF)
 Reader  -->  Card: CLEAR_SPENT (reclaim any spent slots)
-Reader  -->  Card: LOAD_PROOF [keyset_id(8) || amount(4) || nonce(32) || C(33)]
+Reader  -->  Card: LOAD_PROOF [keyset_id(8) || amount(4) || nonce(32) || C(33) || locktime(4)]
 Card    -->  Reader: slot_index (1 byte)
 ```
 
@@ -307,8 +352,10 @@ Card communication uses ISO 7816-4 APDUs. All commands use `CLA = B0`.
 | 0x11 | `GET_BALANCE` | Returns uint32 sum of unspent proof amounts |
 | 0x13 | `GET_PROOF` | Returns 78-byte proof slot data at given index |
 | 0x14 | `GET_SLOT_STATUS` | Returns 32-byte status array (one byte per slot) |
+| 0x15 | `GET_REFUND_INFO` | Returns 33-byte recovery pubkey P_app |
 | 0x20 | `SPEND_PROOF` | Marks proof spent and returns 64-byte Schnorr signature |
 | 0x30 | `LOAD_PROOF` | Writes a proof into the next empty slot |
+| 0x32 | `SET_REFUND_INFO` | Sets 33-byte recovery pubkey P_app (PIN required) |
 
 See [`APDU.md`](APDU.md) for complete command reference including optional commands.
 
@@ -416,6 +463,79 @@ Cards running Profile B+ SHOULD set a capability flag in the `GET_INFO` response
 
 **Mitigation**: The signature is over `SHA256(Proof.secret)` which is unique per proof (includes the unique nonce). A replayed signature is for the same proof, which will be rejected by the mint as already seen (standard Cashu double-spend prevention).
 
+### Threat: Card loss with refund path
+
+**Risk**: User loses card; funds are locked until `locktime` expiry. A thief who finds the card can spend proofs before locktime.
+
+**Mitigation**: The wallet app automatically attempts recovery after `locktime` expiry by signing with `P_app` (see [Recovery](#recovery)). Any proofs already spent by the card (or by a thief before locktime) will be rejected by the mint as already redeemed. Unspent proofs are recovered to the wallet.
+
+**Trade-off**: The thief has until `locktime` to spend; the user recovers whatever remains. This is strictly better than the current behavior (100% loss on card loss). Users can tune `locktime` to balance convenience vs. exposure window.
+
+### Threat: Wallet app compromise
+
+**Risk**: An attacker gains access to the wallet app (and the refund key `P_app`).
+
+**Mitigation**:
+- Before `locktime`: the attacker cannot spend — a valid card signature with `P_card` is still required. The refund key alone is insufficient.
+- After `locktime`: the attacker can recover proofs using `P_app`, equivalent to the risk of any hot wallet compromise.
+- Users SHOULD treat the recovery key with the same security as their wallet seed phrase.
+- Proofs already spent by the card are safe regardless — the mint rejects double-spends.
+
+---
+
+## Recovery
+
+If the optional refund path was used during provisioning, the wallet app can recover unspent proofs from a lost or damaged card after the `locktime` has expired. This uses standard NUT-11 refund semantics — no changes to the card applet or mint are required.
+
+### Prerequisites
+
+1. Proofs were minted with `refund` and `locktime` tags in the P2PK secret (see [Card Provisioning Step 2](#step-2--mint-locked-proofs))
+2. The wallet app retained a copy of all proofs loaded onto the card (including the full `Proof.secret` with refund tags)
+3. The wallet app holds the private key corresponding to `P_app`
+
+### Recovery Flow
+
+```
+Step 1: Detect card loss
+
+  User reports card as lost/stolen in the wallet app,
+  OR wallet app detects card has not been seen for an extended period.
+
+Step 2: Wait for locktime expiry
+
+  Wallet app monitors the locktime for each proof.
+  Recovery cannot proceed until unix_now > locktime.
+
+Step 3: Sign with refund key
+
+  For each retained proof where locktime has expired:
+      msg = SHA256(UTF8(proof.secret))
+      sig = schnorr_sign(msg, privkey(P_app))
+      proof.witness = {"signatures": [sig.hex()]}
+
+Step 4: Submit to mint
+
+  Wallet app submits proofs to the mint:
+      POST /v1/swap (NUT-03) to exchange for fresh unlocked proofs
+
+  The mint verifies:
+    - locktime has expired (unix_now > locktime)
+    - signature is valid for one of the refund pubkeys
+    - proof has not already been redeemed
+
+Step 5: Result
+
+  - Proofs already spent by the card (or thief): rejected as already redeemed
+  - Unspent proofs: swapped for fresh proofs, recovered to the wallet
+```
+
+### Limitations
+
+- Recovery is only possible after `locktime` — there is no early recovery mechanism
+- Proofs spent by a thief before `locktime` are not recoverable
+- The wallet app MUST retain proof data; if the wallet app's data is also lost, recovery is impossible
+- A shorter `locktime` reduces the thief's spending window but increases the risk of accidental locktime expiry during normal use
+
 ---
 
 ## Mint Support
@@ -452,6 +572,17 @@ Wallets or POS applications implementing NUT-XX MUST:
 5. Store collected `(proof, witness)` pairs durably before confirming payment to user
 6. Settle with the mint within a reasonable time window
 
+### Recovery Support
+
+Wallets implementing the optional refund recovery path SHOULD:
+
+1. Generate a recovery keypair (`P_app` / private key) during initial setup and store it securely (e.g. derived from the wallet's BIP-39 seed)
+2. Include `refund` and `locktime` tags when provisioning proofs onto cards (see [Card Provisioning Step 2](#step-2--mint-locked-proofs))
+3. Retain a durable copy of all proofs loaded onto cards, including the complete `Proof.secret` with refund tags
+4. Monitor `locktime` expiry for all provisioned proofs and attempt automatic recovery for cards reported as lost
+5. Provide a "card lost" flow that queues recovery at the earliest `locktime` expiry
+6. When acting as the POS reader for proofs with refund tags, use the retained full proof data (not a reconstruction without tags) to compute the correct `msg` for `SPEND_PROOF`
+
 ---
 
 ## AID Assignment
@@ -474,7 +605,7 @@ The following design questions are open for community discussion:
 
 2. **Denomination scheme**: The NUT currently recommends (SHOULD) power-of-2 denominations. Should this be stronger (MUST)? Or is denomination selection best left entirely to the provisioner?
 
-3. **Key derivation for recovery**: Should card keypairs be derivable from a BIP-39 seed for recovery? Currently, a lost or damaged card means lost funds — same as physical cash. Derivable keys would allow card replacement at the cost of requiring the user to manage a seed.
+3. **~~Key derivation for recovery~~ Recovery via P2PK refund path**: The optional refund path (see [Recovery](#recovery)) provides card loss recovery using existing NUT-11 `refund` and `locktime` tags, without requiring BIP-39 seed derivation on the card or any card applet changes. BIP-39 derivable keypairs remain a potential future enhancement for card-to-card migration but are no longer needed for basic fund recovery.
 
 4. **Multiple mints / keysets**: Should a single card support proofs from multiple mints simultaneously? The current design stores keyset IDs per proof, which technically allows it, but there is no discovery mechanism defined.
 
