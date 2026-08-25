@@ -331,25 +331,31 @@ final class SchnorrHW {
     private static void mul256x256(byte[] a, short aOff,
                                    byte[] b, short bOff,
                                    byte[] out, short outOff) {
+        // JavaCard has no int, so everything below is short arithmetic.
+        // Per step: ai*bj + cur + carry <= 255*255 + 255 + 255 = 65535, i.e.
+        // exactly 16 bits. A signed short holds those bits (it may read as
+        // negative); masking recovers the true byte values, so the result is
+        // exact. High byte is taken with (x >> 8) & 0xFF — an arithmetic
+        // shift on the sign-extended value still yields the correct byte.
         Util.arrayFillNonAtomic(out, outOff, (short)64, (byte)0);
         for (short i = 31; i >= 0; i--) {
-            int ai = a[(short)(aOff+i)] & 0xFF;
+            short ai = (short)(a[(short)(aOff+i)] & 0xFF);
             if (ai == 0) continue;
-            int carry = 0;
+            short carry = 0;
             for (short j = 31; j >= 0; j--) {
-                int bj   = b[(short)(bOff+j)] & 0xFF;
+                short bj  = (short)(b[(short)(bOff+j)] & 0xFF);
                 short pos = (short)(outOff + i + j + 1);
-                int  cur  = out[pos] & 0xFF;
-                int  prod = ai * bj + cur + carry;
+                short cur = (short)(out[pos] & 0xFF);
+                short prod = (short)((short)(ai * bj) + cur + carry);
                 out[pos]  = (byte)(prod & 0xFF);
-                carry     = prod >>> 8;
+                carry     = (short)((prod >> 8) & 0xFF);
             }
             // propagate carry into upper bytes
             short pos = (short)(outOff + i);
             while (carry != 0 && pos >= outOff) {
-                int s = (out[pos] & 0xFF) + carry;
+                short s = (short)((short)(out[pos] & 0xFF) + carry);
                 out[pos--] = (byte)(s & 0xFF);
-                carry      = s >>> 8;
+                carry      = (short)((s >> 8) & 0xFF);
             }
         }
     }
@@ -376,11 +382,23 @@ final class SchnorrHW {
         byte[] hiContrib = new byte[32];
         mul256x32(t2, (short)0, DELTA, (short)0, hiContrib, (short)0);
         // Now sum = hiContrib + t2[32..63] + t[32..63] + p[32..63]
-        add4x32(hiContrib, (short)0,
+        short carry = add4x32(hiContrib, (short)0,
                 t2, (short)32,
                 t, (short)32,
                 p, (short)(pOff+32),
                 out, outOff);
+        // The four-term sum can exceed 2^256. Each overflow unit is a dropped
+        // 2^256, and 2^256 ≡ DELTA (mod n), so fold it back rather than losing
+        // it. Adding DELTA can itself overflow, hence the loop; carry shrinks
+        // rapidly (DELTA < 2^129) so this terminates after a couple of rounds.
+        while (carry != 0) {
+            short pending = carry;
+            carry = 0;
+            for (short i = 0; i < pending; i++) {
+                carry = (short)(carry
+                        + add32(out, outOff, DELTA, (short)0, out, outOff));
+            }
+        }
         // Final reduction: at most 2–3 conditional subtracts
         while (cmp32(out, outOff, N, (short)0) >= 0) {
             sub32(out, outOff, N, (short)0, out, outOff);
@@ -407,22 +425,45 @@ final class SchnorrHW {
      * out = (a + b + c + d) mod n   — four 32-byte big-endian terms.
      * Carries propagated correctly for sum up to 4*(2^256 − 1) ≈ 2^258.
      */
-    private static void add4x32(byte[] a, short aOff,
+    private static short add4x32(byte[] a, short aOff,
                                  byte[] b, short bOff,
                                  byte[] c, short cOff,
                                  byte[] d, short dOff,
                                  byte[] out, short outOff) {
-        int carry = 0;
+        // Max per step: 4*255 + carry <= 1024, well inside a signed short.
+        short carry = 0;
         for (short i = 31; i >= 0; i--) {
-            int s = (a[(short)(aOff+i)] & 0xFF)
-                  + (b[(short)(bOff+i)] & 0xFF)
-                  + (c[(short)(cOff+i)] & 0xFF)
-                  + (d[(short)(dOff+i)] & 0xFF)
-                  + carry;
+            short s = (short)((short)(a[(short)(aOff+i)] & 0xFF)
+                            + (short)(b[(short)(bOff+i)] & 0xFF)
+                            + (short)(c[(short)(cOff+i)] & 0xFF)
+                            + (short)(d[(short)(dOff+i)] & 0xFF)
+                            + carry);
             out[(short)(outOff+i)] = (byte)(s & 0xFF);
-            carry = s >>> 8;
+            carry = (short)((s >> 8) & 0xFF);
         }
-        // carry is small (≤ 3) — apply mod-n reduces below handle it
+        // The caller MUST fold this carry back in: each unit of carry is a
+        // dropped 2^256, which is worth DELTA (mod n). Returning it instead of
+        // discarding it fixes mulModN for sums that overflow 256 bits.
+        return carry;
+    }
+
+    /**
+     * out = a + b for 32-byte big-endian values.
+     *
+     * @return carry out of the most significant byte (0 or 1)
+     */
+    private static short add32(byte[] a, short aOff,
+                               byte[] b, short bOff,
+                               byte[] out, short outOff) {
+        short carry = 0;
+        for (short i = 31; i >= 0; i--) {
+            short s = (short)((short)(a[(short)(aOff+i)] & 0xFF)
+                            + (short)(b[(short)(bOff+i)] & 0xFF)
+                            + carry);
+            out[(short)(outOff+i)] = (byte)(s & 0xFF);
+            carry = (short)((s >> 8) & 0xFF);
+        }
+        return carry;
     }
 
     // ── Utility ───────────────────────────────────────────────────────────

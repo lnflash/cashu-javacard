@@ -171,15 +171,17 @@ public class CashuApplet extends Applet {
     private ECPublicKey  cardPubKey;
 
     // -------------------------------------------------------------------------
-    // Hardware Schnorr engine (ENG-182)
+    // Schnorr engine (ENG-182)
     //
-    // HARDWARE = true  → uses SchnorrHW (JavaCard-native, no BigInteger)
-    //                    Required for real .cap deployment.
-    // HARDWARE = false → uses signMessage() BigInteger simulation (jCardSim only)
-    //                    Set false for test builds / jCardSim.
+    // SchnorrHW is the only signer. It uses JavaCard-native crypto
+    // (ALG_EC_SVDP_DH_PLAIN_XY + byte-array modular arithmetic) and therefore
+    // requires JavaCard 3.0.5 or later — that constant does not exist in 3.0.4.
+    //
+    // A BigInteger-based simulation used to live here behind a HARDWARE flag.
+    // It could never be converted to a .cap (the JavaCard runtime has no
+    // java.math, java.security, java.util or long), so it has been removed.
     // -------------------------------------------------------------------------
-    static final boolean HARDWARE = false; // ← flip to true for .cap build
-    private SchnorrHW schnorrHW;           // null when HARDWARE=false
+    private SchnorrHW schnorrHW;
 
     // -------------------------------------------------------------------------
     // Transient state (RAM, cleared on deselect)
@@ -208,11 +210,9 @@ public class CashuApplet extends Applet {
         scratch         = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
         initCardKeypair();
 
-        if (HARDWARE) {
-            schnorrHW = new SchnorrHW(SECP256K1_G, SECP256K1_P,
-                                      SECP256K1_A, SECP256K1_B, SECP256K1_N);
-            schnorrHW.init();
-        }
+        schnorrHW = new SchnorrHW(SECP256K1_G, SECP256K1_P,
+                                  SECP256K1_A, SECP256K1_B, SECP256K1_N);
+        schnorrHW.init();
     }
 
     /**
@@ -335,17 +335,16 @@ public class CashuApplet extends Applet {
 
     private void processGetBalance(APDU apdu) {
         byte[] buf = apdu.getBuffer();
-        long balance = 0;
+        // Accumulate the uint32 total directly in the outgoing buffer.
+        // JavaCard has no long, so the sum is done byte-wise with carry.
+        buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0;
         for (short i = 0; i < MAX_PROOFS; i++) {
             short base = (short)(i * PROOF_SIZE);
             if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] == STATUS_UNSPENT) {
-                balance += getUint32(proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
+                addUint32(buf, (short) 0, proofStorage,
+                          (short)(base + PROOF_AMOUNT_OFFSET));
             }
         }
-        buf[0] = (byte)((balance >> 24) & 0xFF);
-        buf[1] = (byte)((balance >> 16) & 0xFF);
-        buf[2] = (byte)((balance >> 8)  & 0xFF);
-        buf[3] = (byte)( balance        & 0xFF);
         apdu.setOutgoingAndSend((short) 0, (short) 4);
     }
 
@@ -560,250 +559,49 @@ public class CashuApplet extends Applet {
     }
 
     // -------------------------------------------------------------------------
-    // Signing dispatch — hardware vs. simulation
+    // Signing
     // -------------------------------------------------------------------------
 
     /**
-     * Route BIP-340 signing to hardware (SchnorrHW) or JVM simulation.
-     * HARDWARE flag controls which path is compiled active.
+     * BIP-340 Schnorr sign over a 32-byte message: sig = (R.x || s), 64 bytes.
+     * Delegates to SchnorrHW (JavaCard-native crypto).
+     *
+     * @param msg    source buffer containing the 32-byte message
+     * @param msgOff offset of the message in the source buffer
+     * @param msgLen message length (must be 32)
+     * @param out    output buffer (receives the 64-byte signature)
+     * @param outOff offset in the output buffer
+     * @return 64 (signature length)
      */
     private short doSign(byte[] msg, short msgOff, short msgLen,
                          byte[] out, short outOff) {
-        if (HARDWARE) {
-            // Hardware path: JavaCard-native crypto, no BigInteger.
-            // SchnorrHW uses ALG_EC_SVDP_DH_PLAIN_XY + int[] modular arithmetic.
-            return schnorrHW.sign(cardPrivKey, cardPubKey, msg, msgOff, out, outOff);
-        } else {
-            // Simulation path: BigInteger-based, correct on JVM / jCardSim.
-            return signMessage(msg, msgOff, msgLen, out, outOff);
+        if (msgLen != (short) 32) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Crypto — BIP-340 Schnorr signature (SIMULATION — JVM / jCardSim only)
-    //
-    // ⚠️  Uses java.math.BigInteger, java.security.MessageDigest, java.util.Arrays,
-    // and System.arraycopy — NONE of which are available in the JavaCard runtime.
-    //
-    // This implementation is correct for jCardSim testing on the JVM.
-    // For hardware deployment: HARDWARE=true routes through SchnorrHW instead.
-    // -------------------------------------------------------------------------
-
-    /**
-     * BIP-340 Schnorr sign: sig = (R.x || s), 64 bytes.
-     *
-     * Algorithm:
-     *   1. If P.y is odd, negate d (ensure P has even y)
-     *   2. k = tagged_hash("BIP0340/nonce", d_norm || aux(0) || msg) mod n
-     *   3. R = k * G
-     *   4. If R.y is odd, negate k
-     *   5. e = tagged_hash("BIP0340/challenge", R.x || P.x || msg) mod n
-     *   6. s = (k + e * d) mod n
-     *   7. return R.x || s
-     *
-     * @param msg    source buffer containing 32-byte message
-     * @param msgOff offset of message in source buffer
-     * @param msgLen message length (must be 32)
-     * @param out    output buffer (receives 64-byte signature)
-     * @param outOff offset in output buffer
-     * @return 64 (signature length)
-     */
-    private short signMessage(byte[] msg, short msgOff, short msgLen,
-                              byte[] out, short outOff) {
-        try {
-            java.math.BigInteger N = new java.math.BigInteger(1, SECP256K1_N);
-            java.math.BigInteger Fp = new java.math.BigInteger(1, SECP256K1_P);
-
-            // --- Extract private key scalar d ---
-            byte[] dBytes = new byte[32];
-            cardPrivKey.getS(dBytes, (short) 0);
-            java.math.BigInteger d = new java.math.BigInteger(1, dBytes);
-
-            // --- Extract public key x-coordinate Px ---
-            // jCardSim returns uncompressed key (65 bytes: 0x04 || x || y)
-            // Real JavaCard hardware returns compressed (33 bytes: 0x02/0x03 || x)
-            byte[] wBytes = new byte[65];
-            short wLen = cardPubKey.getW(wBytes, (short) 0);
-
-            byte[] Px;
-            java.math.BigInteger Py_val;
-            if (wLen == 65 && wBytes[0] == 0x04) {
-                // Uncompressed (jCardSim)
-                Px = java.util.Arrays.copyOfRange(wBytes, 1, 33);
-                Py_val = new java.math.BigInteger(1,
-                    java.util.Arrays.copyOfRange(wBytes, 33, 65));
-            } else {
-                // Compressed — derive y from x
-                Px = java.util.Arrays.copyOfRange(wBytes, 1, 33);
-                java.math.BigInteger x = new java.math.BigInteger(1, Px);
-                java.math.BigInteger rhs = x.modPow(java.math.BigInteger.valueOf(3), Fp)
-                    .add(java.math.BigInteger.valueOf(7)).mod(Fp);
-                Py_val = rhs.modPow(Fp.add(java.math.BigInteger.ONE)
-                    .divide(java.math.BigInteger.valueOf(4)), Fp);
-                boolean parityBit = (wBytes[0] & 1) == 1;
-                if (Py_val.testBit(0) != parityBit) {
-                    Py_val = Fp.subtract(Py_val);
-                }
-            }
-
-            // Step 1: if P.y is odd, negate d
-            if (Py_val.testBit(0)) {
-                d = N.subtract(d);
-            }
-
-            // Step 2: k = tagged_hash("BIP0340/nonce", d_norm || zeros32 || msg) mod n
-            byte[] dNorm = toBytes32(d);
-            byte[] auxRand = new byte[32]; // deterministic: all zeros
-            byte[] msgBytes = java.util.Arrays.copyOfRange(msg, msgOff, msgOff + 32);
-            byte[] nonceInput = concat3(dNorm, auxRand, msgBytes);
-            byte[] kHash = taggedHash("BIP0340/nonce", nonceInput);
-            java.math.BigInteger k = new java.math.BigInteger(1, kHash).mod(N);
-            if (k.signum() == 0) k = java.math.BigInteger.ONE; // degenerate case
-
-            // Step 3: R = k * G
-            java.math.BigInteger Gx = new java.math.BigInteger(1,
-                java.util.Arrays.copyOfRange(SECP256K1_G, 1, 33));
-            java.math.BigInteger Gy = new java.math.BigInteger(1,
-                java.util.Arrays.copyOfRange(SECP256K1_G, 33, 65));
-            java.math.BigInteger[] R = ecMul(k, Gx, Gy, Fp, N);
-            if (R == null) ISOException.throwIt(SW_CRYPTO_ERROR);
-
-            // Step 4: if R.y is odd, negate k
-            if (R[1].testBit(0)) {
-                k = N.subtract(k);
-            }
-            byte[] Rx = toBytes32(R[0]);
-
-            // Step 5: e = tagged_hash("BIP0340/challenge", Rx || Px || msg) mod n
-            byte[] challengeInput = concat3(Rx, Px, msgBytes);
-            byte[] eHash = taggedHash("BIP0340/challenge", challengeInput);
-            java.math.BigInteger e = new java.math.BigInteger(1, eHash).mod(N);
-
-            // Step 6: s = (k + e * d) mod n
-            java.math.BigInteger s = k.add(e.multiply(d)).mod(N);
-
-            // Step 7: sig = Rx || s (64 bytes)
-            byte[] sBytes = toBytes32(s);
-            System.arraycopy(Rx,     0, out, outOff,        32);
-            System.arraycopy(sBytes, 0, out, outOff + 32,   32);
-            return (short) 64;
-
-        } catch (ISOException e) {
-            throw e;
-        } catch (Exception e) {
-            ISOException.throwIt(SW_CRYPTO_ERROR);
-            return (short) 0; // unreachable
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // EC math helpers (BigInteger-based, jCardSim/JVM only)
-    // -------------------------------------------------------------------------
-
-    /**
-     * Scalar multiplication: returns k * (x, y) on the curve y² = x³ + 7 (mod p).
-     * Uses double-and-add. Returns null for point at infinity.
-     */
-    private static java.math.BigInteger[] ecMul(java.math.BigInteger k,
-                                                  java.math.BigInteger x,
-                                                  java.math.BigInteger y,
-                                                  java.math.BigInteger p,
-                                                  java.math.BigInteger n) {
-        java.math.BigInteger[] R = null;
-        java.math.BigInteger[] P = { x, y };
-        k = k.mod(n);
-        while (k.signum() > 0) {
-            if (k.testBit(0)) {
-                R = (R == null) ? new java.math.BigInteger[]{ P[0], P[1] }
-                                : ecAdd(R[0], R[1], P[0], P[1], p);
-            }
-            P = ecAdd(P[0], P[1], P[0], P[1], p); // double
-            k = k.shiftRight(1);
-        }
-        return R;
-    }
-
-    /**
-     * EC point addition / doubling on y² = x³ + 7 (mod p).
-     * Handles P == Q (doubling) and P != Q (addition).
-     * Returns null for point at infinity.
-     */
-    private static java.math.BigInteger[] ecAdd(java.math.BigInteger x1,
-                                                  java.math.BigInteger y1,
-                                                  java.math.BigInteger x2,
-                                                  java.math.BigInteger y2,
-                                                  java.math.BigInteger p) {
-        java.math.BigInteger lambda;
-        java.math.BigInteger TWO   = java.math.BigInteger.valueOf(2);
-        java.math.BigInteger THREE = java.math.BigInteger.valueOf(3);
-        java.math.BigInteger pMinus2 = p.subtract(TWO);
-
-        if (x1.equals(x2)) {
-            if (!y1.equals(y2)) return null; // P + (-P) = infinity
-            // Doubling: λ = (3x²) / (2y) mod p  [a=0 for secp256k1]
-            java.math.BigInteger num = THREE.multiply(x1.modPow(TWO, p)).mod(p);
-            java.math.BigInteger den = TWO.multiply(y1).mod(p);
-            lambda = num.multiply(den.modPow(pMinus2, p)).mod(p);
-        } else {
-            // Addition: λ = (y2 - y1) / (x2 - x1) mod p
-            java.math.BigInteger num = y2.subtract(y1).mod(p);
-            java.math.BigInteger den = x2.subtract(x1).mod(p);
-            lambda = num.multiply(den.modPow(pMinus2, p)).mod(p);
-        }
-        java.math.BigInteger x3 = lambda.modPow(TWO, p).subtract(x1).subtract(x2).mod(p);
-        java.math.BigInteger y3 = lambda.multiply(x1.subtract(x3)).subtract(y1).mod(p);
-        // Ensure non-negative
-        if (x3.signum() < 0) x3 = x3.add(p);
-        if (y3.signum() < 0) y3 = y3.add(p);
-        return new java.math.BigInteger[]{ x3, y3 };
-    }
-
-    /**
-     * BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
-     */
-    private static byte[] taggedHash(String tag, byte[] msg)
-            throws java.security.NoSuchAlgorithmException {
-        java.security.MessageDigest sha256 =
-            java.security.MessageDigest.getInstance("SHA-256");
-        byte[] tagHash = sha256.digest(tag.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        sha256.reset();
-        sha256.update(tagHash);
-        sha256.update(tagHash);
-        sha256.update(msg);
-        return sha256.digest();
-    }
-
-    /** Encode a BigInteger as a big-endian 32-byte array (zero-padded). */
-    private static byte[] toBytes32(java.math.BigInteger n) {
-        byte[] b = n.toByteArray();
-        if (b.length == 32) return b;
-        byte[] out = new byte[32];
-        if (b.length > 32) {
-            // strip leading 0x00 sign byte
-            System.arraycopy(b, b.length - 32, out, 0, 32);
-        } else {
-            System.arraycopy(b, 0, out, 32 - b.length, b.length);
-        }
-        return out;
-    }
-
-    /** Concatenate three byte arrays. */
-    private static byte[] concat3(byte[] a, byte[] b, byte[] c) {
-        byte[] out = new byte[a.length + b.length + c.length];
-        System.arraycopy(a, 0, out, 0,                    a.length);
-        System.arraycopy(b, 0, out, a.length,             b.length);
-        System.arraycopy(c, 0, out, a.length + b.length,  c.length);
-        return out;
+        return schnorrHW.sign(cardPrivKey, cardPubKey, msg, msgOff, out, outOff);
     }
 
     // -------------------------------------------------------------------------
     // Utility
     // -------------------------------------------------------------------------
 
-    private long getUint32(byte[] buf, short offset) {
-        return ((long)(buf[offset]              & 0xFF) << 24)
-             | ((long)(buf[(short)(offset + 1)] & 0xFF) << 16)
-             | ((long)(buf[(short)(offset + 2)] & 0xFF) << 8)
-             |  (long)(buf[(short)(offset + 3)] & 0xFF);
+    /**
+     * Big-endian 32-bit add: acc[accOff..accOff+3] += src[srcOff..srcOff+3].
+     *
+     * JavaCard has no long and int is optional, so the addition is performed
+     * byte-wise with an explicit carry. Overflow past 2^32-1 wraps, which
+     * cannot occur in practice: 32 slots of uint32 amounts cannot exceed
+     * 2^32-1 for any realistic denomination set.
+     */
+    private static void addUint32(byte[] acc, short accOff,
+                                  byte[] src, short srcOff) {
+        short carry = 0;
+        for (short i = 3; i >= 0; i--) {
+            short sum = (short) ((short)(acc[(short)(accOff + i)] & 0xFF)
+                               + (short)(src[(short)(srcOff + i)] & 0xFF)
+                               + carry);
+            acc[(short)(accOff + i)] = (byte) (sum & 0xFF);
+            carry = (short) ((sum >> 8) & 0xFF);
+        }
     }
 }

@@ -17,7 +17,7 @@
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <jcardsim.version>3.0.5</jcardsim.version>
+        <jcardsim.version>3.0.6.0</jcardsim.version>
         <junit.version>5.10.1</junit.version>
     </properties>
 
@@ -25,10 +25,15 @@
         <!--
             jCardSim provides the JavaCard API (javacard.framework.*, javacard.security.*, etc.)
             and a software simulator of the JavaCard runtime. Used for both compilation and testing.
-            https://github.com/licel/jcardsim
+
+            NOTE: upstream com.licel:jcardsim only publishes 2.2.2 to Maven Central,
+            so `com.licel:jcardsim:3.0.5` could never resolve from a clean checkout.
+            com.klinec is the maintained fork that ships a JavaCard 3.0.5-era API
+            to Central; package names (com.licel.jcardsim.*) are unchanged.
+            https://github.com/ph4r05/jcardsim
         -->
         <dependency>
-            <groupId>com.licel</groupId>
+            <groupId>com.klinec</groupId>
             <artifactId>jcardsim</artifactId>
             <version>${jcardsim.version}</version>
             <scope>compile</scope>

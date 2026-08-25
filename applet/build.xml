@@ -14,8 +14,11 @@
     ant verify         → run cap-lint checks (requires gp.jar on PATH)
 
   Deploy (after build):
-    gp --install target/cashu-javacard-0.1.0.cap
-    gp --list
+    gp -install target/cashu-javacard-0.1.0.cap
+    gp -list
+
+  (GlobalPlatformPro accepts single-dash long options; the double-dash form
+   cannot appear here because "- -" is illegal inside an XML comment.)
 
   Reference:
     https://github.com/martinpaljak/ant-javacard
@@ -23,7 +26,25 @@
 -->
 <project name="CashuJavaCard" default="cap" basedir=".">
 
-    <property name="ant.javacard.version" value="21.11.25"/>
+    <!-- Release tags carry a "v" prefix; the download URL below relies on it. -->
+    <property name="ant.javacard.version" value="v26.05.15"/>
+    <!--
+      JavaCard SDK used by the converter. Override with -Djc.sdk=/path/to/kit.
+      Get the kits with:
+        git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
+    -->
+    <!--
+      jc.sdk    = converter/toolchain used to build (must match your JDK;
+                  the 3.0.4 converter caps at Java 1.6 and needs JDK 11).
+      jc.target = CAP format / API targeted. MUST be >= 3.0.5: SchnorrHW needs
+                  KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, which was introduced in
+                  JavaCard 3.0.5 and does NOT exist in 3.0.4. That rules out
+                  JCOP3 / J3H145 / Feitian 3.0.4 cards — use JCOP4 (JC 3.0.5).
+    -->
+    <property name="jc.sdk"
+              value="${user.home}/.javacard/sdks/jc305u4_kit"/>
+    <property name="jc.target"
+              value="${user.home}/.javacard/sdks/jc305u4_kit"/>
     <property name="src.dir"    value="src/main/java"/>
     <property name="target.dir" value="target"/>
     <property name="cap.file"   value="${target.dir}/cashu-javacard-0.1.0.cap"/>
@@ -65,7 +86,8 @@
             description="Build CashuApplet.cap (JavaCard 3.0.4)">
         <javacard>
             <cap
-                jckit="3.0.4"
+                jckit="${jc.sdk}"
+                targetsdk="${jc.target}"
                 sources="${src.dir}"
                 package="me.flashapp.cashu"
                 version="0.1"
@@ -83,7 +105,8 @@
             description="Build CashuApplet.cap with debug symbols">
         <javacard>
             <cap
-                jckit="3.0.4"
+                jckit="${jc.sdk}"
+                targetsdk="${jc.target}"
                 sources="${src.dir}"
                 package="me.flashapp.cashu"
                 version="0.1"
