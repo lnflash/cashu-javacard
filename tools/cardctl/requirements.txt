@@ -1,0 +1,4 @@
+# PC/SC bindings. This is the only runtime dependency — the BIP-340 verifier is
+# pure Python on purpose, so a card can be validated on a machine where a native
+# secp256k1 build is not available.
+pyscard>=2.0.7
