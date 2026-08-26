@@ -222,8 +222,11 @@ public class CashuApplet extends Applet {
      * generating a random key pair.
      *
      * Hardware notes:
-     * - JCOP4 SmartMX3, Feitian JavaCard 3.0.4+: support custom EC-FP curves
-     * - jCardSim 3.x: supported
+     * - JCOP4 SmartMX3 (JavaCard 3.0.5): supports custom EC-FP curves
+     * - jCardSim 3.x: supported, but its generator is seeded with
+     *   SecureRandomNullProvider, so every simulator produces the SAME keypair
+     * - JavaCard 3.0.4 chips are NOT supported by this applet at all — see the
+     *   SchnorrHW note above
      */
     private void initCardKeypair() {
         cardKeyPair  = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
@@ -320,8 +323,6 @@ public class CashuApplet extends Applet {
         //   bit0 = secp256k1 native key generation (set — ENG-181 complete)
         //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
         //   bit2 = PIN supported (always set)
-        // Note: bits 0+1 are marked as simulation-quality for jCardSim.
-        //   Hardware deployment (ENG-182) requires Schnorr replacement.
         buf[6] = (byte) 0x07; // secp256k1 + Schnorr + PIN
         buf[7] = pinState[0];
         apdu.setOutgoingAndSend((short) 0, (short) 8);
@@ -589,9 +590,12 @@ public class CashuApplet extends Applet {
      * Big-endian 32-bit add: acc[accOff..accOff+3] += src[srcOff..srcOff+3].
      *
      * JavaCard has no long and int is optional, so the addition is performed
-     * byte-wise with an explicit carry. Overflow past 2^32-1 wraps, which
-     * cannot occur in practice: 32 slots of uint32 amounts cannot exceed
-     * 2^32-1 for any realistic denomination set.
+     * byte-wise with an explicit carry.
+     *
+     * Overflow past 2^32-1 wraps silently and is NOT detected. It cannot occur
+     * for any realistic denomination set (32 slots of sane uint32 amounts stay
+     * far below 2^32-1), but the wrap is real behaviour, not an impossibility —
+     * see testGetBalanceWrapsPast2Pow32, which pins it.
      */
     private static void addUint32(byte[] acc, short accOff,
                                   byte[] src, short srcOff) {

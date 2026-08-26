@@ -6,12 +6,15 @@
   Prerequisites:
     1. Apache Ant  ≥ 1.10  (brew install ant)
     2. ant-javacard plugin  (auto-downloaded by this script)
-    3. Java 11+  (required for ant-javacard itself; the cap targets JC 3.0.4)
+    3. Java 11+  (required for ant-javacard itself; the cap targets JC 3.0.5)
+    4. A JavaCard 3.0.5 SDK. It is NOT auto-downloaded — clone the kits and
+       point jc.sdk at one:
+         git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
+         ant cap -Djc.sdk=$HOME/.javacard/sdks/jc305u4_kit
 
   Build:
     ant cap            → applet/target/cashu-javacard-0.1.0.cap
     ant cap-debug      → same but with debug info
-    ant verify         → run cap-lint checks (requires gp.jar on PATH)
 
   Deploy (after build):
     gp -install target/cashu-javacard-0.1.0.cap
@@ -34,16 +37,17 @@
         git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
     -->
     <!--
-      jc.sdk    = converter/toolchain used to build (must match your JDK;
-                  the 3.0.4 converter caps at Java 1.6 and needs JDK 11).
-      jc.target = CAP format / API targeted. MUST be >= 3.0.5: SchnorrHW needs
-                  KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, which was introduced in
-                  JavaCard 3.0.5 and does NOT exist in 3.0.4. That rules out
-                  JCOP3 / J3H145 / Feitian 3.0.4 cards — use JCOP4 (JC 3.0.5).
+      jc.sdk = the JavaCard SDK used as BOTH the converter toolchain (jckit) and
+               the targeted CAP format / API (targetsdk). One knob, not two:
+               they must agree, and having a second property that silently kept
+               its stale default when only jc.sdk was overridden was a trap.
+
+               MUST be >= 3.0.5. SchnorrHW needs
+               KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, introduced in JavaCard
+               3.0.5; it does NOT exist in 3.0.4. That rules out JCOP3 / J3H145
+               / Feitian 3.0.4 cards — use JCOP4 (JC 3.0.5).
     -->
     <property name="jc.sdk"
-              value="${user.home}/.javacard/sdks/jc305u4_kit"/>
-    <property name="jc.target"
               value="${user.home}/.javacard/sdks/jc305u4_kit"/>
     <property name="src.dir"    value="src/main/java"/>
     <property name="target.dir" value="target"/>
@@ -73,8 +77,9 @@
 
     <!-- ── Main cap build target ──────────────────────────────────────── -->
     <!--
-      Targets JavaCard API 3.0.4 (Feitian JavaCard 3.0.4, NXP JCOP4).
-      ant-javacard auto-downloads the matching JCDK SDK if not present.
+      Targets JavaCard API 3.0.5 (NXP JCOP4). The SDK is NOT auto-downloaded:
+      clone https://github.com/martinpaljak/oracle_javacard_sdks or pass
+      -Djc.sdk=/path/to/jc305u4_kit.
 
       AID breakdown:
         Package AID : D2 76 00 00 85 01 02      (7 bytes)
@@ -83,11 +88,11 @@
       The package AID is also the SELECT AID used by NFC readers.
     -->
     <target name="cap" depends="setup"
-            description="Build CashuApplet.cap (JavaCard 3.0.4)">
+            description="Build CashuApplet.cap (JavaCard 3.0.5)">
         <javacard>
             <cap
                 jckit="${jc.sdk}"
-                targetsdk="${jc.target}"
+                targetsdk="${jc.sdk}"
                 sources="${src.dir}"
                 package="me.flashapp.cashu"
                 version="0.1"
@@ -102,11 +107,11 @@
 
     <!-- ── Debug cap (includes line-number table) ─────────────────────── -->
     <target name="cap-debug" depends="setup"
-            description="Build CashuApplet.cap with debug symbols">
+            description="Build CashuApplet.cap with debug symbols (JavaCard 3.0.5)">
         <javacard>
             <cap
                 jckit="${jc.sdk}"
-                targetsdk="${jc.target}"
+                targetsdk="${jc.sdk}"
                 sources="${src.dir}"
                 package="me.flashapp.cashu"
                 version="0.1"

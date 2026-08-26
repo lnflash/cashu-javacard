@@ -701,6 +701,105 @@ class CashuAppletTest {
     }
 
     // =========================================================================
+    // Odd-y normalisation coverage
+    // =========================================================================
+
+    /**
+     * SchnorrHW.sign() branches on the parity of the card public key's
+     * y-coordinate: if P.y is odd it must sign with d = n − d instead of d. On
+     * real cards the parity is a coin flip per card, so getting that branch
+     * wrong would break half the fleet.
+     *
+     * Under jCardSim the parity is not a coin flip and not even random:
+     * KeyPairImpl seeds its EC generator with SecureRandomNullProvider, so
+     * every simulator ever created generates the SAME keypair — and that
+     * keypair has an even y. No number of fresh installs will ever exercise the
+     * odd-y path through the APDU layer.
+     *
+     * This test pins that fact, because it is the sole justification for
+     * SchnorrHWSignTest driving SchnorrHW.sign() directly with chosen keys. If
+     * this assertion ever starts failing, jCardSim has gained real key
+     * randomness: applet-level parity coverage becomes possible, and the note in
+     * SchnorrHWSignTest should be revisited — but the direct test stays, because
+     * it is deterministic and this would not be.
+     */
+    @Test @Order(41)
+    @DisplayName("Card signature verifies; jCardSim's fixed key covers only the even-y path")
+    void testCardSignatureAndParityCoverageLimit() throws Exception {
+        byte[] msg = new byte[32];
+        for (int i = 0; i < 32; i++) msg[i] = (byte) (0x5A ^ i);
+
+        byte[] firstPub = null;
+        for (int i = 0; i < 5; i++) {
+            CardSimulator card = freshCard();
+            byte[] pub = card.transmitCommand(
+                new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
+            if (firstPub == null) {
+                firstPub = pub;
+            } else {
+                assertArrayEquals(firstPub, pub,
+                    "jCardSim is expected to generate an identical keypair on every fresh "
+                        + "card (SecureRandomNullProvider). It no longer does — re-read the "
+                        + "comment on this test and on SchnorrHWSignTest.");
+            }
+
+            ResponseAPDU resp = card.transmitCommand(
+                new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
+            assertEquals(SW_OK, resp.getSW(), "card " + i + ": SIGN_ARBITRARY failed");
+            assertTrue(schnorrVerify(extractPubkeyX(pub), msg, resp.getData()),
+                "card " + i + ": signature must verify against the card's own public key");
+        }
+
+        assertFalse(pubkeyYIsOdd(firstPub),
+            "jCardSim's fixed keypair is expected to have an even P.y, so the APDU-level "
+                + "tests only ever exercise the plain-d path. The odd-y d = n - d branch is "
+                + "covered deterministically in SchnorrHWSignTest — check it still is.");
+    }
+
+    // =========================================================================
+    // GET_BALANCE carry propagation (addUint32)
+    // =========================================================================
+
+    @Test @Order(42)
+    @DisplayName("GET_BALANCE carries correctly past 2^16 and 2^24")
+    void testGetBalanceCarriesAcrossAllBytes() {
+        // 4 x 0x00FFFFFF = 0x03FFFFFC, then + 0x01000000 = 0x04FFFFFC.
+        // Forces carries out of bytes 3, 2 and 1 — testGetBalanceAfterLoad
+        // (1000 + 500) only ever carries out of byte 3.
+        for (int i = 0; i < 4; i++) {
+            byte[] p = buildProof("0059534c", 0x00FFFFFFL, i);
+            assertEquals(SW_OK,
+                transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, p, 0, p.length, 1)).getSW());
+        }
+        byte[] big = buildProof("0059534c", 0x01000000L, 9);
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, big, 0, big.length, 1)).getSW());
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
+        assertEquals(SW_OK, resp.getSW());
+        assertEquals(0x04FFFFFCL, readUint32(resp.getData(), 0),
+            "4 x 0x00FFFFFF + 0x01000000 must be 0x04FFFFFC");
+    }
+
+    @Test @Order(43)
+    @DisplayName("GET_BALANCE wraps past 2^32 (addUint32 does not detect overflow)")
+    void testGetBalanceWrapsPast2Pow32() {
+        byte[] max = buildProof("0059534c", 0xFFFFFFFFL, 1);
+        byte[] two = buildProof("0059534c", 0x00000002L, 2);
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, max, 0, max.length, 1)).getSW());
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, two, 0, two.length, 1)).getSW());
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
+        assertEquals(SW_OK, resp.getSW());
+        assertEquals(1L, readUint32(resp.getData(), 0),
+            "0xFFFFFFFF + 2 wraps to 1: the uint32 accumulator has no overflow "
+                + "detection, and the applet reports the wrapped value rather than "
+                + "an error. Pinned so the behaviour is a decision, not a surprise.");
+    }
+
+    // =========================================================================
     // CLA / INS validation
     // =========================================================================
 
@@ -724,6 +823,29 @@ class CashuAppletTest {
 
     private ResponseAPDU transmit(CommandAPDU apdu) {
         return simulator.transmitCommand(apdu);
+    }
+
+    /**
+     * Install and SELECT a brand-new card. Each one runs genKeyPair() afresh, so
+     * successive calls draw independent card keys (and independent P.y parities).
+     */
+    static CardSimulator freshCard() {
+        CardSimulator sim = new CardSimulator();
+        sim.installApplet(AIDUtil.create(AID_HEX), CashuApplet.class);
+        ResponseAPDU resp = sim.transmitCommand(
+            new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
+        assertEquals(SW_OK, resp.getSW(), "SELECT on a fresh card should succeed");
+        return sim;
+    }
+
+    /** Parity of the public key's y-coordinate, from either EC point encoding. */
+    static boolean pubkeyYIsOdd(byte[] pubBytes) {
+        if (pubBytes.length == 65 && pubBytes[0] == 0x04) {
+            return (pubBytes[64] & 1) == 1;          // uncompressed: LSB of Y
+        } else if (pubBytes.length == 33) {
+            return (pubBytes[0] & 1) == 1;           // compressed: 0x02 even / 0x03 odd
+        }
+        throw new IllegalArgumentException("Unexpected pubkey length: " + pubBytes.length);
     }
 
     /** Build a 77-byte proof payload: keyset_id[8] + amount[4] + secret[32] + C[33] */

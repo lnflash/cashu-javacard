@@ -4,7 +4,7 @@ import javacard.framework.*;
 import javacard.security.*;
 
 /**
- * SchnorrHW — Hardware BIP-340 Schnorr signing for JavaCard 3.0.4
+ * SchnorrHW — Hardware BIP-340 Schnorr signing for JavaCard 3.0.5+
  *
  * This class replaces the BigInteger-based simulation in CashuApplet with a
  * JavaCard-native implementation. It uses only APIs from:
@@ -32,7 +32,19 @@ import javacard.security.*;
  *   The reduction applies the identity twice (depth-2) to bring the result
  *   to < 2n, followed by a single conditional subtract.
  *
- *   Memory: caller supplies a 256-byte transient scratchpad (CLEAR_ON_DESELECT).
+ * --- Memory discipline ---
+ *
+ *   JavaCard Classic allocates `new` in persistent EEPROM/Flash and never
+ *   collects it: an allocation on the signing path is a permanent leak that
+ *   bricks the card after a few hundred taps. Every buffer this class uses is
+ *   therefore allocated ONCE — in the constructor / init(), at install time —
+ *   as CLEAR_ON_DESELECT transient memory, and threaded down through the
+ *   arithmetic helpers as explicit (work, workOff) parameters.
+ *
+ *   No `new` may appear anywhere outside the constructor and init().
+ *
+ *   Transient footprint: `sc` (256 B scratchpad) + `work` (288 B arithmetic
+ *   scratch, see WORK_LEN).
  *
  * ENG-182 — lnflash/cashu-javacard
  */
@@ -82,6 +94,25 @@ final class SchnorrHW {
     private static final short SC_E    = (short)192;
     private static final short SC_ED   = (short)224;
 
+    // ── Transient arithmetic scratch (CLEAR_ON_DESELECT, WORK_LEN bytes) ──
+    // Threaded into mulModN as (work, workOff) so that nothing on the signing
+    // path ever calls `new`. Layout, relative to workOff:
+    //   [  0.. 63]  prod       — 512-bit a*b product           (mulModN)
+    //   [ 64..127]  t          — 512-bit p_hi*DELTA            (reduce512toModN)
+    //   [128..191]  t2         — 512-bit t_hi*DELTA            (reduce512toModN)
+    //   [192..223]  hiContrib  — 256-bit t2_hi*DELTA           (reduce512toModN)
+    //   [224..287]  full       — 512-bit scratch               (mulSmallByDelta)
+    /** Bytes of scratch mulModN needs; callers must supply at least this much. */
+    static final short WORK_LEN      = (short)288;
+    /** Offsets inside the work buffer handed to reduce512toModN. */
+    private static final short W_PROD = (short)  0;
+    private static final short W_RED  = (short) 64;   // reduce512toModN's region
+    private static final short W_T    = (short)  0;   // relative to W_RED
+    private static final short W_T2   = (short) 64;
+    private static final short W_HI   = (short)128;
+    private static final short W_SUB  = (short)160;   // mulSmallByDelta's region
+    private final byte[] work;
+
     // ── Crypto objects (allocated once) ───────────────────────────────────
     private final MessageDigest sha256;
     private final KeyAgreement  ecdh;      // ALG_EC_SVDP_DH_PLAIN_XY
@@ -111,6 +142,7 @@ final class SchnorrHW {
         tagHashChallenge = new byte[32];
 
         sc     = JCSystem.makeTransientByteArray((short)256, JCSystem.CLEAR_ON_DESELECT);
+        work   = JCSystem.makeTransientByteArray(WORK_LEN,   JCSystem.CLEAR_ON_DESELECT);
         sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
 
         // Generator as EC public key (used as ECDH "peer" for k*G)
@@ -197,7 +229,16 @@ final class SchnorrHW {
         ecdh.init(tmpPriv);
         // Result = 65-byte uncompressed point at sc[TMP]; we need 65 bytes
         // sc[TMP..TMP+64] = 04 || Rx(32) || Ry(32)
-        ecdh.generateSecret(G, (short)0, (short)65, sc, SC_TMP);
+        //
+        // ALG_EC_SVDP_DH_PLAIN_XY output framing is NOT uniform across
+        // implementations — some cards return the bare 64-byte X||Y. Everything
+        // below reads Rx at SC_TMP+1 and the y-parity at SC_TMP+64, so an
+        // unexpected framing would silently shift both by one byte and emit
+        // well-formed signatures that no mint can verify. Fail loudly instead.
+        short rLen = ecdh.generateSecret(G, (short)0, (short)65, sc, SC_TMP);
+        if (rLen != (short)65 || sc[SC_TMP] != (byte)0x04) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
 
         // ── Step 4: if R.y is odd, k = n − k ─────────────────────────
         boolean ryOdd = (sc[(short)(SC_TMP + 64)] & 1) == 1;
@@ -216,17 +257,12 @@ final class SchnorrHW {
         reduceModN(sc, SC_E);         // e = e mod n
 
         // ── Step 6: s = (k + e·d) mod n ──────────────────────────────
-        mulModN(sc, SC_E, sc, SC_D, sc, SC_ED);     // ed = e * d mod n
+        mulModN(sc, SC_E, sc, SC_D, sc, SC_ED, work, (short)0);  // ed = e * d mod n
         addModN(sc, SC_ED, sc, SC_K, out, (short)(outOff + 32)); // s = ed + k mod n
 
         // ── Step 7: output = Rx ‖ s ──────────────────────────────────
-        // Rx is at sc[TMP+1] (after R was written by ecdh.generateSecret)
-        // BUT we overwrote sc[TMP] in step 5.  We must save Rx before step 5.
-        // ⚠  Fix: copy Rx to out[outOff] BEFORE the taggedHash call above.
-        //    This requires a temporary save — use out[outOff] directly.
-        //    Revised: saved below — see note in sign2().
-        // Actually the code above has a bug: we overwrote SC_TMP in step 5 with
-        // Rx → Px → msg, so Rx is still at sc[SC_TMP..SC_TMP+31].  ✓
+        // Rx sits at sc[SC_TMP..SC_TMP+31] — step 5 shifted it there before
+        // hashing; the challenge hash wrote to SC_E, not SC_TMP.
         Util.arrayCopy(sc, SC_TMP, out, outOff, (short)32);  // Rx
 
         return (short)64;
@@ -303,25 +339,27 @@ final class SchnorrHW {
      *
      * So two iterations bring us to < 2n; final subtractIfGe finishes.
      *
-     * Temporary storage needed: 64 bytes.  Uses the caller-supplied scratch[].
-     * Callers pass sc offsets that are clear at call time.
+     * Allocates nothing: all 288 bytes of temporary storage come from the
+     * caller-supplied `work` buffer (see WORK_LEN and the layout map at the
+     * top of the class). `work` must not overlap `out`, `a` or `b`.
      *
-     * @param a      256-bit input A (32 bytes, big-endian)
-     * @param aOff   offset of A
-     * @param b      256-bit input B (32 bytes, big-endian)
-     * @param bOff   offset of B
-     * @param out    32-byte output buffer
-     * @param outOff offset in output buffer
+     * @param a       256-bit input A (32 bytes, big-endian)
+     * @param aOff    offset of A
+     * @param b       256-bit input B (32 bytes, big-endian)
+     * @param bOff    offset of B
+     * @param out     32-byte output buffer
+     * @param outOff  offset in output buffer
+     * @param work    scratch buffer, ≥ WORK_LEN bytes from workOff
+     * @param workOff offset of the scratch region
      */
     static void mulModN(byte[] a, short aOff,
                         byte[] b, short bOff,
-                        byte[] out, short outOff) {
-        // Allocate 64-byte product on the heap.
-        // In JavaCard, small transient allocations inside methods are
-        // expensive; this method is only called once per signing operation.
-        byte[] prod = new byte[64];
-        mul256x256(a, aOff, b, bOff, prod, (short)0);
-        reduce512toModN(prod, (short)0, out, outOff);
+                        byte[] out, short outOff,
+                        byte[] work, short workOff) {
+        mul256x256(a, aOff, b, bOff, work, (short)(workOff + W_PROD));
+        reduce512toModN(work, (short)(workOff + W_PROD),
+                        out, outOff,
+                        work, (short)(workOff + W_RED));
     }
 
     /**
@@ -363,28 +401,33 @@ final class SchnorrHW {
     /**
      * Reduce a 512-bit value (64 bytes, big-endian) to 256-bit mod n.
      * Uses depth-2 DELTA reduction.  Result in out[32].
+     *
+     * Allocates nothing: needs 224 bytes of scratch from work[workOff..].
+     * `work` must not overlap `p` or `out`.
      */
     private static void reduce512toModN(byte[] p, short pOff,
-                                        byte[] out, short outOff) {
+                                        byte[] out, short outOff,
+                                        byte[] work, short workOff) {
+        short tOff  = (short)(workOff + W_T);   // 64 bytes
+        short t2Off = (short)(workOff + W_T2);  // 64 bytes
+        short hiOff = (short)(workOff + W_HI);  // 32 bytes
+
         // p = p_hi * 2^256 + p_lo
         // Step 1: t = p_hi * DELTA  (256×32-eff → 256 bits after mod-n reduction)
         // t fits in 48 bytes worst-case, but we compute mod-n in two steps.
-        byte[] t = new byte[64];
-        mul256x256(p, pOff, DELTA, (short)0, t, (short)0);
+        mul256x256(p, pOff, DELTA, (short)0, work, tOff);
         // t = (p_hi * DELTA)_hi * 2^256 + (p_hi * DELTA)_lo
         // Apply identity again to t_hi part:
-        byte[] t2 = new byte[64];
-        mul256x256(t, (short)0, DELTA, (short)0, t2, (short)0);
+        mul256x256(work, tOff, DELTA, (short)0, work, t2Off);
         // t2_hi * DELTA < 2^128 * 2^128 = 2^256 < 2n → directly add, then subtract
         // Sum = t2_lo + t[32..63] + p[pOff+32..pOff+63]
-        // But t2_hi is tiny (< DELTA < 2^128), its contribution via DELTA:
+        // But t2_hi is tiny (< 2^127), its contribution via DELTA:
         //   t2_hi * DELTA < 2^256 fits in 32 bytes.
-        byte[] hiContrib = new byte[32];
-        mul256x32(t2, (short)0, DELTA, (short)0, hiContrib, (short)0);
+        mulSmallByDelta(work, t2Off, work, hiOff, work, (short)(workOff + W_SUB));
         // Now sum = hiContrib + t2[32..63] + t[32..63] + p[32..63]
-        short carry = add4x32(hiContrib, (short)0,
-                t2, (short)32,
-                t, (short)32,
+        short carry = add4x32(work, hiOff,
+                work, (short)(t2Off+32),
+                work, (short)(tOff+32),
                 p, (short)(pOff+32),
                 out, outOff);
         // The four-term sum can exceed 2^256. Each overflow unit is a dropped
@@ -406,24 +449,43 @@ final class SchnorrHW {
     }
 
     /**
-     * Multiply the 32-byte high half of a 64-byte value by DELTA (32 bytes).
-     * a[0..31] is the operand.  Result in out[32].
-     * (Convenience wrapper — takes upper half of a 64-byte buffer.)
+     * out = a * DELTA, truncated to 256 bits.
+     *
+     * <b>Requires a &lt; 2^127.</b> DELTA is a 129-bit value, so a·DELTA is up to
+     * 385 bits in general and would NOT fit in the 32-byte output — the earlier
+     * claim that "the top 32 bytes are all zero because a &lt; 2^256 and delta &lt;
+     * 2^128" was simply false. The precondition holds only because the sole
+     * caller passes the high half of t2, which the depth-2 DELTA reduction
+     * bounds far below 2^127.
+     *
+     * The precondition is <i>enforced</i>, not assumed: if the top 32 bytes of
+     * the 512-bit product are non-zero the value did not fit, and we throw
+     * rather than hand a silently truncated result back into the reduction.
+     *
+     * @param a       operand, 32 bytes big-endian at a[aOff..aOff+31]
+     * @param out     32-byte output buffer
+     * @param work    scratch, ≥ 64 bytes from workOff; must not overlap a or out
      */
-    private static void mul256x32(byte[] a, short aOff,
-                                  byte[] delta, short deltaOff,
-                                  byte[] out, short outOff) {
-        byte[] full = new byte[64];
-        mul256x256(a, aOff, delta, deltaOff, full, (short)0);
-        // full[0..31] is the upper half — for delta ≈ 2^128, the upper 32 bytes
-        // of full (the top 256 bits of the 512-bit product) are all zero because
-        // a < 2^256 and delta < 2^128.  Lower 32 bytes (full[32..63]) is the result.
-        Util.arrayCopy(full, (short)32, out, outOff, (short)32);
+    private static void mulSmallByDelta(byte[] a, short aOff,
+                                        byte[] out, short outOff,
+                                        byte[] work, short workOff) {
+        mul256x256(a, aOff, DELTA, (short)0, work, workOff);
+        for (short i = 0; i < 32; i++) {
+            if (work[(short)(workOff + i)] != (byte)0) {
+                ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+            }
+        }
+        Util.arrayCopy(work, (short)(workOff + 32), out, outOff, (short)32);
     }
 
     /**
-     * out = (a + b + c + d) mod n   — four 32-byte big-endian terms.
-     * Carries propagated correctly for sum up to 4*(2^256 − 1) ≈ 2^258.
+     * out = low 256 bits of (a + b + c + d), four 32-byte big-endian terms.
+     *
+     * This does NOT reduce mod n. It returns the carry out of bit 255, which the
+     * caller MUST fold back as carry·DELTA (each dropped 2^256 is worth DELTA
+     * mod n). Discarding the return value silently corrupts the reduction.
+     *
+     * @return carry out of bit 255 (0..3 for four 256-bit terms)
      */
     private static short add4x32(byte[] a, short aOff,
                                  byte[] b, short bOff,
