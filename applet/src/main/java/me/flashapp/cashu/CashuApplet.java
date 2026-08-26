@@ -190,9 +190,6 @@ public class CashuApplet extends Applet {
     /** Set to 0x01 after successful VERIFY_PIN; cleared on deselect */
     private byte[] pinVerifiedFlag;
 
-    /** Scratch buffer for crypto operations */
-    private byte[] scratch;
-
     // -------------------------------------------------------------------------
     // Install / init
     // -------------------------------------------------------------------------
@@ -207,7 +204,6 @@ public class CashuApplet extends Applet {
         pinState        = new byte[1];
         pin             = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
-        scratch         = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
         initCardKeypair();
 
         schnorrHW = new SchnorrHW(SECP256K1_G, SECP256K1_P,
@@ -240,7 +236,9 @@ public class CashuApplet extends Applet {
      * Sets secp256k1 curve parameters on a JavaCard EC key pair.
      *
      * This method uses only the standard JavaCard ECKey API and is
-     * hardware-compatible (JCOP4, Feitian, jCardSim).
+     * hardware-compatible (JCOP4 and any JavaCard 3.0.5+ part with custom EC-FP
+     * curve support; jCardSim). Feitian's JavaCard 3.0.4 parts are not in that
+     * set — see the note on initCardKeypair above.
      *
      * @param pub  EC public key to configure
      * @param priv EC private key to configure

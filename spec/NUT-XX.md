@@ -70,7 +70,7 @@ Profile A is not formally specified here. The [cashubtc/Numo](https://github.com
 | Persistent storage | ≥ 8 KB non-volatile (2,496 bytes proof storage + OS overhead) |
 | AID | `D2 76 00 00 85 01 02` |
 
-> **Note**: Any ISO 7816-4 compliant NFC device capable of secp256k1 key generation and Schnorr signing may implement Profile B. Example chips known to meet these requirements: NXP JCOP4 SmartMX3 (CC EAL 5+), Feitian JavaCard 3.0.4+.
+> **Note**: Any ISO 7816-4 compliant NFC device capable of secp256k1 key generation and Schnorr signing may implement Profile B. Example chips known to meet these requirements: NXP JCOP4 SmartMX3 (JavaCard 3.0.5+, CC EAL 5+). Note that the Profile B reference applet needs `ALG_EC_SVDP_DH_PLAIN_XY`, which is JavaCard 3.0.5+, so JavaCard 3.0.4 parts cannot run it.
 
 ### Proof Format on Card
 
@@ -338,17 +338,26 @@ The 64-byte response is a [BIP-340](https://github.com/bitcoin/bips/blob/master/
 [R_x (32 bytes)] [s (32 bytes)]
 ```
 
-Signing algorithm (BIP-340):
+Signing algorithm (BIP-340 default signing):
 
 1. Let `d` = card private key scalar; `P` = `d * G`
 2. If `P.y` is odd, let `d' = n - d`, else `d' = d`
-3. Let `k` = `tagged_hash("BIP0340/nonce", d' || zeros32 || msg) mod n`
-4. Let `R = k * G`; if `R.y` is odd, let `k = n - k`
-5. Let `e = tagged_hash("BIP0340/challenge", bytes(R.x) || bytes(P.x) || msg) mod n`
-6. Let `s = (k + e * d') mod n`
-7. Return `bytes(R.x) || bytes(s)`
+3. Let `a` = 32 bytes of fresh randomness from the card's secure RNG
+4. Let `t = d' XOR tagged_hash("BIP0340/aux", a)`
+5. Let `k` = `tagged_hash("BIP0340/nonce", t || bytes(P.x) || msg) mod n`
+6. Let `R = k * G`; if `R.y` is odd, let `k = n - k`
+7. Let `e = tagged_hash("BIP0340/challenge", bytes(R.x) || bytes(P.x) || msg) mod n`
+8. Let `s = (k + e * d') mod n`
+9. Return `bytes(R.x) || bytes(s)`
 
 where `tagged_hash(tag, msg) = SHA256(SHA256(tag) || SHA256(tag) || msg)`.
+
+Steps 3–4 are BIP-340's auxiliary randomness, and they are **required**, not
+optional. A bearer card signs in a field the attacker controls; a nonce derived
+from `(d, msg)` alone means a fault injected between emitting `R` and folding in
+`e` yields two signatures over one `k`, from which `d = (s1 - s2)/(e1 - e2)`
+recovers the card key and every proof it holds. Signatures over the same message
+are therefore **not** reproducible, which is the intended behaviour.
 
 This is compatible with standard BIP-340 verification and NUT-11 P2PK signature verification.
 
@@ -511,8 +520,7 @@ The following design questions are open for community discussion:
 - [NUT-11][11]: Pay to Public Key (P2PK)
 - [cashubtc/Numo](https://github.com/cashubtc/Numo): Android Cashu NFC POS (Profile A reference)
 - [lnflash/cashu-javacard](https://github.com/lnflash/cashu-javacard): Profile B reference implementation
-- [NXP JCOP4 SmartMX3](https://www.nxp.com/products/security-and-authentication/secure-service-2go/jcop-4): Example Profile B chip (CC EAL 5+)
-- [Feitian JavaCard 3.0.4+](https://www.ftsafe.com/Products/Java_Card): Example Profile B chip
+- [NXP JCOP4 SmartMX3 (JavaCard 3.0.5+)](https://www.nxp.com/products/security-and-authentication/secure-service-2go/jcop-4): Example Profile B chip (CC EAL 5+). `ALG_EC_SVDP_DH_PLAIN_XY` is 3.0.5+, so 3.0.4 parts cannot run this applet
 - [BIP-340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki): Schnorr signatures
 
 [00]: https://github.com/cashubtc/nuts/blob/main/00.md

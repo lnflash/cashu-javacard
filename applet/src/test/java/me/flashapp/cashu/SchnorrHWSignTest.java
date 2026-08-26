@@ -7,6 +7,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -119,9 +120,14 @@ class SchnorrHWSignTest {
      * The scratch buffers are allocated once in the constructor and reused for
      * every signature, so a helper that reads a stale byte instead of writing it
      * would only misbehave from the second signature onward.
+     *
+     * "Repeatable" here means every call keeps producing a <em>valid</em>
+     * signature — not the same bytes. Signature bytes must not repeat; that is
+     * the aux-randomness property asserted below and in
+     * {@link #signUsesAFreshNonce()}.
      */
     @Test
-    @DisplayName("sign() is repeatable across many calls on one SchnorrHW instance")
+    @DisplayName("sign() keeps producing valid, non-repeating signatures across many calls")
     void signIsRepeatableAcrossCalls() throws Exception {
         SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
         schnorr.init();
@@ -151,18 +157,92 @@ class SchnorrHWSignTest {
             assertTrue(CashuAppletTest.schnorrVerify(pubX, msg, sig),
                 "signature " + i + " must verify — reused scratch buffers leaked state");
 
-            // BIP-340 signing is deterministic: the same message must resign identically.
-            if (i == 0) {
-                first = sig;
+            // Re-signing a fixed message on the same instance must keep verifying
+            // no matter how much scratch has been churned since. It must NOT
+            // reproduce the earlier signature — see signUsesAFreshNonce below.
+            byte[] again = new byte[64];
+            byte[] msg0 = new byte[32];
+            schnorr.sign(priv, pub, msg0, (short) 0, again, (short) 0);
+            assertTrue(CashuAppletTest.schnorrVerify(pubX, msg0, again),
+                "re-signature of the all-zero message after call " + i + " must verify");
+            if (first == null) {
+                first = again;
             } else {
-                byte[] again = new byte[64];
-                byte[] msg0 = new byte[32];
-                schnorr.sign(priv, pub, msg0, (short) 0, again, (short) 0);
-                org.junit.jupiter.api.Assertions.assertArrayEquals(first, again,
+                assertFalse(java.util.Arrays.equals(first, again),
                     "re-signing the same message after call " + i
-                        + " must give the same signature");
+                        + " reproduced an earlier signature: the nonce is a pure "
+                        + "function of (d, msg) and the aux randomness is not reaching k");
             }
         }
+    }
+
+    /**
+     * The finding this test exists for: {@code sign()} used to derive k as
+     * {@code taggedHash("BIP0340/nonce", d ‖ zeros32 ‖ msg)} — a deterministic
+     * nonce, under a class header claiming BIP-340. Every such signature
+     * verifies, so nothing else in this suite noticed.
+     *
+     * It matters because this is a bearer card sitting in an attacker-controlled
+     * NFC field. With k a pure function of (d, msg), a fault injected after R is
+     * emitted but before e is folded in yields two signatures sharing k, and
+     * {@code d = (s1 − s2)/(e1 − e2)} recovers the card key outright — every
+     * proof on the card, and every proof ever loaded onto it, becomes spendable.
+     * BIP-340's auxiliary randomness exists to close exactly this.
+     *
+     * So: same key, same message, many signatures. Each must verify, and the R
+     * values must all differ. A regression to a deterministic nonce collapses
+     * every R to one value and fails here.
+     *
+     * Scoped to a single signer on purpose. jCardSim backs
+     * {@code RandomData.ALG_SECURE_RANDOM} with an unseeded BouncyCastle
+     * {@code DigestRandomGenerator}, so two freshly constructed simulators walk
+     * the same byte stream — comparing signatures <em>across</em> instances
+     * would test the simulator's seeding, not the applet. Within one instance
+     * the generator advances, which is exactly the property under test.
+     */
+    @Test
+    @DisplayName("sign() draws a fresh nonce per call (BIP-340 aux randomness)")
+    void signUsesAFreshNonce() throws Exception {
+        SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
+        schnorr.init();
+
+        byte[] d = CashuAppletTest.hexToBytes(
+            "B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF");
+        byte[] w = CashuAppletTest.hexToBytes(
+            "04DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+            + "2CE19B946C4EE58546F5251D441A065EA50735606985E5B228788BEC4E582898");
+        byte[] pubX = java.util.Arrays.copyOfRange(w, 1, 33);
+
+        ECPrivateKey priv = (ECPrivateKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+        ECPublicKey pub = (ECPublicKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+        setCurve(priv, pub);
+        priv.setS(d, (short) 0, (short) 32);
+        pub.setW(w, (short) 0, (short) 65);
+
+        byte[] msg = CashuAppletTest.hexToBytes(
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89");
+
+        java.util.Set<String> seenR = new java.util.HashSet<>();
+        for (int i = 0; i < 24; i++) {
+            byte[] sig = new byte[64];
+            assertEquals(64, schnorr.sign(priv, pub, msg, (short) 0, sig, (short) 0));
+            assertTrue(CashuAppletTest.schnorrVerify(pubX, msg, sig),
+                "signature " + i + " over the fixed message must verify");
+            String r = bytesToHex(java.util.Arrays.copyOfRange(sig, 0, 32));
+            assertTrue(seenR.add(r),
+                "R repeated on signature " + i + " over an identical message — the "
+                    + "nonce is deterministic, so a fault-injected replay recovers "
+                    + "the card private key from the two s values");
+        }
+        assertEquals(24, seenR.size(), "every signature must use its own nonce");
+    }
+
+    private static String bytesToHex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) sb.append(String.format("%02X", x));
+        return sb.toString();
     }
 
     private static void setCurve(ECPrivateKey priv, ECPublicKey pub) {

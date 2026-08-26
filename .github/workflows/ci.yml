@@ -57,12 +57,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ant
 
       # ant-javacard does NOT download JavaCard SDKs; the kit has to be supplied.
+      # Pinned to a commit, not a branch: this third-party repo supplies both
+      # the converter toolchain and the target API jars, and its output is
+      # uploaded as a release artifact. An unpinned `master` would let the bytes
+      # this CAP is built against change with no diff and no signal in the log,
+      # on firmware that holds bearer money. Bump deliberately, same as
+      # `ant.javacard.version` in applet/build.xml.
       - name: Check out JavaCard SDKs
         uses: actions/checkout@v5
         with:
           repository: martinpaljak/oracle_javacard_sdks
-          ref: master
+          # "Import 3.2.0 / 26.0 (2026-05-04)" — contains jc305u4_kit.
+          ref: 6a75ec0d6913db236d354f154df7dbc9573d976d
           path: .javacard-sdks
+          persist-credentials: false
 
       # 3.0.5 is the floor: SchnorrHW needs ALG_EC_SVDP_DH_PLAIN_XY, which does
       # not exist in 3.0.4.

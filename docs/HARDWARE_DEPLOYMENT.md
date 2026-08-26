@@ -145,6 +145,7 @@ For production cards, use a secure messaging channel (SCP02/SCP03) with the card
 |------|----------|
 | SHA-256 | `MessageDigest.ALG_SHA_256` |
 | k·G scalar multiply | `KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY` |
+| BIP-340 aux randomness | `RandomData.ALG_SECURE_RANDOM` |
 | 256-bit mulModN | Schoolbook 256×256 + 2-level DELTA reduction |
 | 256-bit addModN | Carry-propagation + conditional subtract |
 
@@ -157,6 +158,21 @@ persistent memory and every `SPEND_PROOF` / `SIGN_ARBITRARY` threw. All scratch
 is allocated once at install time as `CLEAR_ON_DESELECT` transient arrays:
 `sc` (256 B) plus `work` (288 B), threaded through the arithmetic helpers as
 explicit `(work, workOff)` parameters.
+
+### Install-time ECDH framing probe
+
+`ALG_EC_SVDP_DH_PLAIN_XY` output framing is not uniform across implementations:
+the applet reads a 65-byte `04 ‖ X ‖ Y`, and some parts return the bare 64-byte
+`X ‖ Y` instead. `SchnorrHW.init()` therefore performs one throwaway `2·G` at
+install time and refuses to install if the framing is not what `sign()` indexes
+into.
+
+If `gp --install` fails with `6F00`, that probe is the first thing to suspect —
+and it failing there is the desired outcome. The alternative is discovering it
+at spend time, where `SPEND_PROOF` marks the slot SPENT *before* signing: an
+incompatible card would consume one proof per tap, return `6F00` each time, and
+leave the proofs unredeemable because they are P2PK-locked to a key whose card
+can no longer sign.
 
 ---
 

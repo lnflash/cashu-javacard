@@ -13,15 +13,25 @@ import javacard.security.*;
  *
  * No java.math, java.security, java.util, or System.arraycopy.
  *
- * --- Signing algorithm (BIP-340) ---
+ * --- Signing algorithm (BIP-340 default signing) ---
  *
  *   1. If P.y is odd, d_eff = n − d  (normalise to even-y key)
- *   2. k = SHA256_tagged("BIP0340/nonce", d_eff ‖ zeros32 ‖ msg) mod n
- *   3. R = k·G  (via KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY)
- *   4. If R.y is odd, k = n − k
- *   5. e = SHA256_tagged("BIP0340/challenge", R.x ‖ P.x ‖ msg) mod n
- *   6. s = (k + e·d_eff) mod n   (using mulModN + addModN)
- *   7. sig = R.x ‖ s (64 bytes)
+ *   2. a = 32 fresh bytes from RandomData.ALG_SECURE_RANDOM
+ *      t = d_eff XOR SHA256_tagged("BIP0340/aux", a)
+ *   3. k = SHA256_tagged("BIP0340/nonce", t ‖ P.x ‖ msg) mod n
+ *   4. R = k·G  (via KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY)
+ *   5. If R.y is odd, k = n − k
+ *   6. e = SHA256_tagged("BIP0340/challenge", R.x ‖ P.x ‖ msg) mod n
+ *   7. s = (k + e·d_eff) mod n   (using mulModN + addModN)
+ *   8. sig = R.x ‖ s (64 bytes)
+ *
+ *   Steps 2–3 are BIP-340's *default signing* nonce derivation, auxiliary
+ *   randomness and all — not a deterministic RFC6979-style nonce. This matters
+ *   on a bearer card: a nonce that is a pure function of (d, msg) hands a fault
+ *   injector two signatures over the same k, and d = (s1−s2)/(e1−e2) then falls
+ *   straight out. Folding fresh aux randomness into t is precisely the
+ *   mitigation BIP-340 specifies, so signatures over the same message are
+ *   deliberately NOT reproducible. See SchnorrHWSignTest#signUsesAFreshNonce.
  *
  * --- Modular arithmetic ---
  *
@@ -73,8 +83,9 @@ final class SchnorrHW {
     };
 
     // ── Precomputed tag hashes (set once at install time) ─────────────────
-    // SHA256("BIP0340/nonce") and SHA256("BIP0340/challenge")
+    // SHA256("BIP0340/aux"), SHA256("BIP0340/nonce") and SHA256("BIP0340/challenge")
     // Stored in EEPROM, initialised by init().
+    private final byte[] tagHashAux;       // 32 bytes
     private final byte[] tagHashNonce;     // 32 bytes
     private final byte[] tagHashChallenge; // 32 bytes
 
@@ -118,6 +129,7 @@ final class SchnorrHW {
     private final KeyAgreement  ecdh;      // ALG_EC_SVDP_DH_PLAIN_XY
     private final ECPrivateKey  tmpPriv;   // reused temp key for k
     private final ECPublicKey   genPub;    // generator G as EC public key
+    private final RandomData    rng;       // BIP-340 auxiliary randomness (step 2)
 
     // ── secp256k1 curve parameters (shared with CashuApplet) ──────────────
     // Passed in via constructor to avoid code duplication.
@@ -138,6 +150,7 @@ final class SchnorrHW {
         B      = secp256k1B;
         Nparam = secp256k1N;
 
+        tagHashAux       = new byte[32];
         tagHashNonce     = new byte[32];
         tagHashChallenge = new byte[32];
 
@@ -157,13 +170,31 @@ final class SchnorrHW {
         setECParams(tmpPriv, null);
 
         ecdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);
+
+        // BIP-340 auxiliary randomness. Allocated once, like everything else on
+        // the signing path.
+        //
+        // ALG_SECURE_RANDOM (and generateData) are marked deprecated in the
+        // 3.0.5 API in favour of ALG_TRNG / ALG_PRESEEDED_DRBG / nextBytes, and
+        // the CAP build prints a warning for each. That is deliberate: the
+        // replacements are 3.0.5-era additions that not every 3.0.5+ part
+        // actually implements, and getInstance on an unsupported algorithm
+        // throws CryptoException at install. ALG_SECURE_RANDOM is present
+        // everywhere this applet can run. Revisit only with a card in hand.
+        rng = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
     }
 
     /**
      * Must be called once during applet install (after constructor) to
-     * precompute and store the BIP-340 tag hashes in EEPROM.
+     * precompute and store the BIP-340 tag hashes in EEPROM, and to verify that
+     * this card's ECDH implementation frames its output the way sign() reads it.
      */
     void init() {
+        // SHA256("BIP0340/aux")  — tag is 11 ASCII bytes
+        byte[] tagAux = { 'B','I','P','0','3','4','0','/','a','u','x' };
+        sha256.reset();
+        sha256.doFinal(tagAux, (short)0, (short)11, tagHashAux, (short)0);
+
         // SHA256("BIP0340/nonce")  — tag is 13 ASCII bytes
         byte[] tagNonce = { 'B','I','P','0','3','4','0','/','n','o','n','c','e' };
         sha256.reset();
@@ -175,6 +206,40 @@ final class SchnorrHW {
         };
         sha256.reset();
         sha256.doFinal(tagChallenge, (short)0, (short)17, tagHashChallenge, (short)0);
+
+        // The probe buffer is allocated here, in init(), so that the one-shot
+        // install-time allocation stays inside the only two methods allowed to
+        // allocate at all (see the memory-discipline note on this class and
+        // SchnorrHWMathTest#noAllocationOutsideInstallTime). 80 bytes, once.
+        probeEcdhFraming(new byte[80]);
+    }
+
+    /**
+     * Verify once, at install time, that ALG_EC_SVDP_DH_PLAIN_XY returns the
+     * 65-byte {@code 04 ‖ X ‖ Y} framing that sign() indexes into.
+     *
+     * The framing is a property of the card, not of the message, so a card that
+     * returns the bare 64-byte X‖Y is wrong on the very first tap and wrong on
+     * every tap after it. Discovering that inside sign() is far too late:
+     * CashuApplet marks the proof SPENT before it calls doSign, so an
+     * incompatible card would burn one slot per attempt and hand back 6F00 each
+     * time until the balance was gone — with the proofs unredeemable, because
+     * they are P2PK-locked to a key whose card can no longer sign. Throwing here
+     * fails the {@code gp --install} instead, before a single proof is loaded.
+     *
+     * @param probe caller-allocated scratch of at least 80 bytes. Sized well
+     *              above the expected 65 so that a card returning more trips the
+     *              length check below rather than an
+     *              ArrayIndexOutOfBoundsException.
+     */
+    private void probeEcdhFraming(byte[] probe) {
+        probe[31] = (byte)0x02;              // throwaway scalar d = 2, so R = 2G
+        tmpPriv.setS(probe, (short)0, (short)32);
+        ecdh.init(tmpPriv);
+        short len = ecdh.generateSecret(G, (short)0, (short)65, probe, (short)0);
+        if (len != (short)65 || probe[0] != (byte)0x04) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
     }
 
     // ── Public API ────────────────────────────────────────────────────────
@@ -200,30 +265,52 @@ final class SchnorrHW {
         // Get public key point W (uncompressed 65 bytes or compressed 33 bytes)
         short wLen = pubKey.getW(sc, SC_TMP);  // W at sc[96..]
         boolean pyOdd;
-        if (wLen == 65 && sc[SC_TMP] == (byte)0x04) {
+        if (wLen == (short)65) {
             // Uncompressed: 04 || Px(32) || Py(32)
+            // A 65-byte W whose lead byte is not 0x04 is not a point encoding we
+            // understand. Falling through to the compressed branch here would
+            // read the "parity" out of a byte that is not a parity byte and emit
+            // a signature no mint can verify, so refuse instead.
+            if (sc[SC_TMP] != (byte)0x04) {
+                ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+            }
             // P.y is sc[TMP+33..TMP+64]; parity = LSB of last byte
             pyOdd = (sc[(short)(SC_TMP + 64)] & 1) == 1;
             Util.arrayCopy(sc, (short)(SC_TMP + 1), sc, SC_PX, (short)32);
-        } else {
+        } else if (wLen == (short)33
+                   && (sc[SC_TMP] == (byte)0x02 || sc[SC_TMP] == (byte)0x03)) {
             // Compressed: prefix 02 (even) or 03 (odd)
             pyOdd = (sc[SC_TMP] & 1) == 1;
             Util.arrayCopy(sc, (short)(SC_TMP + 1), sc, SC_PX, (short)32);
+        } else {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+            return (short)0;   // unreachable; keeps pyOdd definitely assigned
         }
 
         if (pyOdd) {
             subtractFromN(sc, SC_D, sc, SC_D);   // d = n − d
         }
 
-        // ── Step 2: k = taggedHash("BIP0340/nonce", d ‖ 0x32 ‖ msg) mod n
-        // sc[TMP..TMP+95] = d(32) || zeros(32) || msg(32)
-        Util.arrayCopy(sc,  SC_D,   sc, SC_TMP,         (short)32);  // d
-        Util.arrayFillNonAtomic(sc, (short)(SC_TMP+32), (short)32, (byte)0); // zeros
-        Util.arrayCopy(msg, msgOff, sc, (short)(SC_TMP+64), (short)32);      // msg
+        // ── Step 2: t = d_eff XOR taggedHash("BIP0340/aux", a) ───────
+        // BIP-340 default signing. `a` is fresh secure randomness per signature;
+        // it is what stops a fault-injected repeat of this call from reusing k.
+        // sc[TMP..TMP+31] = a, sc[TMP+32..TMP+63] = taggedHash(aux, a) -> t
+        rng.generateData(sc, SC_TMP, (short)32);
+        taggedHash(tagHashAux, sc, SC_TMP, (short)32, sc, (short)(SC_TMP+32));
+        for (short i = 0; i < 32; i++) {
+            sc[(short)(SC_TMP+32+i)] =
+                (byte)(sc[(short)(SC_TMP+32+i)] ^ sc[(short)(SC_D+i)]);
+        }
+
+        // ── Step 3: k = taggedHash("BIP0340/nonce", t ‖ P.x ‖ msg) mod n
+        // sc[TMP..TMP+95] = t(32) || Px(32) || msg(32)
+        Util.arrayCopy(sc,  (short)(SC_TMP+32), sc, SC_TMP,          (short)32); // t
+        Util.arrayCopy(sc,  SC_PX,              sc, (short)(SC_TMP+32),(short)32); // Px
+        Util.arrayCopy(msg, msgOff,             sc, (short)(SC_TMP+64),(short)32); // msg
         taggedHash(tagHashNonce, sc, SC_TMP, (short)96, sc, SC_K);
         reduceModN(sc, SC_K);         // k = k mod n (in place)
 
-        // ── Step 3: R = k·G via ECDH coprocessor ─────────────────────
+        // ── Step 4: R = k·G via ECDH coprocessor ─────────────────────
         // Load k into temp private key, compute [k]G
         tmpPriv.setS(sc, SC_K, (short)32);
         ecdh.init(tmpPriv);
@@ -234,20 +321,24 @@ final class SchnorrHW {
         // implementations — some cards return the bare 64-byte X||Y. Everything
         // below reads Rx at SC_TMP+1 and the y-parity at SC_TMP+64, so an
         // unexpected framing would silently shift both by one byte and emit
-        // well-formed signatures that no mint can verify. Fail loudly instead.
+        // well-formed signatures that no mint can verify.
+        //
+        // probeEcdhFraming() already rejected such a card at install time, so
+        // this is a cheap assert on a condition that cannot change between taps;
+        // it is not the place the incompatibility is meant to be discovered.
         short rLen = ecdh.generateSecret(G, (short)0, (short)65, sc, SC_TMP);
         if (rLen != (short)65 || sc[SC_TMP] != (byte)0x04) {
             ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
         }
 
-        // ── Step 4: if R.y is odd, k = n − k ─────────────────────────
+        // ── Step 5: if R.y is odd, k = n − k ─────────────────────────
         boolean ryOdd = (sc[(short)(SC_TMP + 64)] & 1) == 1;
         if (ryOdd) {
             subtractFromN(sc, SC_K, sc, SC_K);
         }
         // Rx is at sc[TMP+1..TMP+32]
 
-        // ── Step 5: e = taggedHash("BIP0340/challenge", Rx ‖ Px ‖ msg) mod n
+        // ── Step 6: e = taggedHash("BIP0340/challenge", Rx ‖ Px ‖ msg) mod n
         // Re-use sc[TMP..TMP+95] for the 96-byte input
         // sc[TMP..TMP+31]  = Rx  (already there at SC_TMP+1, shift left by 1)
         Util.arrayCopy(sc, (short)(SC_TMP+1), sc, SC_TMP,          (short)32); // Rx
@@ -256,12 +347,12 @@ final class SchnorrHW {
         taggedHash(tagHashChallenge, sc, SC_TMP, (short)96, sc, SC_E);
         reduceModN(sc, SC_E);         // e = e mod n
 
-        // ── Step 6: s = (k + e·d) mod n ──────────────────────────────
+        // ── Step 7: s = (k + e·d) mod n ──────────────────────────────
         mulModN(sc, SC_E, sc, SC_D, sc, SC_ED, work, (short)0);  // ed = e * d mod n
         addModN(sc, SC_ED, sc, SC_K, out, (short)(outOff + 32)); // s = ed + k mod n
 
-        // ── Step 7: output = Rx ‖ s ──────────────────────────────────
-        // Rx sits at sc[SC_TMP..SC_TMP+31] — step 5 shifted it there before
+        // ── Step 8: output = Rx ‖ s ──────────────────────────────────
+        // Rx sits at sc[SC_TMP..SC_TMP+31] — step 6 shifted it there before
         // hashing; the challenge hash wrote to SC_E, not SC_TMP.
         Util.arrayCopy(sc, SC_TMP, out, outOff, (short)32);  // Rx
 
@@ -461,6 +552,12 @@ final class SchnorrHW {
      * The precondition is <i>enforced</i>, not assumed: if the top 32 bytes of
      * the 512-bit product are non-zero the value did not fit, and we throw
      * rather than hand a silently truncated result back into the reduction.
+     *
+     * Unlike the ECDH framing check, this one cannot be hoisted to install time:
+     * it is an assertion about an intermediate of <i>this</i> multiplication,
+     * not a fixed property of the card. It is unreachable for every input the
+     * depth-2 reduction can produce — reaching it means the arithmetic above is
+     * wrong, in which case a spent slot is the smaller loss.
      *
      * @param a       operand, 32 bytes big-endian at a[aOff..aOff+31]
      * @param out     32-byte output buffer
