@@ -1,5 +1,6 @@
 package me.flashapp.cashu;
 
+import javacard.framework.ISOException;
 import javacard.security.ECPrivateKey;
 import javacard.security.ECPublicKey;
 import javacard.security.KeyBuilder;
@@ -237,6 +238,164 @@ class SchnorrHWSignTest {
                     + "the card private key from the two s values");
         }
         assertEquals(24, seenR.size(), "every signature must use its own nonce");
+    }
+
+    /**
+     * The finding this test exists for: {@code sign()} called
+     * {@code privKey.getS(sc, SC_D)} and threw the returned length away, then
+     * unconditionally read 32 bytes at {@code sc[SC_D..SC_D+31]} — while the
+     * exactly analogous {@code pubKey.getW} length three lines later <em>was</em>
+     * checked.
+     *
+     * The JavaCard API does not promise that {@code getS} left-pads: a card may
+     * return the scalar with leading zero bytes stripped, and roughly one
+     * generated key in 256 has a zero high byte. On such a card the tail of the
+     * shared scratchpad gets folded into d, every signature fails verification,
+     * and the proofs stay P2PK-locked to that key — unspendable. jCardSim always
+     * returns 32, so nothing in this suite could ever surface it; the key below
+     * therefore reports its length the way a stripping card would.
+     */
+    @Test
+    @DisplayName("sign() refuses a card whose getS returns fewer than 32 bytes")
+    void signRejectsShortPrivateScalar() throws Exception {
+        SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
+        schnorr.init();
+
+        // d = 3: 31 leading zero bytes, i.e. squarely in the class of keys a
+        // leading-zero-stripping card mis-reports.
+        byte[] d = CashuAppletTest.hexToBytes((String) KEYS[0][0]);
+        byte[] w = CashuAppletTest.hexToBytes((String) KEYS[0][1]);
+
+        ECPrivateKey priv = (ECPrivateKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+        ECPublicKey pub = (ECPublicKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+        setCurve(priv, pub);
+        priv.setS(d, (short) 0, (short) 32);
+        pub.setW(w, (short) 0, (short) 65);
+
+        byte[] msg = CashuAppletTest.hexToBytes(
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89");
+
+        // Control leg: with a full-width getS this exact key signs and verifies,
+        // so a failure below is about the length check and not about d = 3.
+        byte[] good = new byte[64];
+        assertEquals(64, schnorr.sign(priv, pub, msg, (short) 0, good, (short) 0));
+        assertTrue(CashuAppletTest.schnorrVerify(
+                java.util.Arrays.copyOfRange(w, 1, 33), msg, good),
+            "control signature with a 32-byte getS must verify");
+
+        ECPrivateKey stripping = new LeadingZeroStrippingPrivateKey(priv);
+        assertEquals(1, stripping.getS(new byte[32], (short) 0),
+            "the stand-in must actually report a short length, or this test is vacuous");
+
+        byte[] sig = new byte[64];
+        ISOException thrown = org.junit.jupiter.api.Assertions.assertThrows(
+            ISOException.class,
+            () -> schnorr.sign(stripping, pub, msg, (short) 0, sig, (short) 0),
+            "a getS shorter than 32 bytes must be refused, not silently padded with "
+                + "whatever the scratchpad happened to hold");
+        assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason(),
+            "short getS must report SW_CRYPTO_ERROR");
+    }
+
+    /**
+     * Two representations of the group order used to coexist: {@code N} inside
+     * SchnorrHW, which all the modular arithmetic reduces against, and the
+     * constructor's {@code secp256k1N}, which is what reaches {@code setR()} on
+     * the key objects. Nothing checked that they agreed, so a typo in
+     * {@code CashuApplet.SECP256K1_N} would have had the ECDH scalar multiply
+     * run on one order and addModN/mulModN/subtractFromN on another — signatures
+     * well-formed and rejected by every mint.
+     */
+    @Test
+    @DisplayName("init() refuses a group order that disagrees with the one the math uses")
+    void initRejectsMismatchedGroupOrder() {
+        byte[] wrongN = SECP_N.clone();
+        wrongN[31] ^= (byte) 0x01;   // n ± 1: still 256 bits, still plausible
+
+        SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, wrongN);
+        ISOException thrown = org.junit.jupiter.api.Assertions.assertThrows(
+            ISOException.class, schnorr::init,
+            "a group order that disagrees with SchnorrHW.N must fail the install");
+        assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason());
+    }
+
+    /**
+     * DELTA is not an independent constant: mulModN's reduction is only correct
+     * while DELTA == 2^256 − n. Editing one without the other is silent, so
+     * init() asserts the identity. Mutating the static array here is the only
+     * way to exercise that assertion; the original byte is restored in a finally
+     * block, and Surefire runs these tests on one thread.
+     */
+    @Test
+    @DisplayName("init() refuses a DELTA that is not 2^256 - n")
+    void initRejectsDeltaInconsistentWithN() throws Exception {
+        java.lang.reflect.Field f = SchnorrHW.class.getDeclaredField("DELTA");
+        f.setAccessible(true);
+        byte[] delta = (byte[]) f.get(null);
+        byte original = delta[31];
+        try {
+            delta[31] ^= (byte) 0x01;
+            SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
+            ISOException thrown = org.junit.jupiter.api.Assertions.assertThrows(
+                ISOException.class, schnorr::init,
+                "a DELTA that is not 2^256 - n must fail the install");
+            assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason());
+        } finally {
+            delta[31] = original;
+        }
+
+        // The constant is back: a signer built now must still work.
+        SchnorrHW restored = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
+        restored.init();
+    }
+
+    /**
+     * An {@link ECPrivateKey} that behaves like a card whose {@code getS} strips
+     * leading zero bytes: the value is right, the length is short, and the
+     * caller's buffer keeps whatever it held beyond it.
+     */
+    private static final class LeadingZeroStrippingPrivateKey implements ECPrivateKey {
+        private final ECPrivateKey delegate;
+
+        LeadingZeroStrippingPrivateKey(ECPrivateKey delegate) { this.delegate = delegate; }
+
+        @Override
+        public short getS(byte[] buf, short off) {
+            byte[] full = new byte[32];
+            short len = delegate.getS(full, (short) 0);
+            short lead = 0;
+            while (lead < (short) (len - 1) && full[lead] == 0) lead++;
+            short stripped = (short) (len - lead);
+            System.arraycopy(full, lead, buf, off, stripped);
+            return stripped;
+        }
+
+        @Override public void setS(byte[] b, short o, short l) { delegate.setS(b, o, l); }
+        @Override public void setFieldFP(byte[] b, short o, short l) { delegate.setFieldFP(b, o, l); }
+        @Override public void setFieldF2M(short e) { delegate.setFieldF2M(e); }
+        @Override public void setFieldF2M(short e1, short e2, short e3) {
+            delegate.setFieldF2M(e1, e2, e3);
+        }
+        @Override public void setA(byte[] b, short o, short l) { delegate.setA(b, o, l); }
+        @Override public void setB(byte[] b, short o, short l) { delegate.setB(b, o, l); }
+        @Override public void setG(byte[] b, short o, short l) { delegate.setG(b, o, l); }
+        @Override public void setR(byte[] b, short o, short l) { delegate.setR(b, o, l); }
+        @Override public void setK(short k) { delegate.setK(k); }
+        @Override public short getField(byte[] b, short o) { return delegate.getField(b, o); }
+        @Override public short getA(byte[] b, short o) { return delegate.getA(b, o); }
+        @Override public short getB(byte[] b, short o) { return delegate.getB(b, o); }
+        @Override public short getG(byte[] b, short o) { return delegate.getG(b, o); }
+        @Override public short getR(byte[] b, short o) { return delegate.getR(b, o); }
+        @Override public short getK() { return delegate.getK(); }
+        @Override public void copyDomainParametersFrom(javacard.security.ECKey src) {
+            delegate.copyDomainParametersFrom(src);
+        }
+        @Override public boolean isInitialized() { return delegate.isInitialized(); }
+        @Override public void clearKey() { delegate.clearKey(); }
+        @Override public byte getType() { return delegate.getType(); }
+        @Override public short getSize() { return delegate.getSize(); }
     }
 
     private static String bytesToHex(byte[] b) {

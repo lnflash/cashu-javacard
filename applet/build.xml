@@ -56,6 +56,26 @@
     <!-- ── Download ant-javacard plugin ───────────────────────────────── -->
     <property name="ant.javacard.jar"
               value="${user.home}/.ant/lib/ant-javacard-${ant.javacard.version}.jar"/>
+    <!--
+      SHA-256 of the ant-javacard.jar release asset for ${ant.javacard.version}.
+
+      A GitHub release asset is mutable: the tag can be re-pointed at different
+      bytes by the upstream maintainer, or by anyone who takes that account, and
+      nothing in the download tells us. This jar drives the converter that
+      produces the CAP that CI uploads as an artifact and that ends up on cards
+      holding bearer money, so it is pinned by content, exactly like the SDK
+      commit pinned in .github/workflows/ci.yml.
+
+      To bump: change ant.javacard.version, then
+
+        curl -sSL -o /tmp/ant-javacard.jar \
+          https://github.com/martinpaljak/ant-javacard/releases/download/<tag>/ant-javacard.jar
+        shasum -a 256 /tmp/ant-javacard.jar
+
+      and paste the digest here in the same commit as the version bump.
+    -->
+    <property name="ant.javacard.sha256"
+              value="14f5e25c07b184e4ec02ee148892c2ea7ad5d7e9db8b91109524df8f7d000589"/>
     <available file="${ant.javacard.jar}" property="ant.javacard.present"/>
 
     <target name="download-plugin" unless="ant.javacard.present"
@@ -67,8 +87,36 @@
              usetimestamp="true"/>
     </target>
 
+    <!-- ── Verify the plugin jar before it reaches the classpath ──────── -->
+    <!--
+      Runs on every build, not only after a download: the cached copy in
+      ~/.ant/lib is shared with every other project on this machine and is just
+      as able to be swapped as the download itself.
+    -->
+    <target name="verify-plugin" depends="download-plugin"
+            description="Fail unless ant-javacard.jar matches its pinned SHA-256">
+        <checksum file="${ant.javacard.jar}"
+                  algorithm="SHA-256"
+                  property="${ant.javacard.sha256}"
+                  verifyProperty="ant.javacard.verified"/>
+        <fail>
+            <condition>
+                <not><istrue value="${ant.javacard.verified}"/></not>
+            </condition>
+ant-javacard.jar does not match its pinned SHA-256.
+
+  file     : ${ant.javacard.jar}
+  expected : ${ant.javacard.sha256}
+
+Refusing to hand unverified bytes to the CAP converter. If you deliberately
+bumped ant.javacard.version, delete the cached jar, re-download it, and record
+the new digest in ant.javacard.sha256 in this file. Otherwise treat this as a
+compromised or truncated download.
+        </fail>
+    </target>
+
     <!-- ── Register ant-javacard task ─────────────────────────────────── -->
-    <target name="setup" depends="download-plugin">
+    <target name="setup" depends="verify-plugin">
         <taskdef name="javacard"
                  classname="pro.javacard.ant.JavaCard"
                  classpath="${ant.javacard.jar}"/>

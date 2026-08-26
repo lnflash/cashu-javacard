@@ -61,6 +61,13 @@ import javacard.security.*;
 final class SchnorrHW {
 
     // ── secp256k1 group order n ────────────────────────────────────────────
+    //
+    // This is the ONE value every modular helper in this class reduces against.
+    // The caller also hands the group order in through the constructor (see
+    // Nparam) because the EC key objects need it via setR(); init() asserts the
+    // two agree, so a typo in CashuApplet.SECP256K1_N fails `gp --install`
+    // rather than producing signatures that are well-formed and universally
+    // rejected.
     private static final byte[] N = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFE,
@@ -74,6 +81,10 @@ final class SchnorrHW {
      * n  = FFFF...FFFE BAAEDCE6 AF48A03B BFD25E8C D0364141
      * 2^256 = 1 0000...0000
      * DELTA = 0000...0001 45512319 50B75FC4 402DA173 2FC9BEBF
+     *
+     * Derived from N, and therefore not independently editable: every reduction
+     * below is only correct while N + DELTA == 2^256 exactly. init() asserts
+     * that identity at install time alongside the N/Nparam agreement check.
      */
     private static final byte[] DELTA = {
         (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
@@ -183,10 +194,39 @@ final class SchnorrHW {
 
     /**
      * Must be called once during applet install (after constructor) to
-     * precompute and store the BIP-340 tag hashes in EEPROM, and to verify that
-     * this card's ECDH implementation frames its output the way sign() reads it.
+     * precompute and store the BIP-340 tag hashes in EEPROM, to verify that the
+     * curve constants this class reduces against agree with the ones the caller
+     * installs on the key objects, and to verify that this card's ECDH
+     * implementation frames its output the way sign() reads it.
      */
     void init() {
+        // ── Curve-constant agreement ─────────────────────────────────────
+        // Two representations of the group order exist: N, used by every
+        // modular helper here, and Nparam, handed to setR() on the EC key
+        // objects (and, in CashuApplet, to the card keypair). If they ever
+        // disagree — a typo in CashuApplet.SECP256K1_N, or this class reused
+        // for another curve — the ECDH scalar multiply runs on one order while
+        // addModN/mulModN/subtractFromN run on another, and every signature is
+        // well-formed and universally rejected. Fail `gp --install` instead.
+        if (Nparam.length != (short)32
+                || Util.arrayCompare(N, (short)0, Nparam, (short)0, (short)32) != (byte)0) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
+
+        // DELTA is defined as 2^256 − N, i.e. N + DELTA must be exactly 2^256:
+        // a 256-bit sum of zero with a carry out. mulModN's whole reduction
+        // rests on that identity, so it is checked rather than commented.
+        // Uses sc as scratch — allocated already, and nothing has signed yet at
+        // install time. probeEcdhFraming() clobbers the same bytes below.
+        if (add32(N, (short)0, DELTA, (short)0, sc, (short)0) != (short)1) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
+        for (short i = 0; i < 32; i++) {
+            if (sc[i] != (byte)0) {
+                ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+            }
+        }
+
         // SHA256("BIP0340/aux")  — tag is 11 ASCII bytes
         byte[] tagAux = { 'B','I','P','0','3','4','0','/','a','u','x' };
         sha256.reset();
@@ -214,7 +254,8 @@ final class SchnorrHW {
 
     /**
      * Verify once, at install time, that ALG_EC_SVDP_DH_PLAIN_XY returns the
-     * 65-byte {@code 04 ‖ X ‖ Y} framing that sign() indexes into.
+     * 65-byte {@code 04 ‖ X ‖ Y} framing that sign() indexes into, and that
+     * {@code ECPrivateKey.getS} left-pads its output to a full 32 bytes.
      *
      * The framing is a property of the card, not of the message, so a card that
      * returns the bare 64-byte X‖Y is wrong on the very first tap and wrong on
@@ -237,6 +278,18 @@ final class SchnorrHW {
         Util.arrayFillNonAtomic(probe, (short)0, (short)80, (byte)0);
         probe[31] = (byte)0x02;              // throwaway scalar d = 2, so R = 2G
         tmpPriv.setS(probe, (short)0, (short)32);
+
+        // getS framing. sign() reads d as exactly 32 bytes at sc[SC_D..SC_D+31];
+        // a card that strips leading zeros and returns a short length would
+        // leave the tail of the scratchpad folded into d. d = 2 here has 31
+        // leading zero bytes, so any such card answers with a length far below
+        // 32 and fails the install rather than a spend. Roughly one generated
+        // key in 256 has a zero high byte, so the same card would otherwise
+        // brick a card's worth of P2PK-locked proofs at random.
+        if (tmpPriv.getS(probe, (short)0) != (short)32) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
+
         ecdh.init(tmpPriv);
         short len = ecdh.generateSecret(G, (short)0, (short)65, probe, (short)0);
         if (len != (short)65 || probe[0] != (byte)0x04) {
@@ -262,7 +315,16 @@ final class SchnorrHW {
                byte[] out, short outOff) {
 
         // ── Step 1: Extract d, check P.y parity ──────────────────────
-        privKey.getS(sc, SC_D);    // d at sc[0..31]
+        // The length is checked for exactly the reason getW's is, below: a card
+        // that returns a short, leading-zero-stripped scalar would leave the
+        // tail of the shared scratchpad inside d, and every signature it emits
+        // would fail verification while the proofs stay P2PK-locked to that key
+        // and therefore unspendable. probeEcdhFraming() already rejected such a
+        // card at install time, so this is a cheap assert on a property that
+        // cannot change between taps — not the place it is meant to surface.
+        if (privKey.getS(sc, SC_D) != (short)32) {   // d at sc[0..31]
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
 
         // Get public key point W (uncompressed 65 bytes or compressed 33 bytes)
         short wLen = pubKey.getW(sc, SC_TMP);  // W at sc[96..]

@@ -151,22 +151,97 @@ class SchnorrHWMathTest {
     }
 
     /**
-     * JavaCard Classic allocates `new` in persistent EEPROM/Flash and never
-     * collects it, so a single `new byte[]` on the signing path leaks the card's
-     * persistent memory a few hundred bytes per tap until every SPEND_PROOF and
-     * SIGN_ARBITRARY throws. jCardSim runs on the JVM heap with a real GC and
-     * therefore cannot surface this — only a source-level check can.
+     * The methods that are allowed to allocate, per source file: everything that
+     * runs exactly once at install time. Anything else in these files is
+     * reachable from an APDU handler.
      *
-     * Allocation is legal in the constructor and in init(), both of which run
-     * exactly once at install time.
+     * Entry format: { file name, install-time declaration, ... }. The
+     * declarations are matched literally against the comment-stripped source, so
+     * they must be unique in it — {@code "private CashuApplet()"} rather than
+     * {@code "CashuApplet()"}, which would also hit the {@code new CashuApplet()}
+     * inside install().
+     *
+     * Every .java file under src/main/java/me/flashapp/cashu must appear here;
+     * a new one with no entry fails the test rather than slipping through
+     * unchecked.
+     */
+    private static final String[][] INSTALL_TIME_METHODS = {
+        { "SchnorrHW.java",
+          "SchnorrHW(", "void init()" },
+        { "CashuApplet.java",
+          "public static void install(", "private CashuApplet()",
+          "private void initCardKeypair()" },
+    };
+
+    /**
+     * JavaCard Classic allocates `new` in persistent EEPROM/Flash and never
+     * collects it, so a single `new byte[]` on an APDU path leaks the card's
+     * persistent memory a few dozen bytes per tap until every write command
+     * throws. jCardSim runs on the JVM heap with a real GC and therefore cannot
+     * surface this — only a source-level check can. It is CONTRIBUTING.md
+     * principle 5, and this test is its enforcement.
+     *
+     * Both applet sources are scanned, not just the signer: {@code CashuApplet}
+     * is every bit as much on the APDU path, and a stray {@code byte[] tmp = new
+     * byte[64]} inside processLoadProof would leak exactly the same way.
      */
     @Test
-    @DisplayName("SchnorrHW allocates nothing outside the constructor and init()")
+    @DisplayName("no applet source allocates outside its install-time methods")
     void noAllocationOutsideInstallTime() throws Exception {
-        String src = stripCommentsAndCharLiterals(readSchnorrHWSource());
+        java.nio.file.Path dir = mainSourceDir();
+        java.util.List<java.nio.file.Path> sources;
+        try (java.util.stream.Stream<java.nio.file.Path> s = java.nio.file.Files.list(dir)) {
+            sources = s.filter(p -> p.getFileName().toString().endsWith(".java"))
+                       .sorted()
+                       .collect(java.util.stream.Collectors.toList());
+        }
+        org.junit.jupiter.api.Assertions.assertFalse(sources.isEmpty(),
+            "no applet sources found under " + dir.toAbsolutePath());
 
-        int[] ctor = bodyRange(src, "SchnorrHW(");
-        int[] init = bodyRange(src, "void init()");
+        java.util.Set<String> scanned = new java.util.HashSet<>();
+        for (java.nio.file.Path p : sources) {
+            String name = p.getFileName().toString();
+            String[] installTime = installTimeMethods(name);
+            assertNoAllocationOutside(name,
+                new String(java.nio.file.Files.readAllBytes(p),
+                    java.nio.charset.StandardCharsets.UTF_8),
+                installTime);
+            scanned.add(name);
+        }
+
+        for (String[] entry : INSTALL_TIME_METHODS) {
+            org.junit.jupiter.api.Assertions.assertTrue(scanned.contains(entry[0]),
+                "INSTALL_TIME_METHODS names " + entry[0] + ", which no longer exists under "
+                + dir.toAbsolutePath() + " — the allow-list is stale");
+        }
+    }
+
+    /** The install-time declarations registered for a source file. */
+    private static String[] installTimeMethods(String fileName) {
+        for (String[] entry : INSTALL_TIME_METHODS) {
+            if (entry[0].equals(fileName)) {
+                return java.util.Arrays.copyOfRange(entry, 1, entry.length);
+            }
+        }
+        throw new org.opentest4j.AssertionFailedError(
+            fileName + " is on the APDU path but has no entry in INSTALL_TIME_METHODS. "
+            + "Add one listing the methods that run once at install time (constructor, "
+            + "install(), anything called only from them) so the rest of the file is "
+            + "checked for persistent-memory allocation.");
+    }
+
+    /**
+     * Fails if the source allocates anywhere inside a method body other than the
+     * given install-time declarations.
+     */
+    private static void assertNoAllocationOutside(String fileName, String rawSrc,
+                                                  String[] installTimeDeclarations) {
+        String src = stripCommentsAndCharLiterals(rawSrc);
+
+        int[][] allowedRanges = new int[installTimeDeclarations.length][];
+        for (int i = 0; i < installTimeDeclarations.length; i++) {
+            allowedRanges[i] = bodyRange(src, installTimeDeclarations[i]);
+        }
 
         // `new byte[..]` plus the array-initializer form `byte[] x = { .. }`,
         // which allocates just the same but contains no `new` keyword.
@@ -181,37 +256,38 @@ class SchnorrHWMathTest {
             int at = m.start();
             // Depth 1 is the class body: field initialisers run once when the
             // applet is installed, which is exactly what we want. Depth >= 2 is
-            // inside a method, and only the constructor and init() may allocate.
-            boolean inMethodBody = depth[at] >= 2;
-            boolean allowed = !inMethodBody
-                || (at > ctor[0] && at < ctor[1])
-                || (at > init[0] && at < init[1]);
+            // inside a method, and only the install-time methods may allocate.
+            boolean allowed = depth[at] < 2;
+            for (int[] range : allowedRanges) {
+                allowed |= at > range[0] && at < range[1];
+            }
             if (!allowed) {
                 int from = Math.max(0, at - 90);
                 int to = Math.min(src.length(), at + 90);
                 org.junit.jupiter.api.Assertions.fail(
-                    "allocation outside the constructor/init() leaks persistent EEPROM on "
-                    + "every call — allocate once at install time as a CLEAR_ON_DESELECT "
-                    + "transient array and thread it through as (work, workOff). Found near:\n..."
+                    "allocation outside the install-time methods of " + fileName
+                    + " leaks persistent EEPROM on every call — allocate once at install "
+                    + "time as a CLEAR_ON_DESELECT transient array and thread it through "
+                    + "as (work, workOff). Found near:\n..."
                     + src.substring(from, to).replaceAll("\\s+", " ") + "...");
             }
         }
     }
 
-    private static String readSchnorrHWSource() throws java.io.IOException {
+    /** Applet main-source directory, resolved from either module or repo root. */
+    private static java.nio.file.Path mainSourceDir() throws java.io.IOException {
         String[] candidates = {
-            "src/main/java/me/flashapp/cashu/SchnorrHW.java",
-            "applet/src/main/java/me/flashapp/cashu/SchnorrHW.java",
+            "src/main/java/me/flashapp/cashu",
+            "applet/src/main/java/me/flashapp/cashu",
         };
         for (String c : candidates) {
             java.nio.file.Path p = java.nio.file.Paths.get(c);
-            if (java.nio.file.Files.exists(p)) {
-                return new String(java.nio.file.Files.readAllBytes(p),
-                    java.nio.charset.StandardCharsets.UTF_8);
+            if (java.nio.file.Files.isDirectory(p)) {
+                return p;
             }
         }
         throw new java.io.FileNotFoundException(
-            "SchnorrHW.java not found relative to "
+            "applet sources not found relative to "
             + java.nio.file.Paths.get("").toAbsolutePath());
     }
 

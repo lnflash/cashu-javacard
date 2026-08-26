@@ -35,7 +35,7 @@ conversion. A change that breaks either is caught there.
 2. **Hardware spend protection**: Spent proof slots must use non-resettable mechanisms. Never allow a spent proof to be unmarked.
 3. **Spec alignment**: All commands and behavior must match NUT-XX exactly. If the spec is ambiguous, open a spec issue before implementing.
 4. **Portability**: Applet should run on any JavaCard 3.0.5+ chip with secp256k1 support. Avoid chip-specific APIs.
-5. **No allocation after install**: JavaCard Classic allocates `new` in persistent EEPROM/Flash and never collects it. Anything reachable from an APDU handler must use buffers allocated once at install time (`JCSystem.makeTransientByteArray`). `SchnorrHWMathTest.noAllocationOutsideInstallTime` enforces this for the signer.
+5. **No allocation after install**: JavaCard Classic allocates `new` in persistent EEPROM/Flash and never collects it. Anything reachable from an APDU handler must use buffers allocated once at install time (`JCSystem.makeTransientByteArray`). `SchnorrHWMathTest.noAllocationOutsideInstallTime` enforces this across every source under `applet/src/main/java/me/flashapp/cashu`. Each file needs an entry in that test's `INSTALL_TIME_METHODS` listing the methods that run once at install time; a new file with no entry fails the test rather than going unchecked.
 
 ## Pull Request Process
 
