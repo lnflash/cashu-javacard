@@ -254,8 +254,17 @@ final class SchnorrHW {
 
     /**
      * Verify once, at install time, that ALG_EC_SVDP_DH_PLAIN_XY returns the
-     * 65-byte {@code 04 ‖ X ‖ Y} framing that sign() indexes into, and that
-     * {@code ECPrivateKey.getS} left-pads its output to a full 32 bytes.
+     * 65-byte {@code 04 ‖ X ‖ Y} framing that sign() indexes into.
+     *
+     * Deliberately scoped to the ECDH framing and nothing else. An earlier
+     * version also asserted that {@code getS} left-pads to 32 bytes, which was
+     * wrong twice over: it asserted it on {@code tmpPriv} — a key loaded here
+     * by {@code setS}, not the {@code cardPrivKey} that {@code sign()} actually
+     * reads — so a card that echoes back whatever length setS was handed while
+     * reporting a stripped length for generated keys sailed through the probe
+     * and failed in sign(); and a card returning fewer than 32 bytes is
+     * spec-legal, so the check refused to install on hardware that works.
+     * sign() right-aligns the scalar instead.
      *
      * The framing is a property of the card, not of the message, so a card that
      * returns the bare 64-byte X‖Y is wrong on the very first tap and wrong on
@@ -278,17 +287,6 @@ final class SchnorrHW {
         Util.arrayFillNonAtomic(probe, (short)0, (short)80, (byte)0);
         probe[31] = (byte)0x02;              // throwaway scalar d = 2, so R = 2G
         tmpPriv.setS(probe, (short)0, (short)32);
-
-        // getS framing. sign() reads d as exactly 32 bytes at sc[SC_D..SC_D+31];
-        // a card that strips leading zeros and returns a short length would
-        // leave the tail of the scratchpad folded into d. d = 2 here has 31
-        // leading zero bytes, so any such card answers with a length far below
-        // 32 and fails the install rather than a spend. Roughly one generated
-        // key in 256 has a zero high byte, so the same card would otherwise
-        // brick a card's worth of P2PK-locked proofs at random.
-        if (tmpPriv.getS(probe, (short)0) != (short)32) {
-            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
-        }
 
         ecdh.init(tmpPriv);
         short len = ecdh.generateSecret(G, (short)0, (short)65, probe, (short)0);
@@ -315,15 +313,38 @@ final class SchnorrHW {
                byte[] out, short outOff) {
 
         // ── Step 1: Extract d, check P.y parity ──────────────────────
-        // The length is checked for exactly the reason getW's is, below: a card
-        // that returns a short, leading-zero-stripped scalar would leave the
-        // tail of the shared scratchpad inside d, and every signature it emits
-        // would fail verification while the proofs stay P2PK-locked to that key
-        // and therefore unspendable. probeEcdhFraming() already rejected such a
-        // card at install time, so this is a cheap assert on a property that
-        // cannot change between taps — not the place it is meant to surface.
-        if (privKey.getS(sc, SC_D) != (short)32) {   // d at sc[0..31]
+        // getS is specified to return the scalar's byte length, with the value
+        // right-aligned in the caller's buffer. It is NOT specified to left-pad
+        // to the key size, so a card that strips leading zero bytes is entirely
+        // spec-legal — and roughly one generated key in 256 has a zero high
+        // byte. Two things therefore must not happen here:
+        //
+        //   * trusting the length blindly. Everything below reads d as exactly
+        //     32 bytes at sc[SC_D..SC_D+31]; a short answer would fold the tail
+        //     of the shared scratchpad into d, and every signature the card
+        //     emitted would fail verification while its proofs stayed
+        //     P2PK-locked to that key — unspendable.
+        //   * refusing the card. The key is generated on-card at install time
+        //     and can have a zero high byte by pure luck, so rejecting a short
+        //     length would brick a card's worth of bearer money at random.
+        //
+        // Right-aligning handles both, and is correct on every spec-legal card.
+        short dLen = privKey.getS(sc, SC_D);   // d at sc[SC_D..SC_D+dLen-1]
+        if (dLen < (short)1 || dLen > (short)32) {
             ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
+        if (dLen < (short)32) {
+            short pad = (short)(32 - dLen);
+            // Backwards, byte by byte: source and destination overlap inside
+            // sc, and the JavaCard spec does not promise arrayCopyNonAtomic
+            // behaves like memmove when they do.
+            for (short i = (short)(dLen - 1); i >= (short)0; i--) {
+                sc[(short)(SC_D + pad + i)] = sc[(short)(SC_D + i)];
+            }
+            // Not a fresh array: sc is long-lived scratch that still holds the
+            // previous signature's bytes, so the pad must be written, not
+            // assumed.
+            Util.arrayFillNonAtomic(sc, SC_D, pad, (byte)0);
         }
 
         // Get public key point W (uncompressed 65 bytes or compressed 33 bytes)

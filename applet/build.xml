@@ -54,8 +54,17 @@
     <property name="cap.file"   value="${target.dir}/cashu-javacard-0.1.0.cap"/>
 
     <!-- ── Download ant-javacard plugin ───────────────────────────────── -->
+    <!--
+      Project-local on purpose, NOT ${user.home}/.ant/lib. Ant's launcher puts
+      every jar in ~/.ant/lib on the classpath of every Ant build on the
+      machine, so a tampered download cached there would outlive this build and
+      reach projects that never asked for it. `setup` passes an explicit
+      classpath to <taskdef> below, so the jar has no reason to be in the
+      global directory in the first place. ${target.dir} is gitignored and
+      `ant clean` removes it.
+    -->
     <property name="ant.javacard.jar"
-              value="${user.home}/.ant/lib/ant-javacard-${ant.javacard.version}.jar"/>
+              value="${target.dir}/ant-javacard-${ant.javacard.version}.jar"/>
     <!--
       SHA-256 of the ant-javacard.jar release asset for ${ant.javacard.version}.
 
@@ -80,7 +89,7 @@
 
     <target name="download-plugin" unless="ant.javacard.present"
             description="Download ant-javacard plugin if missing">
-        <mkdir dir="${user.home}/.ant/lib"/>
+        <mkdir dir="${target.dir}"/>
         <get src="https://github.com/martinpaljak/ant-javacard/releases/download/${ant.javacard.version}/ant-javacard.jar"
              dest="${ant.javacard.jar}"
              verbose="true"
@@ -89,31 +98,43 @@
 
     <!-- ── Verify the plugin jar before it reaches the classpath ──────── -->
     <!--
-      Runs on every build, not only after a download: the cached copy in
-      ~/.ant/lib is shared with every other project on this machine and is just
-      as able to be swapped as the download itself.
+      Runs on every build, not only after a download: the cached copy is just as
+      able to be swapped after the fact as the download itself is in flight.
+
+      Split across two targets so the mismatch path can DELETE the offending
+      jar before failing. Leaving it on disk would mean the next `ant cap`
+      either re-fails on the same bad bytes forever or, worse, that a human
+      "fixes" the build by bumping the digest to whatever it found. Deleting it
+      makes the next run re-download, which is the only recovery that can
+      succeed honestly.
     -->
-    <target name="verify-plugin" depends="download-plugin"
-            description="Fail unless ant-javacard.jar matches its pinned SHA-256">
+    <target name="-checksum-plugin" depends="download-plugin">
         <checksum file="${ant.javacard.jar}"
                   algorithm="SHA-256"
                   property="${ant.javacard.sha256}"
                   verifyProperty="ant.javacard.verified"/>
+        <condition property="ant.javacard.mismatch">
+            <not><istrue value="${ant.javacard.verified}"/></not>
+        </condition>
+    </target>
+
+    <target name="-plugin-mismatch" depends="-checksum-plugin" if="ant.javacard.mismatch">
+        <delete file="${ant.javacard.jar}" verbose="true"/>
         <fail>
-            <condition>
-                <not><istrue value="${ant.javacard.verified}"/></not>
-            </condition>
-ant-javacard.jar does not match its pinned SHA-256.
+ant-javacard.jar does not match its pinned SHA-256, and has been deleted.
 
   file     : ${ant.javacard.jar}
   expected : ${ant.javacard.sha256}
 
 Refusing to hand unverified bytes to the CAP converter. If you deliberately
-bumped ant.javacard.version, delete the cached jar, re-download it, and record
-the new digest in ant.javacard.sha256 in this file. Otherwise treat this as a
+bumped ant.javacard.version, re-run the build to re-download and record the new
+digest in ant.javacard.sha256 in this file. Otherwise treat this as a
 compromised or truncated download.
         </fail>
     </target>
+
+    <target name="verify-plugin" depends="-plugin-mismatch"
+            description="Fail unless ant-javacard.jar matches its pinned SHA-256"/>
 
     <!-- ── Register ant-javacard task ─────────────────────────────────── -->
     <target name="setup" depends="verify-plugin">

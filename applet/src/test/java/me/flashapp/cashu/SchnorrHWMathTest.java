@@ -164,6 +164,14 @@ class SchnorrHWMathTest {
      * Every .java file under src/main/java/me/flashapp/cashu must appear here;
      * a new one with no entry fails the test rather than slipping through
      * unchecked.
+     *
+     * "Runs exactly once at install time" is itself enforced, not taken on
+     * trust: {@link #assertNoAllocationOutside} requires every unqualified call
+     * to a listed method to sit inside another listed method's body. A helper
+     * like {@code initCardKeypair()} is only install-time for as long as nobody
+     * wires it to an APDU handler, and a whole-body allocation waiver granted on
+     * the strength of a comment is exactly how the leak this test guards against
+     * would come back.
      */
     private static final String[][] INSTALL_TIME_METHODS = {
         { "SchnorrHW.java",
@@ -216,6 +224,68 @@ class SchnorrHWMathTest {
         }
     }
 
+    /**
+     * The guard above is only worth anything if it can say no, so it is pointed
+     * at sources written to fail it.
+     *
+     * The waived-helper leak is the one this exists for: {@code initThing()}
+     * allocates and is allow-listed, which is fine while only the constructor
+     * calls it. The moment an APDU handler calls it too, every tap allocates a
+     * new array in EEPROM — and the allocation itself never moved, so the plain
+     * allocation scan stays green. Only the call-site check catches it.
+     */
+    @Test
+    @DisplayName("the allow-list rejects an install-time helper called from the APDU path")
+    void allowListRejectsInstallTimeHelperCalledFromApduPath() {
+        String[] allowList = {
+            "public static void install(", "private Fake()", "private void initThing()"
+        };
+
+        String clean =
+            "class Fake {\n"
+            + "    private byte[] buf;\n"
+            + "    public static void install(byte[] a, short b, byte c) { new Fake(); }\n"
+            + "    private Fake() { initThing(); }\n"
+            + "    private void initThing() { buf = new byte[64]; }\n"
+            + "    private void processApdu() { buf[0] = 1; }\n"
+            + "}\n";
+        assertNoAllocationOutside("Fake.java", clean, allowList);
+
+        String leaky = clean.replace(
+            "private void processApdu() { buf[0] = 1; }",
+            "private void processApdu() { initThing(); }");
+        org.opentest4j.AssertionFailedError failed =
+            org.junit.jupiter.api.Assertions.assertThrows(
+                org.opentest4j.AssertionFailedError.class,
+                () -> assertNoAllocationOutside("Fake.java", leaky, allowList),
+                "an allow-listed allocating helper reached from the APDU path must fail");
+        org.junit.jupiter.api.Assertions.assertTrue(failed.getMessage().contains("initThing"),
+            "the failure must name the helper that gained an APDU-path caller, got: "
+                + failed.getMessage());
+    }
+
+    /**
+     * A call on another object that merely shares a name with an allow-listed
+     * method is not a call to it — {@code ecdh.init(tmpPriv)} in SchnorrHW is
+     * exactly that, and flagging it would make the guard unusable.
+     */
+    @Test
+    @DisplayName("the call-site check ignores calls qualified by a receiver")
+    void allowListIgnoresQualifiedSameNameCalls() {
+        String src =
+            "class Fake {\n"
+            + "    private byte[] buf;\n"
+            + "    private Other other;\n"
+            + "    public static void install(byte[] a, short b, byte c) { new Fake(); }\n"
+            + "    private Fake() { initThing(); }\n"
+            + "    private void initThing() { buf = new byte[64]; }\n"
+            + "    private void processApdu() { other.initThing(); }\n"
+            + "}\n";
+        assertNoAllocationOutside("Fake.java", src, new String[] {
+            "public static void install(", "private Fake()", "private void initThing()"
+        });
+    }
+
     /** The install-time declarations registered for a source file. */
     private static String[] installTimeMethods(String fileName) {
         for (String[] entry : INSTALL_TIME_METHODS) {
@@ -242,6 +312,8 @@ class SchnorrHWMathTest {
         for (int i = 0; i < installTimeDeclarations.length; i++) {
             allowedRanges[i] = bodyRange(src, installTimeDeclarations[i]);
         }
+
+        assertOnlyCalledAtInstallTime(fileName, src, installTimeDeclarations, allowedRanges);
 
         // `new byte[..]` plus the array-initializer form `byte[] x = { .. }`,
         // which allocates just the same but contains no `new` keyword.
@@ -272,6 +344,82 @@ class SchnorrHWMathTest {
                     + src.substring(from, to).replaceAll("\\s+", " ") + "...");
             }
         }
+    }
+
+    /**
+     * Fails if a method whose whole body is waived as install-time is reachable
+     * from anywhere that is not itself waived.
+     *
+     * The waiver on {@code initCardKeypair()} is only sound while the "called
+     * once, from the constructor" claim in its comment holds. Add a
+     * {@code 0x4x REGENERATE_KEY} handler that calls it and the leak is back —
+     * a fresh {@code KeyPair} in EEPROM per APDU — with the allocation guard
+     * still green, because the allocation never moved. So the claim is checked
+     * rather than read: every unqualified call to a listed name must sit inside
+     * a listed body.
+     *
+     * Unqualified on purpose. {@code ecdh.init(tmpPriv)} is a call on another
+     * object that happens to share a name with {@code SchnorrHW.init()}, and a
+     * receiver before the dot is the one signal available without a type
+     * checker. The flip side is the known limit of this check: a cross-file
+     * {@code schnorrHW.init()} from an APDU handler is invisible to it. Both
+     * cross-file entry points here are install-time by construction — the JCRE
+     * calls {@code install()}, which calls the constructor — and the guard
+     * covers the case that actually rots, which is a local helper quietly
+     * gaining a second caller.
+     */
+    private static void assertOnlyCalledAtInstallTime(String fileName, String src,
+                                                      String[] installTimeDeclarations,
+                                                      int[][] allowedRanges) {
+        for (int i = 0; i < installTimeDeclarations.length; i++) {
+            String declaration = installTimeDeclarations[i];
+            String name = declaredName(declaration);
+            int declAt = src.indexOf(declaration);
+            int declEnd = declAt + declaration.length();
+
+            java.util.regex.Matcher calls = java.util.regex.Pattern
+                .compile("(?<![.\\w$])" + java.util.regex.Pattern.quote(name) + "\\s*\\(")
+                .matcher(src);
+            while (calls.find()) {
+                int at = calls.start();
+                if (at >= declAt && at < declEnd) {
+                    continue;   // the declaration itself
+                }
+                boolean allowed = false;
+                for (int[] range : allowedRanges) {
+                    allowed |= at > range[0] && at < range[1];
+                }
+                if (!allowed) {
+                    int from = Math.max(0, at - 90);
+                    int to = Math.min(src.length(), at + 90);
+                    org.junit.jupiter.api.Assertions.fail(
+                        name + "() is on the INSTALL_TIME_METHODS allow-list of " + fileName
+                        + ", so its entire body is waived from the no-allocation rule — but "
+                        + "it is called from outside every install-time method, i.e. from the "
+                        + "APDU path. Either drop the waiver and stop allocating in it, or "
+                        + "remove the call. Found near:\n..."
+                        + src.substring(from, to).replaceAll("\\s+", " ") + "...");
+                }
+            }
+        }
+    }
+
+    /** The method (or constructor) name in a declaration like "private void foo(". */
+    private static String declaredName(String declaration) {
+        int paren = declaration.indexOf('(');
+        if (paren < 0) {
+            throw new IllegalStateException(
+                "INSTALL_TIME_METHODS entries must name a method: " + declaration);
+        }
+        int end = paren;
+        while (end > 0 && Character.isWhitespace(declaration.charAt(end - 1))) end--;
+        int start = end;
+        while (start > 0 && Character.isJavaIdentifierPart(declaration.charAt(start - 1))) start--;
+        if (start == end) {
+            throw new IllegalStateException(
+                "no method name found in INSTALL_TIME_METHODS entry: " + declaration);
+        }
+        return declaration.substring(start, end);
     }
 
     /** Applet main-source directory, resolved from either module or repo root. */

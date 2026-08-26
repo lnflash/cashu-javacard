@@ -247,24 +247,47 @@ class SchnorrHWSignTest {
      * exactly analogous {@code pubKey.getW} length three lines later <em>was</em>
      * checked.
      *
-     * The JavaCard API does not promise that {@code getS} left-pads: a card may
-     * return the scalar with leading zero bytes stripped, and roughly one
-     * generated key in 256 has a zero high byte. On such a card the tail of the
-     * shared scratchpad gets folded into d, every signature fails verification,
-     * and the proofs stay P2PK-locked to that key — unspendable. jCardSim always
-     * returns 32, so nothing in this suite could ever surface it; the key below
-     * therefore reports its length the way a stripping card would.
+     * The JavaCard API does not promise that {@code getS} left-pads: it returns
+     * the scalar's byte length with the value right-aligned, so a card that
+     * strips leading zero bytes is spec-legal, and roughly one generated key in
+     * 256 has a zero high byte. Two wrong answers exist here. Trusting the
+     * length folds the tail of the shared scratchpad into d, and every signature
+     * fails verification while the proofs stay P2PK-locked to that key —
+     * unspendable. <em>Refusing</em> the card is no better: the card key is
+     * generated on-card, so a short scalar is luck, not a defect, and rejecting
+     * it bricks working hardware at random. sign() must right-align.
+     *
+     * jCardSim always returns 32, so nothing else in this suite can surface any
+     * of it; the stand-in below reports its length the way a stripping card
+     * would. The scratchpad is deliberately dirtied by a preceding signature so
+     * that a missing zero-pad shows up as a wrong d rather than as a lucky read
+     * of a still-zero buffer.
      */
     @Test
-    @DisplayName("sign() refuses a card whose getS returns fewer than 32 bytes")
-    void signRejectsShortPrivateScalar() throws Exception {
+    @DisplayName("sign() right-aligns a getS shorter than 32 bytes instead of failing")
+    void signRightAlignsShortPrivateScalar() throws Exception {
         SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
         schnorr.init();
+
+        byte[] msg = CashuAppletTest.hexToBytes(
+            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89");
+
+        // Churn the scratchpad with a full-width 32-byte key first, so sc[0..31]
+        // holds a foreign scalar when the short key is read over it.
+        ECPrivateKey dirtyPriv = (ECPrivateKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+        ECPublicKey dirtyPub = (ECPublicKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+        setCurve(dirtyPriv, dirtyPub);
+        dirtyPriv.setS(CashuAppletTest.hexToBytes((String) KEYS[2][0]), (short) 0, (short) 32);
+        dirtyPub.setW(CashuAppletTest.hexToBytes((String) KEYS[2][1]), (short) 0, (short) 65);
+        schnorr.sign(dirtyPriv, dirtyPub, msg, (short) 0, new byte[64], (short) 0);
 
         // d = 3: 31 leading zero bytes, i.e. squarely in the class of keys a
         // leading-zero-stripping card mis-reports.
         byte[] d = CashuAppletTest.hexToBytes((String) KEYS[0][0]);
         byte[] w = CashuAppletTest.hexToBytes((String) KEYS[0][1]);
+        byte[] pubX = java.util.Arrays.copyOfRange(w, 1, 33);
 
         ECPrivateKey priv = (ECPrivateKey) KeyBuilder.buildKey(
             KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
@@ -274,15 +297,11 @@ class SchnorrHWSignTest {
         priv.setS(d, (short) 0, (short) 32);
         pub.setW(w, (short) 0, (short) 65);
 
-        byte[] msg = CashuAppletTest.hexToBytes(
-            "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89");
-
         // Control leg: with a full-width getS this exact key signs and verifies,
-        // so a failure below is about the length check and not about d = 3.
+        // so a failure below is about the short length and not about d = 3.
         byte[] good = new byte[64];
         assertEquals(64, schnorr.sign(priv, pub, msg, (short) 0, good, (short) 0));
-        assertTrue(CashuAppletTest.schnorrVerify(
-                java.util.Arrays.copyOfRange(w, 1, 33), msg, good),
+        assertTrue(CashuAppletTest.schnorrVerify(pubX, msg, good),
             "control signature with a 32-byte getS must verify");
 
         ECPrivateKey stripping = new LeadingZeroStrippingPrivateKey(priv);
@@ -290,13 +309,47 @@ class SchnorrHWSignTest {
             "the stand-in must actually report a short length, or this test is vacuous");
 
         byte[] sig = new byte[64];
-        ISOException thrown = org.junit.jupiter.api.Assertions.assertThrows(
-            ISOException.class,
-            () -> schnorr.sign(stripping, pub, msg, (short) 0, sig, (short) 0),
-            "a getS shorter than 32 bytes must be refused, not silently padded with "
-                + "whatever the scratchpad happened to hold");
-        assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason(),
-            "short getS must report SW_CRYPTO_ERROR");
+        assertEquals(64, schnorr.sign(stripping, pub, msg, (short) 0, sig, (short) 0),
+            "a spec-legal card whose getS strips leading zeros must still sign");
+        assertTrue(CashuAppletTest.schnorrVerify(pubX, msg, sig),
+            "the short scalar must be right-aligned and zero-padded — a signature that "
+                + "fails to verify means the scratchpad tail was folded into d");
+    }
+
+    /**
+     * The complement of the test above: right-aligning is only safe for a length
+     * that fits. A card reporting 0 or more than 32 bytes is not a
+     * leading-zero-stripping card, it is a card this applet does not understand,
+     * and padding whatever it wrote would sign with a scalar nobody chose.
+     */
+    @Test
+    @DisplayName("sign() refuses a getS length outside 1..32")
+    void signRejectsOutOfRangePrivateScalarLength() throws Exception {
+        SchnorrHW schnorr = new SchnorrHW(SECP_G, SECP_P, SECP_A, SECP_B, SECP_N);
+        schnorr.init();
+
+        byte[] d = CashuAppletTest.hexToBytes((String) KEYS[2][0]);
+        byte[] w = CashuAppletTest.hexToBytes((String) KEYS[2][1]);
+
+        ECPrivateKey priv = (ECPrivateKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
+        ECPublicKey pub = (ECPublicKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
+        setCurve(priv, pub);
+        priv.setS(d, (short) 0, (short) 32);
+        pub.setW(w, (short) 0, (short) 65);
+
+        byte[] msg = new byte[32];
+        for (short bogus : new short[] { 0, 33, -1 }) {
+            ECPrivateKey liar = new FixedLengthPrivateKey(priv, bogus);
+            byte[] sig = new byte[64];
+            ISOException thrown = org.junit.jupiter.api.Assertions.assertThrows(
+                ISOException.class,
+                () -> schnorr.sign(liar, pub, msg, (short) 0, sig, (short) 0),
+                "a getS length of " + bogus + " must be refused, not padded");
+            assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason(),
+                "an out-of-range getS length must report SW_CRYPTO_ERROR");
+        }
     }
 
     /**
@@ -356,10 +409,8 @@ class SchnorrHWSignTest {
      * leading zero bytes: the value is right, the length is short, and the
      * caller's buffer keeps whatever it held beyond it.
      */
-    private static final class LeadingZeroStrippingPrivateKey implements ECPrivateKey {
-        private final ECPrivateKey delegate;
-
-        LeadingZeroStrippingPrivateKey(ECPrivateKey delegate) { this.delegate = delegate; }
+    private static final class LeadingZeroStrippingPrivateKey extends DelegatingPrivateKey {
+        LeadingZeroStrippingPrivateKey(ECPrivateKey delegate) { super(delegate); }
 
         @Override
         public short getS(byte[] buf, short off) {
@@ -371,7 +422,35 @@ class SchnorrHWSignTest {
             System.arraycopy(full, lead, buf, off, stripped);
             return stripped;
         }
+    }
 
+    /**
+     * An {@link ECPrivateKey} whose {@code getS} writes the real scalar but
+     * reports a length the applet cannot work with — a card outside the range
+     * the spec allows, rather than a merely stripping one.
+     */
+    private static final class FixedLengthPrivateKey extends DelegatingPrivateKey {
+        private final short reported;
+
+        FixedLengthPrivateKey(ECPrivateKey delegate, short reported) {
+            super(delegate);
+            this.reported = reported;
+        }
+
+        @Override
+        public short getS(byte[] buf, short off) {
+            delegate.getS(buf, off);
+            return reported;
+        }
+    }
+
+    /** Everything an {@link ECPrivateKey} must implement, forwarded verbatim. */
+    private static abstract class DelegatingPrivateKey implements ECPrivateKey {
+        protected final ECPrivateKey delegate;
+
+        DelegatingPrivateKey(ECPrivateKey delegate) { this.delegate = delegate; }
+
+        @Override public short getS(byte[] b, short o) { return delegate.getS(b, o); }
         @Override public void setS(byte[] b, short o, short l) { delegate.setS(b, o, l); }
         @Override public void setFieldFP(byte[] b, short o, short l) { delegate.setFieldFP(b, o, l); }
         @Override public void setFieldF2M(short e) { delegate.setFieldF2M(e); }
