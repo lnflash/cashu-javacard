@@ -17,9 +17,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * that agree with the in-repo verifier and are rejected by every real mint.
  *
  * These vectors come from the specification itself, so they anchor the verifier
- * to BIP-340, and the verifier in turn anchors the card. The card cannot be fed
- * an external private key, so this is verify-only by necessity — signing
- * coverage lives in CashuAppletTest.
+ * to BIP-340, and the verifier in turn anchors the card.
+ *
+ * This file is verify-only, and the honest reason is NOT that the card refuses
+ * an external key — SchnorrHWSignTest does exactly that, loading BIP-340's own
+ * vector key B7E15162… via priv.setS(). It is that sign() draws fresh auxiliary
+ * randomness per call (BIP-340 step 2), so it cannot reproduce a vector's exact
+ * signature. Reproducing them would need aux forced to a fixed value, which no
+ * current API exposes. Consequently these vectors pin the VERIFIER only: nothing
+ * here proves the card's nonce derivation is BIP-340's rather than some other
+ * derivation that also happens to verify. See the open finding on nonce-
+ * derivation coverage in SchnorrHWSignTest.
  *
  * Source: https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv
  */

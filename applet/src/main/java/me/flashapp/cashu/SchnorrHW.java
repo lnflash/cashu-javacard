@@ -128,8 +128,11 @@ final class SchnorrHW {
     private final MessageDigest sha256;
     private final KeyAgreement  ecdh;      // ALG_EC_SVDP_DH_PLAIN_XY
     private final ECPrivateKey  tmpPriv;   // reused temp key for k
-    private final ECPublicKey   genPub;    // generator G as EC public key
     private final RandomData    rng;       // BIP-340 auxiliary randomness (step 2)
+    // NB: there is deliberately no ECPublicKey for the generator. R = k*G is
+    // computed by handing the raw 65-byte G to generateSecret(), so a key object
+    // for G would be built, parameterised and then never read — dead weight in
+    // EEPROM and one more thing to keep in sync with the curve parameters.
 
     // ── secp256k1 curve parameters (shared with CashuApplet) ──────────────
     // Passed in via constructor to avoid code duplication.
@@ -157,12 +160,6 @@ final class SchnorrHW {
         sc     = JCSystem.makeTransientByteArray((short)256, JCSystem.CLEAR_ON_DESELECT);
         work   = JCSystem.makeTransientByteArray(WORK_LEN,   JCSystem.CLEAR_ON_DESELECT);
         sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
-
-        // Generator as EC public key (used as ECDH "peer" for k*G)
-        genPub = (ECPublicKey) KeyBuilder.buildKey(
-            KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
-        setECParams(null, genPub);
-        genPub.setW(G, (short)0, (short)65);
 
         // Temp private key slot for k (reused each sign call)
         tmpPriv = (ECPrivateKey) KeyBuilder.buildKey(
@@ -207,11 +204,12 @@ final class SchnorrHW {
         sha256.reset();
         sha256.doFinal(tagChallenge, (short)0, (short)17, tagHashChallenge, (short)0);
 
-        // The probe buffer is allocated here, in init(), so that the one-shot
-        // install-time allocation stays inside the only two methods allowed to
-        // allocate at all (see the memory-discipline note on this class and
-        // SchnorrHWMathTest#noAllocationOutsideInstallTime). 80 bytes, once.
-        probeEcdhFraming(new byte[80]);
+        // Probe using the transient scratchpad rather than a fresh array: a
+        // `new byte[80]` here would be persistent EEPROM that is orphaned the
+        // moment init() returns and never reclaimed, which is precisely what
+        // the memory-discipline note on this class forbids. `sc` is already
+        // allocated, is 256 B, and nothing has signed yet at install time.
+        probeEcdhFraming(sc);
     }
 
     /**
@@ -227,12 +225,16 @@ final class SchnorrHW {
      * they are P2PK-locked to a key whose card can no longer sign. Throwing here
      * fails the {@code gp --install} instead, before a single proof is loaded.
      *
-     * @param probe caller-allocated scratch of at least 80 bytes. Sized well
+     * @param probe scratch of at least 80 bytes, owned by the caller. Sized well
      *              above the expected 65 so that a card returning more trips the
      *              length check below rather than an
-     *              ArrayIndexOutOfBoundsException.
+     *              ArrayIndexOutOfBoundsException. Its first 80 bytes are
+     *              clobbered.
      */
     private void probeEcdhFraming(byte[] probe) {
+        // Zero the scalar explicitly — the buffer is shared scratch, not a
+        // freshly allocated (and therefore zeroed) array.
+        Util.arrayFillNonAtomic(probe, (short)0, (short)80, (byte)0);
         probe[31] = (byte)0x02;              // throwaway scalar d = 2, so R = 2G
         tmpPriv.setS(probe, (short)0, (short)32);
         ecdh.init(tmpPriv);
