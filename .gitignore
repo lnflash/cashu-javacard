@@ -18,3 +18,9 @@ build/
 # Build output
 target/
 *.cap
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

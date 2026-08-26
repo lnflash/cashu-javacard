@@ -41,6 +41,43 @@ jobs:
       - name: Run tests
         run: mvn -B -f applet/pom.xml test
 
+  cardctl:
+    name: cardctl tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Both suites run with no reader, no card and no pyscard: cardctl imports
+      # pyscard lazily precisely so the APDU encodings and the BIP-340 verifier
+      # can be checked anywhere. That matters because the verifier is what
+      # `cardctl selftest` trusts when it declares a physical card's signature
+      # valid — if it is wrong, selftest either passes a broken card or rejects
+      # a good one.
+      - name: Run tests
+        working-directory: tools/cardctl
+        run: |
+          python test_bip340.py
+          python test_apdu.py
+
+      # Prove requirements.txt is actually installable. pyscard ships a native
+      # _scard module and is the one dependency that can install "successfully"
+      # and then fail at import — that is exactly how it behaves on macOS system
+      # Python 3.9. Catch a broken pin here rather than at the card reader.
+      - name: Install requirements and import pyscard
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y swig libpcsclite-dev
+          pip install -r tools/cardctl/requirements.txt
+          python -c "import smartcard.scard; print('pyscard import OK')"
+
   cap:
     name: CAP conversion
     runs-on: ubuntu-latest
