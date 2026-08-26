@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""
+cardctl — host-side PC/SC driver for the Cashu JavaCard applet.
+
+Speaks the full command set in spec/APDU.md over either interface: a contact
+reader (ACR39U and friends) or a contactless one (ACR122U). PC/SC hides the
+difference, so the same commands work for both — which matters, because CAP
+loading over contactless is the flaky path and you will want to know quickly
+whether a failure is the card or the interface.
+
+The command that earns this tool its keep is `selftest`: it selects the applet,
+reads the card's public key, asks the card to sign a message, and verifies that
+signature against BIP-340. Everything up to now has been proven only in
+jCardSim, which cannot surface EEPROM exhaustion, ECDH output framing, or a
+card whose getS returns short. `selftest` is the first evidence from silicon.
+
+    python3 cardctl.py readers
+    python3 cardctl.py selftest
+    python3 cardctl.py info
+    python3 cardctl.py spend 0 --message <64-hex>
+
+Requires: pip install -r requirements.txt   (pyscard)
+"""
+
+import argparse
+import binascii
+import hashlib
+import os
+import secrets
+import sys
+from typing import List, Optional, Tuple
+
+import bip340
+
+# ── Applet identity ───────────────────────────────────────────────────────────
+# The 7-byte PACKAGE AID. SELECT does prefix matching, so this also selects the
+# 8-byte applet AID (…02 01). We try the 8-byte form as a fallback for cards or
+# readers that decline partial matches.
+PACKAGE_AID = bytes.fromhex("D276000085010200")[:7]
+APPLET_AID = bytes.fromhex("D276000085010201")
+
+CLA = 0xB0
+
+INS_GET_INFO = 0x01
+INS_GET_PUBKEY = 0x10
+INS_GET_BALANCE = 0x11
+INS_GET_PROOF_COUNT = 0x12
+INS_GET_PROOF = 0x13
+INS_GET_SLOT_STATUS = 0x14
+INS_SPEND_PROOF = 0x20
+INS_SIGN_ARBITRARY = 0x21
+INS_LOAD_PROOF = 0x30
+INS_CLEAR_SPENT = 0x31
+INS_VERIFY_PIN = 0x40
+INS_SET_PIN = 0x41
+INS_CHANGE_PIN = 0x42
+INS_LOCK_CARD = 0x50
+
+LOCK_CONFIRM_BYTE = 0xDE
+
+PROOF_SIZE = 78
+STATUS_NAMES = {0x00: "empty", 0x01: "unspent", 0x02: "spent"}
+
+SW_MEANINGS = {
+    0x9000: "success",
+    0x6700: "wrong length",
+    0x6982: "security condition not satisfied (PIN required but not verified)",
+    0x6983: "PIN blocked — retries exhausted",
+    0x6984: "PIN not set",
+    0x6985: "conditions not satisfied (already spent / PIN already set / card locked)",
+    0x6A83: "slot index out of range",
+    0x6A84: "no space — all slots occupied",
+    0x6A88: "slot is empty",
+    0x6D00: "instruction not supported",
+    0x6E00: "class not supported",
+    0x6F00: "signing failed (hardware error)",
+}
+
+
+def describe_sw(sw: int) -> str:
+    if sw in SW_MEANINGS:
+        return SW_MEANINGS[sw]
+    if (sw & 0xFFF0) == 0x63C0:
+        return f"wrong PIN — {sw & 0x0F} retries remaining"
+    return "unknown status word"
+
+
+class CardError(Exception):
+    def __init__(self, sw: int, context: str = ""):
+        self.sw = sw
+        where = f" during {context}" if context else ""
+        super().__init__(f"card returned {sw:04X}{where}: {describe_sw(sw)}")
+
+
+def _hex(b: bytes) -> str:
+    return binascii.hexlify(b).decode()
+
+
+# ── PC/SC transport ───────────────────────────────────────────────────────────
+def _load_pyscard():
+    try:
+        from smartcard.System import readers  # noqa
+        from smartcard.util import toHexString  # noqa
+        return readers
+    except ImportError:
+        sys.exit(
+            "pyscard is not installed.\n"
+            "  pip install -r requirements.txt\n"
+            "On macOS PC/SC ships with the OS — do NOT install pcsc-lite.\n"
+            "On Debian/Ubuntu you also need: sudo apt install pcscd libpcsclite-dev"
+        )
+
+
+class Card:
+    """A connected card with the Cashu applet selected."""
+
+    def __init__(self, reader_index: int = 0, verbose: bool = False):
+        readers_fn = _load_pyscard()
+        available = readers_fn()
+        if not available:
+            sys.exit(
+                "No PC/SC readers found.\n"
+                "  - Is the reader plugged in?\n"
+                "  - Linux: is pcscd running? (sudo systemctl start pcscd)\n"
+                "  - macOS: the daemon is built in; try replugging the reader."
+            )
+        if reader_index >= len(available):
+            sys.exit(f"Reader index {reader_index} out of range ({len(available)} found)")
+        self.reader = available[reader_index]
+        self.verbose = verbose
+        try:
+            self.connection = self.reader.createConnection()
+            self.connection.connect()
+        except Exception as exc:  # noqa: BLE001 — surface the driver's own words
+            sys.exit(f"Could not connect to a card on {self.reader}: {exc}\nIs a card on the reader?")
+
+    # ── raw APDU ──────────────────────────────────────────────────────────────
+    def transmit(self, apdu: bytes, context: str = "") -> bytes:
+        if self.verbose:
+            print(f"  > {_hex(apdu)}", file=sys.stderr)
+        data, sw1, sw2 = self.connection.transmit(list(apdu))
+        sw = (sw1 << 8) | sw2
+        body = bytes(data)
+        if self.verbose:
+            print(f"  < {_hex(body)} {sw:04X}", file=sys.stderr)
+        if sw != 0x9000:
+            raise CardError(sw, context)
+        return body
+
+    def send(self, ins: int, p1: int = 0, p2: int = 0,
+             data: bytes = b"", le: Optional[int] = None, context: str = "") -> bytes:
+        apdu = bytes([CLA, ins, p1, p2])
+        if data:
+            apdu += bytes([len(data)]) + data
+        if le is not None:
+            apdu += bytes([le])
+        return self.transmit(apdu, context or f"INS {ins:02X}")
+
+    # ── selection ─────────────────────────────────────────────────────────────
+    def select(self) -> bytes:
+        """SELECT by AID. Returns the 2-byte applet version."""
+        for aid in (PACKAGE_AID, APPLET_AID):
+            apdu = bytes([0x00, 0xA4, 0x04, 0x00, len(aid)]) + aid
+            try:
+                return self.transmit(apdu, "SELECT")
+            except CardError as exc:
+                last = exc
+        raise SystemExit(
+            f"SELECT failed: {last}\n"
+            "The applet is probably not installed on this card. Load it with:\n"
+            "  gp -install applet/target/cashu-javacard-0.1.0.cap"
+        )
+
+    # ── read commands ─────────────────────────────────────────────────────────
+    def get_info(self) -> dict:
+        b = self.send(INS_GET_INFO, le=0x00, context="GET_INFO")
+        if len(b) < 8:
+            raise SystemExit(f"GET_INFO returned {len(b)} bytes, expected 8: {_hex(b)}")
+        caps = b[6]
+        return {
+            "version": f"{b[0]}.{b[1]}",
+            "max_slots": b[2],
+            "unspent": b[3],
+            "spent": b[4],
+            "empty": b[5],
+            "caps_raw": caps,
+            "secp256k1_native": bool(caps & 0x01),
+            "schnorr": bool(caps & 0x02),
+            "pin_state": {0: "unset", 1: "set", 2: "locked"}.get(b[7], f"unknown({b[7]})"),
+        }
+
+    def get_pubkey(self) -> bytes:
+        return self.send(INS_GET_PUBKEY, le=0x21, context="GET_PUBKEY")
+
+    def get_balance(self) -> int:
+        return int.from_bytes(self.send(INS_GET_BALANCE, le=0x04, context="GET_BALANCE"), "big")
+
+    def get_proof_count(self) -> int:
+        return self.send(INS_GET_PROOF_COUNT, le=0x01, context="GET_PROOF_COUNT")[0]
+
+    def get_slot_status(self) -> bytes:
+        return self.send(INS_GET_SLOT_STATUS, le=0x20, context="GET_SLOT_STATUS")
+
+    def get_proof(self, slot: int) -> dict:
+        b = self.send(INS_GET_PROOF, p1=slot, le=PROOF_SIZE, context=f"GET_PROOF slot {slot}")
+        return {
+            "slot": slot,
+            "status": STATUS_NAMES.get(b[0], f"unknown({b[0]})"),
+            "keyset_id": b[1:9].decode("ascii", "replace"),
+            "amount": int.from_bytes(b[9:13], "big"),
+            "secret": b[13:45],
+            "c": b[45:78],
+        }
+
+    # ── spend commands ────────────────────────────────────────────────────────
+    def spend_proof(self, slot: int, message: bytes) -> bytes:
+        if len(message) != 32:
+            raise SystemExit(f"SPEND_PROOF message must be 32 bytes, got {len(message)}")
+        return self.send(INS_SPEND_PROOF, p1=slot, data=message, le=0x40,
+                         context=f"SPEND_PROOF slot {slot}")
+
+    def sign(self, message: bytes) -> bytes:
+        if len(message) != 32:
+            raise SystemExit(f"SIGN_ARBITRARY message must be 32 bytes, got {len(message)}")
+        return self.send(INS_SIGN_ARBITRARY, data=message, le=0x40, context="SIGN_ARBITRARY")
+
+    # ── write commands ────────────────────────────────────────────────────────
+    def load_proof(self, keyset_id: bytes, amount: int, secret: bytes, c: bytes) -> int:
+        if len(keyset_id) != 8:
+            raise SystemExit(f"keyset_id must be 8 bytes, got {len(keyset_id)}")
+        if len(secret) != 32:
+            raise SystemExit(f"secret must be 32 bytes, got {len(secret)}")
+        if len(c) != 33:
+            raise SystemExit(f"C must be 33 bytes, got {len(c)}")
+        payload = keyset_id + amount.to_bytes(4, "big") + secret + c
+        return self.send(INS_LOAD_PROOF, data=payload, le=0x01, context="LOAD_PROOF")[0]
+
+    def clear_spent(self) -> int:
+        return self.send(INS_CLEAR_SPENT, le=0x01, context="CLEAR_SPENT")[0]
+
+    # ── auth ──────────────────────────────────────────────────────────────────
+    def verify_pin(self, pin: bytes) -> None:
+        self.send(INS_VERIFY_PIN, data=pin, context="VERIFY_PIN")
+
+    def set_pin(self, pin: bytes) -> None:
+        self.send(INS_SET_PIN, data=pin, context="SET_PIN")
+
+    def change_pin(self, old: bytes, new: bytes) -> None:
+        self.send(INS_CHANGE_PIN, data=bytes([len(old)]) + old + new, context="CHANGE_PIN")
+
+    def lock_card(self) -> None:
+        self.transmit(bytes([CLA, INS_LOCK_CARD, 0x00, LOCK_CONFIRM_BYTE]), "LOCK_CARD")
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def parse_hex(value: str, expected_len: Optional[int] = None, what: str = "value") -> bytes:
+    try:
+        b = bytes.fromhex(value.removeprefix("0x"))
+    except ValueError:
+        raise SystemExit(f"{what} is not valid hex: {value!r}")
+    if expected_len is not None and len(b) != expected_len:
+        raise SystemExit(f"{what} must be {expected_len} bytes ({expected_len*2} hex chars), got {len(b)}")
+    return b
+
+
+def connect(args) -> Card:
+    card = Card(reader_index=args.reader, verbose=args.verbose)
+    card.select()
+    return card
+
+
+def check_signature(pubkey: bytes, message: bytes, sig: bytes) -> bool:
+    return bip340.verify(bip340.x_only(pubkey), message, sig)
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+def cmd_readers(args) -> int:
+    readers_fn = _load_pyscard()
+    found = readers_fn()
+    if not found:
+        print("No PC/SC readers found.")
+        return 1
+    for i, r in enumerate(found):
+        print(f"[{i}] {r}")
+    return 0
+
+
+def cmd_info(args) -> int:
+    card = connect(args)
+    i = card.get_info()
+    print(f"applet version   : {i['version']}")
+    print(f"slots            : {i['max_slots']} total — "
+          f"{i['unspent']} unspent, {i['spent']} spent, {i['empty']} empty")
+    print(f"capabilities     : 0x{i['caps_raw']:02X} "
+          f"(secp256k1 native={i['secp256k1_native']}, schnorr={i['schnorr']})")
+    print(f"PIN              : {i['pin_state']}")
+    print(f"balance          : {card.get_balance()}")
+    return 0
+
+
+def cmd_pubkey(args) -> int:
+    card = connect(args)
+    pk = card.get_pubkey()
+    print(_hex(pk))
+    if args.verbose:
+        print(f"x-only: {_hex(bip340.x_only(pk))}", file=sys.stderr)
+    return 0
+
+
+def cmd_balance(args) -> int:
+    print(connect(args).get_balance())
+    return 0
+
+
+def cmd_slots(args) -> int:
+    card = connect(args)
+    status = card.get_slot_status()
+    print(f"{len(status)} slots ({card.get_proof_count()} non-empty)")
+    for i, s in enumerate(status):
+        if s != 0x00 or args.all:
+            print(f"  [{i:2}] {STATUS_NAMES.get(s, f'unknown({s})')}")
+    return 0
+
+
+def cmd_proof(args) -> int:
+    p = connect(args).get_proof(args.slot)
+    print(f"slot      : {p['slot']}")
+    print(f"status    : {p['status']}")
+    print(f"keyset_id : {p['keyset_id']}")
+    print(f"amount    : {p['amount']}")
+    print(f"secret    : {_hex(p['secret'])}")
+    print(f"C         : {_hex(p['c'])}")
+    return 0
+
+
+def cmd_sign(args) -> int:
+    card = connect(args)
+    msg = parse_hex(args.message, 32, "message") if args.message else secrets.token_bytes(32)
+    if not args.message:
+        print(f"message   : {_hex(msg)}  (random)")
+    sig = card.sign(msg)
+    print(f"signature : {_hex(sig)}")
+    ok = check_signature(card.get_pubkey(), msg, sig)
+    print(f"BIP-340   : {'VALID ✅' if ok else 'INVALID ❌'}")
+    return 0 if ok else 1
+
+
+def cmd_spend(args) -> int:
+    card = connect(args)
+    msg = parse_hex(args.message, 32, "message") if args.message else secrets.token_bytes(32)
+    if not args.message:
+        print(f"message   : {_hex(msg)}  (random)")
+    before = card.get_proof(args.slot)
+    print(f"slot {args.slot} before : {before['status']}, amount {before['amount']}")
+    sig = card.spend_proof(args.slot, msg)
+    print(f"signature : {_hex(sig)}")
+    ok = check_signature(card.get_pubkey(), msg, sig)
+    print(f"BIP-340   : {'VALID ✅' if ok else 'INVALID ❌'}")
+    after = card.get_proof(args.slot)
+    print(f"slot {args.slot} after  : {after['status']}")
+    if after["status"] != "spent":
+        print("WARNING: slot was not marked spent — single-spend enforcement failed", file=sys.stderr)
+        return 1
+    return 0 if ok else 1
+
+
+def cmd_load(args) -> int:
+    card = connect(args)
+    if args.pin:
+        card.verify_pin(args.pin.encode())
+    keyset = args.keyset.encode() if len(args.keyset) == 8 and not args.keyset_hex \
+        else parse_hex(args.keyset, 8, "keyset")
+    secret = parse_hex(args.secret, 32, "secret") if args.secret else secrets.token_bytes(32)
+    c = parse_hex(args.c, 33, "C") if args.c else b"\x02" + secrets.token_bytes(32)
+    slot = card.load_proof(keyset, args.amount, secret, c)
+    print(f"loaded into slot {slot}")
+    if not args.secret:
+        print(f"secret : {_hex(secret)}")
+    if not args.c:
+        print(f"C      : {_hex(c)}  (placeholder, not a real mint signature)")
+    return 0
+
+
+def cmd_clear_spent(args) -> int:
+    card = connect(args)
+    if args.pin:
+        card.verify_pin(args.pin.encode())
+    print(f"freed {card.clear_spent()} slot(s)")
+    return 0
+
+
+def cmd_verify_pin(args) -> int:
+    connect(args).verify_pin(args.pin.encode())
+    print("PIN verified")
+    return 0
+
+
+def cmd_set_pin(args) -> int:
+    connect(args).set_pin(args.pin.encode())
+    print("PIN set")
+    return 0
+
+
+def cmd_change_pin(args) -> int:
+    card = connect(args)
+    card.verify_pin(args.old.encode())
+    card.change_pin(args.old.encode(), args.new.encode())
+    print("PIN changed")
+    return 0
+
+
+def cmd_lock(args) -> int:
+    card = connect(args)
+    if not args.yes:
+        print("LOCK_CARD permanently and irreversibly disables all write operations.")
+        if input("Type 'lock' to confirm: ").strip() != "lock":
+            print("aborted")
+            return 1
+    if args.pin:
+        card.verify_pin(args.pin.encode())
+    card.lock_card()
+    print("card locked (irreversible)")
+    return 0
+
+
+def cmd_apdu(args) -> int:
+    card = Card(reader_index=args.reader, verbose=True)
+    if not args.no_select:
+        card.select()
+    try:
+        body = card.transmit(parse_hex(args.apdu, None, "apdu"), "raw APDU")
+        print(_hex(body) if body else "(no data)")
+        return 0
+    except CardError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
+def cmd_selftest(args) -> int:
+    """
+    The card-arrival test. Everything the applet claims, proven on real silicon.
+    """
+    results: List[Tuple[str, bool, str]] = []
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        results.append((name, ok, detail))
+        print(f"{'PASS' if ok else 'FAIL'}  {name}{'  — ' + detail if detail else ''}")
+
+    card = Card(reader_index=args.reader, verbose=args.verbose)
+    print(f"reader: {card.reader}\n")
+
+    version = card.select()
+    record("SELECT applet", True, f"version {version[0]}.{version[1]}" if len(version) >= 2 else "")
+
+    info = card.get_info()
+    record("GET_INFO", True,
+           f"v{info['version']}, {info['max_slots']} slots, PIN {info['pin_state']}")
+    record("Schnorr capability advertised", info["schnorr"],
+           f"caps=0x{info['caps_raw']:02X}")
+
+    pk = card.get_pubkey()
+    good_pk = len(pk) == 33 and pk[0] in (0x02, 0x03)
+    record("GET_PUBKEY well-formed", good_pk, f"{_hex(pk)[:20]}… ({len(pk)} bytes)")
+
+    card.get_balance()
+    record("GET_BALANCE", True, str(card.get_balance()))
+
+    status = card.get_slot_status()
+    record("GET_SLOT_STATUS", len(status) == info["max_slots"],
+           f"{len(status)} status bytes")
+
+    # The whole point: does a signature off this card verify against BIP-340?
+    all_sigs_ok = True
+    for i in range(args.rounds):
+        msg = secrets.token_bytes(32)
+        sig = card.sign(msg)
+        ok = check_signature(pk, msg, sig)
+        all_sigs_ok &= ok
+        record(f"SIGN_ARBITRARY + BIP-340 verify [{i + 1}/{args.rounds}]", ok,
+               "" if ok else f"msg={_hex(msg)} sig={_hex(sig)}")
+
+    # A fresh nonce per call is a BIP-340 requirement and a real security
+    # property here: a nonce that is a pure function of (d, msg) leaks the key
+    # to anyone who can fault-inject two signatures over the same message.
+    if args.rounds >= 2:
+        fixed = secrets.token_bytes(32)
+        s1, s2 = card.sign(fixed), card.sign(fixed)
+        record("fresh nonce across identical messages", s1[:32] != s2[:32],
+               "R reused — aux randomness is not working" if s1[:32] == s2[:32] else "")
+
+    failed = [n for n, ok, _ in results if not ok]
+    print()
+    if failed:
+        print(f"{len(failed)} check(s) FAILED: {', '.join(failed)}")
+        return 1
+    print(f"All {len(results)} checks passed on physical hardware.")
+    if not all_sigs_ok:
+        return 1
+    return 0
+
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="cardctl",
+        description="PC/SC driver for the Cashu JavaCard applet (spec/APDU.md).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Start with:  cardctl readers   then   cardctl selftest",
+    )
+    p.add_argument("-r", "--reader", type=int, default=0, help="reader index (default 0)")
+    p.add_argument("-v", "--verbose", action="store_true", help="log APDUs to stderr")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("readers", help="list PC/SC readers").set_defaults(func=cmd_readers)
+    sub.add_parser("info", help="applet version, slot counts, capabilities, PIN state").set_defaults(func=cmd_info)
+    sub.add_parser("pubkey", help="card's compressed secp256k1 public key").set_defaults(func=cmd_pubkey)
+    sub.add_parser("balance", help="sum of unspent proof amounts").set_defaults(func=cmd_balance)
+
+    s = sub.add_parser("slots", help="per-slot status")
+    s.add_argument("--all", action="store_true", help="include empty slots")
+    s.set_defaults(func=cmd_slots)
+
+    s = sub.add_parser("proof", help="read a proof slot")
+    s.add_argument("slot", type=int)
+    s.set_defaults(func=cmd_proof)
+
+    s = sub.add_parser("sign", help="SIGN_ARBITRARY and verify the signature")
+    s.add_argument("--message", help="32-byte message as hex (random if omitted)")
+    s.set_defaults(func=cmd_sign)
+
+    s = sub.add_parser("spend", help="SPEND_PROOF: mark spent, sign, verify")
+    s.add_argument("slot", type=int)
+    s.add_argument("--message", help="32-byte message as hex (random if omitted)")
+    s.set_defaults(func=cmd_spend)
+
+    s = sub.add_parser("load", help="LOAD_PROOF into the next free slot")
+    s.add_argument("--keyset", required=True, help="8-byte keyset id (ascii, or hex with --keyset-hex)")
+    s.add_argument("--keyset-hex", action="store_true", help="treat --keyset as hex")
+    s.add_argument("--amount", type=int, required=True)
+    s.add_argument("--secret", help="32-byte secret as hex (random if omitted)")
+    s.add_argument("--c", help="33-byte C point as hex (placeholder if omitted)")
+    s.add_argument("--pin", help="verify this PIN first")
+    s.set_defaults(func=cmd_load)
+
+    s = sub.add_parser("clear-spent", help="free all spent slots")
+    s.add_argument("--pin")
+    s.set_defaults(func=cmd_clear_spent)
+
+    s = sub.add_parser("verify-pin", help="verify the PIN for this session")
+    s.add_argument("pin")
+    s.set_defaults(func=cmd_verify_pin)
+
+    s = sub.add_parser("set-pin", help="set the PIN (personalisation only, once)")
+    s.add_argument("pin")
+    s.set_defaults(func=cmd_set_pin)
+
+    s = sub.add_parser("change-pin", help="change the PIN")
+    s.add_argument("old")
+    s.add_argument("new")
+    s.set_defaults(func=cmd_change_pin)
+
+    s = sub.add_parser("lock", help="permanently disable writes (IRREVERSIBLE)")
+    s.add_argument("--pin")
+    s.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    s.set_defaults(func=cmd_lock)
+
+    s = sub.add_parser("apdu", help="send a raw APDU (hex)")
+    s.add_argument("apdu")
+    s.add_argument("--no-select", action="store_true", help="skip SELECT first")
+    s.set_defaults(func=cmd_apdu)
+
+    s = sub.add_parser("selftest", help="full hardware check incl. BIP-340 signature verification")
+    s.add_argument("--rounds", type=int, default=3, help="signature rounds (default 3)")
+    s.set_defaults(func=cmd_selftest)
+
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.func(args)
+    except CardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
