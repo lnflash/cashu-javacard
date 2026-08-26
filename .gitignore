@@ -14,3 +14,7 @@ build/
 *.key
 *.pem
 *.p12
+
+# Build output
+target/
+*.cap

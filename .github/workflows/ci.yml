@@ -1,0 +1,91 @@
+name: CI
+
+# This repo shipped for months with a build that could not resolve from a clean
+# checkout and a CAP conversion that had never been run. Both halves are now
+# enforced on every push, so the next regression is caught here rather than by
+# someone holding a tray of blank cards.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: jCardSim tests (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 11 is the floor the pom declares; 17 is what contributors actually run.
+        java: ['11', '17']
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      # Runs from a clean checkout with no local repo priming, so a dependency
+      # that does not exist on Maven Central fails here.
+      - name: Run tests
+        run: mvn -B -f applet/pom.xml test
+
+  cap:
+    name: CAP conversion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Ant
+        run: sudo apt-get update && sudo apt-get install -y ant
+
+      # ant-javacard does NOT download JavaCard SDKs; the kit has to be supplied.
+      # Pinned to a commit, not a branch: this third-party repo supplies both
+      # the converter toolchain and the target API jars, and its output is
+      # uploaded as a release artifact. An unpinned `master` would let the bytes
+      # this CAP is built against change with no diff and no signal in the log,
+      # on firmware that holds bearer money. Bump deliberately, same as
+      # `ant.javacard.version` in applet/build.xml.
+      - name: Check out JavaCard SDKs
+        uses: actions/checkout@v5
+        with:
+          repository: martinpaljak/oracle_javacard_sdks
+          # "Import 3.2.0 / 26.0 (2026-05-04)" — contains jc305u4_kit.
+          ref: 6a75ec0d6913db236d354f154df7dbc9573d976d
+          path: .javacard-sdks
+          persist-credentials: false
+
+      # 3.0.5 is the floor: SchnorrHW needs ALG_EC_SVDP_DH_PLAIN_XY, which does
+      # not exist in 3.0.4.
+      - name: Convert CAP
+        run: ant -f applet/build.xml cap -Djc.sdk="$GITHUB_WORKSPACE/.javacard-sdks/jc305u4_kit"
+
+      - name: Assert CAP was produced
+        run: |
+          cap=applet/target/cashu-javacard-0.1.0.cap
+          test -s "$cap" || { echo "::error::$cap was not produced"; exit 1; }
+          ls -l "$cap"
+
+      - name: Upload CAP
+        uses: actions/upload-artifact@v5
+        with:
+          name: cashu-javacard-cap
+          path: applet/target/cashu-javacard-0.1.0.cap
+          if-no-files-found: error

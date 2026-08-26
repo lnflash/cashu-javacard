@@ -11,7 +11,8 @@ ENG-182 — GlobalPlatform packaging and deployment for CashuApplet.
 | Java | 11+ | `brew install openjdk@17` |
 | Apache Ant | 1.10+ | `brew install ant` |
 | GlobalPlatformPro (gp) | 20.01.23+ | See below |
-| Physical card | Feitian JavaCard 3.0.4 *or* NXP JCOP4 SmartMX3 | |
+| JavaCard SDK | 3.0.5+ (`jc305u4_kit`) | See [Build the .cap file](#build-the-cap-file) |
+| Physical card | NXP JCOP4 SmartMX3 (JavaCard 3.0.5+) | **Not** JavaCard 3.0.4 — see [Supported targets](#supported-targets) |
 | PC/SC reader | Any ISO 7816-4 reader | `brew install pcsc-lite` |
 
 ### Install GlobalPlatformPro
@@ -33,35 +34,35 @@ chmod +x /usr/local/bin/gp
 
 ## Build the .cap file
 
+ant-javacard does **not** download JavaCard SDKs — you have to supply the kit
+yourself and point `jc.sdk` at it. One clone covers every SDK version:
+
+```bash
+# One-time: fetch the JavaCard SDK kits (~200 MB, all versions)
+git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
+```
+
 ```bash
 cd cashu-javacard/applet
 
-# Build (ant-javacard auto-downloads JavaCard SDK 3.0.4 on first run)
+# Build. jc.sdk defaults to ~/.javacard/sdks/jc305u4_kit; override if you
+# cloned elsewhere. It must be a 3.0.5 (or later) kit — see below.
 ant cap
+ant cap -Djc.sdk=/path/to/jc305u4_kit   # explicit form
 
 # Output: target/cashu-javacard-0.1.0.cap
 ls -lh target/cashu-javacard-0.1.0.cap
 ```
 
-> **First run**: ant-javacard will download the JavaCard 3.0.4 SDK
-> from GitHub (~40 MB). Subsequent builds use the cached SDK.
+> **3.0.5 is a hard floor.** `SchnorrHW` performs the `k·G` scalar multiply with
+> `KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY`, which was introduced in JavaCard 3.0.5
+> and does not exist in 3.0.4. A 3.0.4 kit cannot convert this applet, and a
+> 3.0.4 card cannot run it.
 
-### Switch to hardware Schnorr before building
-
-In `CashuApplet.java`, set the hardware flag:
-
-```java
-// Before: simulation mode (jCardSim / tests)
-static final boolean HARDWARE = false;
-
-// For .cap build: hardware mode (SchnorrHW, no BigInteger)
-static final boolean HARDWARE = true;
-```
-
-Then build:
-```bash
-ant clean cap
-```
+There is no build-time mode switch. `SchnorrHW` is the only signer; the
+BigInteger simulation that used to sit behind a `HARDWARE` flag has been removed
+(it could never be converted to a `.cap` — the JavaCard runtime has no
+`java.math`).
 
 ---
 
@@ -102,7 +103,8 @@ gp --apdu 00A4040007D2760000850102
 # GET_INFO (INS 0x01)
 gp --apdu B0010000
 
-# Response: 00 01 20 00 00 00 06   (v0.1, 32 slots, 0 unspent, 0 spent, cap=0x06)
+# Response: 00 01 20 00 00 20 07 00
+#   v0.1 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
 # SW: 9000
 
 # GET_PUBKEY (INS 0x10)
@@ -143,13 +145,34 @@ For production cards, use a secure messaging channel (SCP02/SCP03) with the card
 |------|----------|
 | SHA-256 | `MessageDigest.ALG_SHA_256` |
 | k·G scalar multiply | `KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY` |
+| BIP-340 aux randomness | `RandomData.ALG_SECURE_RANDOM` |
 | 256-bit mulModN | Schoolbook 256×256 + 2-level DELTA reduction |
 | 256-bit addModN | Carry-propagation + conditional subtract |
 
 DELTA = 2^256 mod n = `0x00...01 45512319 50B75FC4 402DA173 2FC9BEBF`
 
-The signing operation allocates ~192 bytes of heap during execution.
-Pre-allocate proof: the applet's `scratch` buffer covers transient needs.
+The signing operation allocates **nothing** at runtime. JavaCard Classic puts
+`new` in persistent EEPROM/Flash and never collects it, so an allocation on the
+signing path would leak a few hundred bytes per tap until the card ran out of
+persistent memory and every `SPEND_PROOF` / `SIGN_ARBITRARY` threw. All scratch
+is allocated once at install time as `CLEAR_ON_DESELECT` transient arrays:
+`sc` (256 B) plus `work` (288 B), threaded through the arithmetic helpers as
+explicit `(work, workOff)` parameters.
+
+### Install-time ECDH framing probe
+
+`ALG_EC_SVDP_DH_PLAIN_XY` output framing is not uniform across implementations:
+the applet reads a 65-byte `04 ‖ X ‖ Y`, and some parts return the bare 64-byte
+`X ‖ Y` instead. `SchnorrHW.init()` therefore performs one throwaway `2·G` at
+install time and refuses to install if the framing is not what `sign()` indexes
+into.
+
+If `gp --install` fails with `6F00`, that probe is the first thing to suspect —
+and it failing there is the desired outcome. The alternative is discovering it
+at spend time, where `SPEND_PROOF` marks the slot SPENT *before* signing: an
+incompatible card would consume one proof per tap, return `6F00` each time, and
+leave the proofs unredeemable because they are P2PK-locked to a key whose card
+can no longer sign.
 
 ---
 
@@ -157,9 +180,10 @@ Pre-allocate proof: the applet's `scratch` buffer covers transient needs.
 
 | Card | JC API | Notes |
 |------|--------|-------|
-| Feitian JavaCard 3.0.4 | 3.0.4 | ✅ Primary target; secp256k1 custom curve supported |
-| NXP JCOP4 SmartMX3 P71 | 3.0.4 | ✅ v2 target; same API set |
-| Generic JC 3.0.1+ | 3.0.1 | ⚠️  May work; verify `ALG_EC_SVDP_DH_PLAIN_XY` support |
+| NXP JCOP4 SmartMX3 P71 | 3.0.5 | ✅ Primary target; secp256k1 custom curve supported |
+| Feitian JavaCard 3.0.4 | 3.0.4 | ❌ No `ALG_EC_SVDP_DH_PLAIN_XY` (3.0.5+ only) — the CAP will not convert or load |
+| Generic JC 3.0.5+ | 3.0.5 | ⚠️  May work; verify custom EC-FP curve + `ALG_EC_SVDP_DH_PLAIN_XY` support |
+| JavaCard ≤ 3.0.4 | ≤ 3.0.4 | ❌ No ECDH plain-XY |
 | JavaCard 2.2.x | 2.2 | ❌ No `int` type; no ECDH plain-XY |
 
 ---

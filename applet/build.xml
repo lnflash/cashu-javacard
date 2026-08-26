@@ -6,16 +6,22 @@
   Prerequisites:
     1. Apache Ant  ≥ 1.10  (brew install ant)
     2. ant-javacard plugin  (auto-downloaded by this script)
-    3. Java 11+  (required for ant-javacard itself; the cap targets JC 3.0.4)
+    3. Java 11+  (required for ant-javacard itself; the cap targets JC 3.0.5)
+    4. A JavaCard 3.0.5 SDK. It is NOT auto-downloaded — clone the kits and
+       point jc.sdk at one:
+         git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
+         ant cap -Djc.sdk=$HOME/.javacard/sdks/jc305u4_kit
 
   Build:
     ant cap            → applet/target/cashu-javacard-0.1.0.cap
     ant cap-debug      → same but with debug info
-    ant verify         → run cap-lint checks (requires gp.jar on PATH)
 
   Deploy (after build):
-    gp --install target/cashu-javacard-0.1.0.cap
-    gp --list
+    gp -install target/cashu-javacard-0.1.0.cap
+    gp -list
+
+  (GlobalPlatformPro accepts single-dash long options; the double-dash form
+   cannot appear here because "- -" is illegal inside an XML comment.)
 
   Reference:
     https://github.com/martinpaljak/ant-javacard
@@ -23,27 +29,124 @@
 -->
 <project name="CashuJavaCard" default="cap" basedir=".">
 
-    <property name="ant.javacard.version" value="21.11.25"/>
+    <!-- Release tags carry a "v" prefix; the download URL below relies on it. -->
+    <property name="ant.javacard.version" value="v26.05.15"/>
+    <!--
+      JavaCard SDK used by the converter. Override with -Djc.sdk=/path/to/kit.
+      Get the kits with:
+        git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
+    -->
+    <!--
+      jc.sdk = the JavaCard SDK used as BOTH the converter toolchain (jckit) and
+               the targeted CAP format / API (targetsdk). One knob, not two:
+               they must agree, and having a second property that silently kept
+               its stale default when only jc.sdk was overridden was a trap.
+
+               MUST be >= 3.0.5. SchnorrHW needs
+               KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, introduced in JavaCard
+               3.0.5; it does NOT exist in 3.0.4. That rules out JCOP3 / J3H145
+               / Feitian 3.0.4 cards — use JCOP4 (JC 3.0.5).
+    -->
+    <property name="jc.sdk"
+              value="${user.home}/.javacard/sdks/jc305u4_kit"/>
     <property name="src.dir"    value="src/main/java"/>
     <property name="target.dir" value="target"/>
     <property name="cap.file"   value="${target.dir}/cashu-javacard-0.1.0.cap"/>
 
     <!-- ── Download ant-javacard plugin ───────────────────────────────── -->
+    <!--
+      Project-local on purpose, NOT ${user.home}/.ant/lib. Ant's launcher puts
+      every jar in ~/.ant/lib on the classpath of every Ant build on the
+      machine, so a tampered download cached there would outlive this build and
+      reach projects that never asked for it. `setup` passes an explicit
+      classpath to <taskdef> below, so the jar has no reason to be in the
+      global directory in the first place. ${target.dir} is gitignored and
+      `ant clean` removes it.
+    -->
     <property name="ant.javacard.jar"
-              value="${user.home}/.ant/lib/ant-javacard-${ant.javacard.version}.jar"/>
-    <available file="${ant.javacard.jar}" property="ant.javacard.present"/>
+              value="${target.dir}/ant-javacard-${ant.javacard.version}.jar"/>
+    <!--
+      SHA-256 of the ant-javacard.jar release asset for ${ant.javacard.version}.
 
-    <target name="download-plugin" unless="ant.javacard.present"
+      A GitHub release asset is mutable: the tag can be re-pointed at different
+      bytes by the upstream maintainer, or by anyone who takes that account, and
+      nothing in the download tells us. This jar drives the converter that
+      produces the CAP that CI uploads as an artifact and that ends up on cards
+      holding bearer money, so it is pinned by content, exactly like the SDK
+      commit pinned in .github/workflows/ci.yml.
+
+      To bump: change ant.javacard.version, then
+
+        curl -sSL -o /tmp/ant-javacard.jar \
+          https://github.com/martinpaljak/ant-javacard/releases/download/<tag>/ant-javacard.jar
+        shasum -a 256 /tmp/ant-javacard.jar
+
+      and paste the digest here in the same commit as the version bump.
+    -->
+    <property name="ant.javacard.sha256"
+              value="14f5e25c07b184e4ec02ee148892c2ea7ad5d7e9db8b91109524df8f7d000589"/>
+    <!--
+      Inside a target, not at the top level: a top-level <available> is
+      evaluated while the buildfile is parsed, which is before `clean` has run.
+      With the jar under ${target.dir} that made `ant clean cap` — an entirely
+      ordinary thing to type — decide the jar was present, skip the download,
+      and then fail the checksum on a file `clean` had just deleted.
+    -->
+    <target name="-check-plugin">
+        <available file="${ant.javacard.jar}" property="ant.javacard.present"/>
+    </target>
+
+    <target name="download-plugin" depends="-check-plugin" unless="ant.javacard.present"
             description="Download ant-javacard plugin if missing">
-        <mkdir dir="${user.home}/.ant/lib"/>
+        <mkdir dir="${target.dir}"/>
         <get src="https://github.com/martinpaljak/ant-javacard/releases/download/${ant.javacard.version}/ant-javacard.jar"
              dest="${ant.javacard.jar}"
              verbose="true"
              usetimestamp="true"/>
     </target>
 
+    <!-- ── Verify the plugin jar before it reaches the classpath ──────── -->
+    <!--
+      Runs on every build, not only after a download: the cached copy is just as
+      able to be swapped after the fact as the download itself is in flight.
+
+      Split across two targets so the mismatch path can DELETE the offending
+      jar before failing. Leaving it on disk would mean the next `ant cap`
+      either re-fails on the same bad bytes forever or, worse, that a human
+      "fixes" the build by bumping the digest to whatever it found. Deleting it
+      makes the next run re-download, which is the only recovery that can
+      succeed honestly.
+    -->
+    <target name="-checksum-plugin" depends="download-plugin">
+        <checksum file="${ant.javacard.jar}"
+                  algorithm="SHA-256"
+                  property="${ant.javacard.sha256}"
+                  verifyProperty="ant.javacard.verified"/>
+        <condition property="ant.javacard.mismatch">
+            <not><istrue value="${ant.javacard.verified}"/></not>
+        </condition>
+    </target>
+
+    <target name="-plugin-mismatch" depends="-checksum-plugin" if="ant.javacard.mismatch">
+        <delete file="${ant.javacard.jar}" verbose="true"/>
+        <fail>
+ant-javacard.jar does not match its pinned SHA-256, and has been deleted.
+
+  file     : ${ant.javacard.jar}
+  expected : ${ant.javacard.sha256}
+
+Refusing to hand unverified bytes to the CAP converter. If you deliberately
+bumped ant.javacard.version, re-run the build to re-download and record the new
+digest in ant.javacard.sha256 in this file. Otherwise treat this as a
+compromised or truncated download.
+        </fail>
+    </target>
+
+    <target name="verify-plugin" depends="-plugin-mismatch"
+            description="Fail unless ant-javacard.jar matches its pinned SHA-256"/>
+
     <!-- ── Register ant-javacard task ─────────────────────────────────── -->
-    <target name="setup" depends="download-plugin">
+    <target name="setup" depends="verify-plugin">
         <taskdef name="javacard"
                  classname="pro.javacard.ant.JavaCard"
                  classpath="${ant.javacard.jar}"/>
@@ -52,8 +155,9 @@
 
     <!-- ── Main cap build target ──────────────────────────────────────── -->
     <!--
-      Targets JavaCard API 3.0.4 (Feitian JavaCard 3.0.4, NXP JCOP4).
-      ant-javacard auto-downloads the matching JCDK SDK if not present.
+      Targets JavaCard API 3.0.5 (NXP JCOP4). The SDK is NOT auto-downloaded:
+      clone https://github.com/martinpaljak/oracle_javacard_sdks or pass
+      -Djc.sdk=/path/to/jc305u4_kit.
 
       AID breakdown:
         Package AID : D2 76 00 00 85 01 02      (7 bytes)
@@ -62,10 +166,11 @@
       The package AID is also the SELECT AID used by NFC readers.
     -->
     <target name="cap" depends="setup"
-            description="Build CashuApplet.cap (JavaCard 3.0.4)">
+            description="Build CashuApplet.cap (JavaCard 3.0.5)">
         <javacard>
             <cap
-                jckit="3.0.4"
+                jckit="${jc.sdk}"
+                targetsdk="${jc.sdk}"
                 sources="${src.dir}"
                 package="me.flashapp.cashu"
                 version="0.1"
@@ -80,10 +185,11 @@
 
     <!-- ── Debug cap (includes line-number table) ─────────────────────── -->
     <target name="cap-debug" depends="setup"
-            description="Build CashuApplet.cap with debug symbols">
+            description="Build CashuApplet.cap with debug symbols (JavaCard 3.0.5)">
         <javacard>
             <cap
-                jckit="3.0.4"
+                jckit="${jc.sdk}"
+                targetsdk="${jc.sdk}"
                 sources="${src.dir}"
                 package="me.flashapp.cashu"
                 version="0.1"

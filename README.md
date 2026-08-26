@@ -39,9 +39,13 @@ This is the reference implementation for **NUT-XX: Cashu NFC Card Protocol**, Pr
 
 | Chip | Status | Notes |
 |------|--------|-------|
-| Feitian JavaCard 3.0.4 | ✅ Target (v1) | ~$2/card at volume |
-| NXP JCOP4 (SmartMX3) | ✅ Target (v2) | CC EAL 5+, ~$5/card |
+| NXP JCOP4 (SmartMX3) | ✅ Target | JavaCard 3.0.5, CC EAL 5+, ~$5/card |
+| Feitian JavaCard 3.0.4 | ❌ | No `ALG_EC_SVDP_DH_PLAIN_XY` — that constant is 3.0.5+, so the applet cannot run on 3.0.4 |
 | NXP NTAG 424 DNA | ❌ | Insufficient memory, no EC crypto |
+
+JavaCard **3.0.5 or later** is a hard requirement: the Schnorr signer performs
+its `k·G` scalar multiply with `KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY`, which
+does not exist in 3.0.4.
 
 ## APDU Command Set
 
@@ -65,26 +69,31 @@ See [`spec/APDU.md`](spec/APDU.md) for full command reference.
 ## Project Structure
 
 ```
-applet/         JavaCard applet source (Java Card 3.0.4+)
-spec/           Protocol specs (APDU.md, NUT-XX.md)
-test/           jCardSim-based test suite
-docs/           Architecture and provisioning guides
-scripts/        Provisioning helpers for flash-pos
+applet/src/main/java/   JavaCard applet source (Java Card 3.0.5+)
+applet/src/test/java/   jCardSim-based test suite
+spec/                   Protocol specs (APDU.md, NUT-XX.md)
+docs/                   Architecture and provisioning guides
 ```
 
 ## Building
 
-Requires [JavaCard SDK 3.0.4+](https://www.oracle.com/java/technologies/javacard-downloads.html) and JDK 11+.
+Requires JDK 11+ and a JavaCard SDK **3.0.5 or later**. The SDK is not
+downloaded for you:
 
 ```bash
-./gradlew buildCap
-# Output: applet/cap/CashuApplet.cap
+git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
+
+ant -f applet/build.xml cap
+# Output: applet/target/cashu-javacard-0.1.0.cap
 ```
+
+See [`docs/HARDWARE_DEPLOYMENT.md`](docs/HARDWARE_DEPLOYMENT.md) for installing
+the CAP onto a card.
 
 ## Testing
 
 ```bash
-./gradlew test
+mvn -f applet/pom.xml test
 # Runs full jCardSim test suite (no hardware required)
 ```
 
