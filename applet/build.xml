@@ -85,9 +85,18 @@
     -->
     <property name="ant.javacard.sha256"
               value="14f5e25c07b184e4ec02ee148892c2ea7ad5d7e9db8b91109524df8f7d000589"/>
-    <available file="${ant.javacard.jar}" property="ant.javacard.present"/>
+    <!--
+      Inside a target, not at the top level: a top-level <available> is
+      evaluated while the buildfile is parsed, which is before `clean` has run.
+      With the jar under ${target.dir} that made `ant clean cap` — an entirely
+      ordinary thing to type — decide the jar was present, skip the download,
+      and then fail the checksum on a file `clean` had just deleted.
+    -->
+    <target name="-check-plugin">
+        <available file="${ant.javacard.jar}" property="ant.javacard.present"/>
+    </target>
 
-    <target name="download-plugin" unless="ant.javacard.present"
+    <target name="download-plugin" depends="-check-plugin" unless="ant.javacard.present"
             description="Download ant-javacard plugin if missing">
         <mkdir dir="${target.dir}"/>
         <get src="https://github.com/martinpaljak/ant-javacard/releases/download/${ant.javacard.version}/ant-javacard.jar"
