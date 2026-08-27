@@ -24,6 +24,7 @@ Requires: pip install -r requirements.txt   (pyscard)
 
 import argparse
 import binascii
+import json
 import hashlib
 import os
 import secrets
@@ -411,6 +412,161 @@ def cmd_load(args) -> int:
     return 0
 
 
+# ── card file (interchange with cashu-client) ─────────────────────────────────
+#
+# The mint protocol lives in TypeScript (lnflash/cashu-client) and this driver
+# is Python, so proofs cross the boundary as a file. The schema is defined once,
+# in cashu-client's `src/cardFile.ts`; this is the other half of it.
+#
+# The field names are the card's own vocabulary — `nonce`, not `secret`, and a
+# 16-hex-char `keysetId`. A file that says `secret` was written against a wrong
+# model: a NUT-10 P2PK secret is ~150 bytes of JSON and cannot live in a slot.
+
+CARD_FILE_VERSION = 1
+
+
+def _slot_from_json(entry, index: int) -> dict:
+    """Validate one slot from a card file. Mirrors parseCardSlot in cashu-client."""
+    where = f"slot {index}: "
+    if not isinstance(entry, dict):
+        raise SystemExit(f"{where}expected an object, got {type(entry).__name__}")
+
+    if "nonce" not in entry and "secret" in entry:
+        raise SystemExit(
+            f'{where}has "secret" but no "nonce" — the card stores the 32-byte '
+            f"P2PK nonce, not the secret string (~150 bytes of JSON). See NUT-XX."
+        )
+
+    amount = entry.get("amount")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        raise SystemExit(f"{where}amount must be a positive integer, got {amount!r}")
+
+    keyset = entry.get("keysetId")
+    if not isinstance(keyset, str):
+        raise SystemExit(f"{where}keysetId must be a hex string")
+    c_hex = entry.get("C")
+    if not isinstance(c_hex, str):
+        raise SystemExit(f"{where}C must be a hex string")
+    nonce_hex = entry.get("nonce")
+    if not isinstance(nonce_hex, str):
+        raise SystemExit(f"{where}nonce must be a hex string")
+
+    try:
+        return {
+            "keyset": parse_keyset_id(keyset),
+            "amount": amount,
+            "nonce": parse_hex(nonce_hex, 32, f"{where}nonce"),
+            "c": parse_hex(c_hex, 33, f"{where}C"),
+        }
+    except SystemExit as exc:
+        raise SystemExit(f"{where}{exc}" if not str(exc).startswith(where) else str(exc))
+
+
+def read_card_file(path: str) -> dict:
+    """Parse and validate a card file. Refuses anything malformed."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        raise SystemExit(f"no such card file: {path}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{path} is not valid JSON: {exc}")
+
+    if not isinstance(doc, dict):
+        raise SystemExit("card file must be a JSON object")
+    if doc.get("version") != CARD_FILE_VERSION:
+        raise SystemExit(
+            f"unsupported card file version {doc.get('version')!r}, "
+            f"expected {CARD_FILE_VERSION}"
+        )
+    for field in ("mint", "unit"):
+        if not isinstance(doc.get(field), str) or not doc[field]:
+            raise SystemExit(f"card file {field} must be a non-empty string")
+    pub = doc.get("cardPubkey")
+    if not isinstance(pub, str):
+        raise SystemExit("card file cardPubkey must be a hex string")
+    card_pubkey = parse_hex(pub, 33, "cardPubkey")
+    if card_pubkey[0] not in (0x02, 0x03):
+        raise SystemExit(
+            f"card file cardPubkey must be a compressed secp256k1 point "
+            f"(02/03 prefix), got 0x{card_pubkey[0]:02x}"
+        )
+    slots = doc.get("slots")
+    if not isinstance(slots, list):
+        raise SystemExit("card file slots must be an array")
+
+    return {
+        "mint": doc["mint"],
+        "unit": doc["unit"],
+        "card_pubkey": card_pubkey,
+        "slots": [_slot_from_json(e, i) for i, e in enumerate(slots)],
+    }
+
+
+def cmd_load_file(args) -> int:
+    """Load every proof in a card file, in order."""
+    doc = read_card_file(args.path)
+
+    card = connect(args)
+    on_card = card.get_pubkey()
+    if on_card != doc["card_pubkey"]:
+        # Proofs are P2PK-locked to one card. Loading them onto a different card
+        # writes money nothing can ever spend.
+        raise SystemExit(
+            f"card file is for {_hex(doc['card_pubkey'])}\n"
+            f"but this card is  {_hex(on_card)}\n"
+            "These proofs are locked to a different card and could never be spent."
+        )
+    if args.pin:
+        card.verify_pin(args.pin.encode())
+
+    total = 0
+    for i, slot in enumerate(doc["slots"]):
+        index = card.load_proof(slot["keyset"], slot["amount"], slot["nonce"], slot["c"])
+        total += slot["amount"]
+        print(f"slot {index}: {slot['amount']} {doc['unit']}")
+    print(f"loaded {len(doc['slots'])} proof(s), {total} {doc['unit']} total")
+    return 0
+
+
+def cmd_dump(args) -> int:
+    """Write every non-empty slot to a card file for the mint side to redeem."""
+    card = connect(args)
+    pubkey = card.get_pubkey()
+    statuses = card.get_slot_status()
+
+    slots = []
+    for index, status in enumerate(statuses):
+        if status == 0x00:
+            continue
+        if args.unspent_only and status != 0x01:
+            continue
+        p = card.get_proof(index)
+        slots.append({
+            "keysetId": p["keyset_id"],
+            "amount": p["amount"],
+            "nonce": _hex(p["nonce"]),
+            "C": _hex(p["c"]),
+        })
+
+    doc = {
+        "version": CARD_FILE_VERSION,
+        "mint": args.mint,
+        "unit": args.unit,
+        "cardPubkey": _hex(pubkey),
+        "slots": slots,
+        "note": f"dumped by cardctl from {len(slots)} slot(s)",
+    }
+    text = json.dumps(doc, indent=2)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        print(f"wrote {len(slots)} slot(s) to {args.out}")
+    else:
+        print(text)
+    return 0
+
+
 def cmd_clear_spent(args) -> int:
     card = connect(args)
     if args.pin:
@@ -571,6 +727,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--c", help="33-byte C point as hex (placeholder if omitted)")
     s.add_argument("--pin", help="verify this PIN first")
     s.set_defaults(func=cmd_load)
+
+    s = sub.add_parser("load-file", help="LOAD_PROOF every proof in a card file")
+    s.add_argument("path", help="card file written by cashu-client")
+    s.add_argument("--pin", help="verify this PIN first")
+    s.set_defaults(func=cmd_load_file)
+
+    s = sub.add_parser("dump", help="write the card's slots out as a card file")
+    s.add_argument("--mint", required=True, help="mint URL these proofs belong to")
+    s.add_argument("--unit", default="sat", help="keyset unit (default: sat)")
+    s.add_argument("--out", help="write here instead of stdout")
+    s.add_argument("--unspent-only", action="store_true",
+                   help="skip spent slots (they are still readable, and still owed)")
+    s.set_defaults(func=cmd_dump)
 
     s = sub.add_parser("clear-spent", help="free all spent slots")
     s.add_argument("--pin")

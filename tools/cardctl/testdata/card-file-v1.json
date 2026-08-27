@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "mint": "https://forge.flashapp.me",
+  "unit": "sat",
+  "cardPubkey": "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da",
+  "slots": [
+    {
+      "keysetId": "0059534ce0bfa19a",
+      "amount": 8,
+      "nonce": "abababababababababababababababababababababababababababababababab",
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    },
+    {
+      "keysetId": "0059534ce0bfa19a",
+      "amount": 16,
+      "nonce": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    }
+  ]
+}
