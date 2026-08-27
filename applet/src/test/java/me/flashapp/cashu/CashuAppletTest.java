@@ -66,9 +66,10 @@ class CashuAppletTest {
     static final byte[] WRONG_PIN    = { 0x00, 0x00, 0x00, 0x00 };
     static final byte[] NEW_PIN      = { 0x35, 0x36, 0x37, 0x38 };  // "5678"
 
-    // Sample proof data (77 bytes = keyset_id[8] + amount[4] + secret[32] + C[33])
-    static final byte[] PROOF_1 = buildProof("0059534c", 1000, 1);
-    static final byte[] PROOF_2 = buildProof("008288762774ace1".substring(0,8), 500, 2);
+    // Sample proof data (77 bytes = keyset_id[8] + amount[4] + nonce[32] + C[33]).
+    // Full 16-hex-char NUT-02 keyset ids, as a real mint issues them.
+    static final byte[] PROOF_1 = buildProof("0059534ce0bfa19a", 1000, 1);
+    static final byte[] PROOF_2 = buildProof("008288762774ace1", 500, 2);
 
     private CardSimulator simulator;
 
@@ -239,7 +240,7 @@ class CashuAppletTest {
     @DisplayName("LOAD_PROOF fills slots sequentially")
     void testLoadProofSequential() {
         for (int i = 0; i < 3; i++) {
-            byte[] proof = buildProof("0059534c", 100 * (i + 1), i + 1);
+            byte[] proof = buildProof("0059534ce0bfa19a", 100 * (i + 1), i + 1);
             ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, proof, 0, proof.length, 1));
             assertEquals(SW_OK, resp.getSW());
             assertEquals(i, resp.getData()[0] & 0xFF, "Slot index should be " + i);
@@ -535,11 +536,11 @@ class CashuAppletTest {
     @DisplayName("LOAD_PROOF NO_SPACE after all 32 slots filled")
     void testLoadProofNoSpace() {
         for (int i = 0; i < MAX_PROOFS; i++) {
-            byte[] proof = buildProof("0059534c", 1, i);
+            byte[] proof = buildProof("0059534ce0bfa19a", 1, i);
             ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, proof, 0, proof.length, 1));
             assertEquals(SW_OK, resp.getSW(), "Slot " + i + " should be loadable");
         }
-        byte[] overflow = buildProof("0059534c", 1, 99);
+        byte[] overflow = buildProof("0059534ce0bfa19a", 1, 99);
         ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, overflow, 0, overflow.length, 1));
         assertEquals(SW_NO_SPACE, resp.getSW(), "33rd proof should fail with NO_SPACE");
     }
@@ -767,11 +768,11 @@ class CashuAppletTest {
         // Forces carries out of bytes 3, 2 and 1 — testGetBalanceAfterLoad
         // (1000 + 500) only ever carries out of byte 3.
         for (int i = 0; i < 4; i++) {
-            byte[] p = buildProof("0059534c", 0x00FFFFFFL, i);
+            byte[] p = buildProof("0059534ce0bfa19a", 0x00FFFFFFL, i);
             assertEquals(SW_OK,
                 transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, p, 0, p.length, 1)).getSW());
         }
-        byte[] big = buildProof("0059534c", 0x01000000L, 9);
+        byte[] big = buildProof("0059534ce0bfa19a", 0x01000000L, 9);
         assertEquals(SW_OK,
             transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, big, 0, big.length, 1)).getSW());
 
@@ -784,8 +785,8 @@ class CashuAppletTest {
     @Test @Order(43)
     @DisplayName("GET_BALANCE wraps past 2^32 (addUint32 does not detect overflow)")
     void testGetBalanceWrapsPast2Pow32() {
-        byte[] max = buildProof("0059534c", 0xFFFFFFFFL, 1);
-        byte[] two = buildProof("0059534c", 0x00000002L, 2);
+        byte[] max = buildProof("0059534ce0bfa19a", 0xFFFFFFFFL, 1);
+        byte[] two = buildProof("0059534ce0bfa19a", 0x00000002L, 2);
         assertEquals(SW_OK,
             transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, max, 0, max.length, 1)).getSW());
         assertEquals(SW_OK,
@@ -848,20 +849,34 @@ class CashuAppletTest {
         throw new IllegalArgumentException("Unexpected pubkey length: " + pubBytes.length);
     }
 
-    /** Build a 77-byte proof payload: keyset_id[8] + amount[4] + secret[32] + C[33] */
+    /**
+     * Build a 77-byte proof payload: keyset_id[8] + amount[4] + nonce[32] + C[33].
+     *
+     * keysetIdHex is hex-decoded to 8 RAW bytes, never ASCII-encoded. A NUT-02
+     * keyset id is 16 hex chars, which is exactly 8 bytes raw; storing it as
+     * ASCII text would fit only half the id. The 32-byte field is the P2PK
+     * nonce, not the secret string — see spec/NUT-XX.md.
+     *
+     * Short ids are rejected rather than zero-padded: padding made a half id
+     * look like a working one, which is exactly the class of bug this file is
+     * meant to catch.
+     */
     static byte[] buildProof(String keysetIdHex, long amount, int seed) {
+        if (keysetIdHex.length() != 16) {
+            throw new IllegalArgumentException(
+                "keyset id must be 16 hex chars (8 raw bytes), got " + keysetIdHex.length()
+                + ": " + keysetIdHex);
+        }
         byte[] proof = new byte[77];
-        // keyset_id: 8 bytes from hex string (padded)
-        byte[] kid = hexToBytes(keysetIdHex.length() >= 16
-            ? keysetIdHex.substring(0, 16)
-            : String.format("%-16s", keysetIdHex).replace(' ', '0'));
+        // keyset_id: 8 raw bytes from the hex string
+        byte[] kid = hexToBytes(keysetIdHex);
         System.arraycopy(kid, 0, proof, 0, 8);
         // amount: big-endian uint32
         proof[8]  = (byte)((amount >> 24) & 0xFF);
         proof[9]  = (byte)((amount >> 16) & 0xFF);
         proof[10] = (byte)((amount >> 8)  & 0xFF);
         proof[11] = (byte)( amount        & 0xFF);
-        // secret: 32 bytes filled with seed value
+        // nonce: 32 bytes filled with seed value
         for (int i = 0; i < 32; i++) proof[12 + i] = (byte) seed;
         // C point: 33 bytes (02 prefix + 32 bytes of seed+1)
         proof[44] = 0x02;
