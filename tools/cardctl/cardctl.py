@@ -392,12 +392,16 @@ def parse_keyset_id(value: str) -> bytes:
 
 
 def cmd_load(args) -> int:
-    card = connect(args)
-    if args.pin:
-        card.verify_pin(args.pin.encode())
+    # Parse every argument before touching the reader. VERIFY_PIN decrements the
+    # card's retry counter, so running it ahead of validation means a typo'd
+    # --keyset costs a PIN attempt on a command that could never have succeeded.
+    # Pure argument validation must never require a card tap.
     keyset = parse_keyset_id(args.keyset)
     nonce = parse_hex(args.nonce, 32, "nonce") if args.nonce else secrets.token_bytes(32)
     c = parse_hex(args.c, 33, "C") if args.c else b"\x02" + secrets.token_bytes(32)
+    card = connect(args)
+    if args.pin:
+        card.verify_pin(args.pin.encode())
     slot = card.load_proof(keyset, args.amount, nonce, c)
     print(f"loaded into slot {slot}")
     if not args.nonce:

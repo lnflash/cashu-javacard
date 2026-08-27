@@ -168,7 +168,7 @@ This is the **core payment operation**.
 | P1 | Slot index |
 | P2 | 00 |
 | Lc | 20 |
-| Data | 32-byte message (SHA-256 of the spending transaction) |
+| Data | 32-byte message = SHA-256(UTF8(Proof.secret)) — see the note below |
 | Le | 40 |
 | Response | 64-byte Schnorr signature (R \|\| s, 32 bytes each) |
 

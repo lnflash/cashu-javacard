@@ -291,6 +291,48 @@ def test_cmd_load_rejects_a_half_length_keyset_id():
     assert card.connection.sent == [], "nothing should reach the card"
 
 
+def test_cmd_load_validates_arguments_before_opening_the_reader():
+    """A bad --keyset must cost nothing — not even a PIN attempt.
+
+    VERIFY_PIN decrements the card's retry counter and locks the card after a
+    few misses. If cmd_load connects and verifies before parsing, then
+    `load --keyset 0059534c --pin 4321` burns a retry on a command that could
+    never have succeeded. The previous test only proves this by accident: it
+    passes no --pin, so the VERIFY_PIN branch is never reached regardless of
+    ordering. This one passes one, and also asserts the reader was never opened
+    — the transmit log alone cannot distinguish "did not connect" from
+    "connected and sent nothing".
+    """
+    bad = [
+        # a half-length keyset id, and a nonce that is 31 bytes instead of 32
+        ["--keyset", "0059534c", "--amount", "21", "--pin", "4321"],
+        ["--keyset", "0059534ce0bfa19a", "--amount", "21", "--pin", "4321",
+         "--nonce", "00" * 31],
+        # ...and a C that is 32 bytes instead of the compressed-point 33
+        ["--keyset", "0059534ce0bfa19a", "--amount", "21", "--pin", "4321",
+         "--c", "00" * 32],
+    ]
+    for flags in bad:
+        card = make_card([(b"\x03", 0x9000)])
+        args = cardctl.build_parser().parse_args(["load", *flags])
+        connects = []
+        real = cardctl.connect
+        cardctl.connect = lambda a: (connects.append(a), card)[1]
+        try:
+            try:
+                args.func(args)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError(f"cmd_load accepted bad arguments: {flags}")
+        finally:
+            cardctl.connect = real
+        assert connects == [], f"cmd_load opened the reader before validating: {flags}"
+        assert card.connection.sent == [], \
+            f"cmd_load transmitted before validating {flags}: " \
+            f"{[a.hex() for a in card.connection.sent]}"
+
+
 def test_cmd_load_reads_the_nonce_flag_it_declares():
     """cmd_load reads args.nonce; build_parser must declare --nonce. Renaming
     either half alone is an AttributeError at the card reader, not in CI."""
