@@ -181,7 +181,17 @@ This is the **core payment operation**.
 | 6A83 | Slot index out of range |
 | 6F00 | Signing failed (hardware error) |
 
-**Note on message construction:** The reader computes `msg = SHA-256(keyset_id || secret || amount || recipient_pubkey)`. This binds the signature to the specific proof and intended recipient, preventing replay.
+**Note on message construction:** The reader computes
+
+```
+msg = SHA-256(UTF8(Proof.secret))
+```
+
+where `Proof.secret` is the reconstructed NUT-10 P2PK secret string — see
+[NUT-XX.md — SPEND_PROOF Message Construction](NUT-XX.md#spend_proof--message-construction)
+for the canonical definition and the reconstruction rules. That secret embeds
+the proof's 32-byte nonce, which is what makes the message unique per proof and
+so makes a captured signature useless against any other proof.
 
 ---
 

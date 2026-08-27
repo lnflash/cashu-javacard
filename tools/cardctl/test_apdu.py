@@ -11,7 +11,10 @@ No reader and no card required — the PC/SC connection is faked.
 Run:  python3 -m pytest test_apdu.py -q     (or: python3 test_apdu.py)
 """
 
+import contextlib
+import io
 import sys
+import traceback
 import types
 
 import cardctl
@@ -137,6 +140,17 @@ def test_parse_keyset_id_accepts_a_full_id():
     assert cardctl.parse_keyset_id("0059534CE0BFA19A") == bytes.fromhex("0059534ce0bfa19a")
 
 
+def test_parse_keyset_id_does_not_claim_truncation_for_non_hex():
+    """An 8-char value that is not hex was never half an id. Saying so sends the
+    operator hunting for a truncation that never happened."""
+    try:
+        cardctl.parse_keyset_id("hellooo1")
+    except SystemExit as exc:
+        assert "not valid hex" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected SystemExit for a non-hex keyset id")
+
+
 def test_get_info_decodes_capabilities_and_pin_state():
     # v0.1, 32 slots, 3 unspent, 1 spent, 28 empty, caps=0x03, pin=set
     card = make_card([(bytes([0, 1, 32, 3, 1, 28, 0x03, 1]), 0x9000)])
@@ -223,6 +237,85 @@ def test_lock_card_sends_the_confirmation_byte_in_p2():
     assert card.connection.last == bytes.fromhex("B05000DE")
 
 
+# ── CLI wiring ───────────────────────────────────────────────────────────────
+# The bug this file exists to prevent lived in cmd_load, not in the helpers it
+# calls. Testing parse_keyset_id and Card.load_proof in isolation leaves the one
+# line that carried the defect uncovered: a rename of --nonce, or a restored
+# `args.keyset.encode()`, keeps every other test green while every loaded proof
+# goes back to being unspendable. These drive the real parser into the real
+# command, with only the PC/SC connection faked.
+
+@contextlib.contextmanager
+def stubbed_connect(card):
+    """Point cardctl.connect at a FakeConnection-backed Card.
+
+    Swallows the command's own stdout so the standalone runner's PASS/FAIL
+    lines stay readable.
+    """
+    real = cardctl.connect
+    cardctl.connect = lambda args: card
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            yield
+    finally:
+        cardctl.connect = real
+
+
+def test_cmd_load_puts_the_raw_16_char_keyset_id_on_the_wire():
+    card = make_card([(b"\x03", 0x9000)])
+    args = cardctl.build_parser().parse_args(
+        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "21"]
+    )
+    with stubbed_connect(card):
+        assert args.func(args) == 0
+    sent = card.connection.last
+    assert sent[:4] == bytes.fromhex("B0300000")
+    assert sent[5:13] == bytes.fromhex("0059534ce0bfa19a"), sent[5:13].hex()
+    assert int.from_bytes(sent[13:17], "big") == 21
+
+
+def test_cmd_load_rejects_a_half_length_keyset_id():
+    card = make_card([(b"\x03", 0x9000)])
+    args = cardctl.build_parser().parse_args(
+        ["load", "--keyset", "0059534c", "--amount", "21"]
+    )
+    with stubbed_connect(card):
+        try:
+            args.func(args)
+        except SystemExit as exc:
+            assert "16" in str(exc), str(exc)
+        else:
+            raise AssertionError("cmd_load accepted a half-length keyset id")
+    assert card.connection.sent == [], "nothing should reach the card"
+
+
+def test_cmd_load_reads_the_nonce_flag_it_declares():
+    """cmd_load reads args.nonce; build_parser must declare --nonce. Renaming
+    either half alone is an AttributeError at the card reader, not in CI."""
+    nonce = "00" * 32
+    card = make_card([(b"\x00", 0x9000)])
+    args = cardctl.build_parser().parse_args(
+        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "1", "--nonce", nonce]
+    )
+    with stubbed_connect(card):
+        assert args.func(args) == 0
+    assert card.connection.last[17:49] == bytes(32)
+
+
+def test_load_parser_no_longer_accepts_keyset_hex():
+    """--keyset-hex selected the ASCII path this PR deleted. It must stay gone,
+    or a stale runbook silently re-enables half-id encoding."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            cardctl.build_parser().parse_args(
+                ["load", "--keyset", "0059534ce0bfa19a", "--amount", "1", "--keyset-hex"]
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("--keyset-hex is still accepted")
+
+
 # ── error handling ───────────────────────────────────────────────────────────
 def test_status_words_are_translated():
     assert "already spent" in cardctl.describe_sw(0x6985)
@@ -249,8 +342,15 @@ if __name__ == "__main__":
             try:
                 fn()
                 print(f"PASS  {name}")
-            except AssertionError as exc:
+            # Not just AssertionError. cardctl reports operator errors by raising
+            # SystemExit, and a parser/command mismatch surfaces as AttributeError
+            # — both were verified to escape an AssertionError-only handler, kill
+            # the run with no summary line, and silently skip every later test.
+            # A detected regression must read as a FAIL, not as a crash.
+            except (AssertionError, SystemExit, Exception) as exc:
                 failures += 1
-                print(f"FAIL  {name}: {exc}")
+                print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
+                if not isinstance(exc, (AssertionError, SystemExit)):
+                    traceback.print_exc()
     print(f"\n{'all tests passed' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)

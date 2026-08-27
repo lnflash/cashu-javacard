@@ -19,7 +19,7 @@ get around it rather than through it.
 
 | # | Threat | Protected? | Notes |
 |---|---|---|---|
-| 1 | Passive read of card memory | **Partially** | An attacker gets keyset id, amount, secret and `C` — but not the private key, so the proofs are unspendable. Balance and history leak. |
+| 1 | Passive read of card memory | **Partially** | An attacker gets keyset id, amount, nonce and `C` — the secret string is never stored on the card, but it is reconstructible from the nonce plus the card pubkey, so treat it as leaked too. What does not leak is the private key, so the proofs stay unspendable. Balance and history leak. |
 | 2 | Hostile reader spends the card | ❌ **No** | `SPEND_PROOF` needs no PIN. Anyone in NFC range can drain it. See [D12](DECISIONS.md#d12). **Unresolved.** |
 | 3 | Card lost or destroyed | ❌ **By design** | No seed, no backup, no recovery. See [D5](DECISIONS.md#d5). |
 | 4 | Cloning the chip | **Yes** | Cloning EEPROM copies the proofs but not the key; a clone cannot sign. Cards should be CC EAL 5+ to resist invasive extraction. |

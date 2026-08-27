@@ -375,9 +375,14 @@ def parse_keyset_id(value: str) -> bytes:
     Earlier versions accepted an 8-character value and ASCII-encoded it. That
     silently stored half an id — the resulting proof matches no keyset at the
     mint and the funds are stranded on the card. Reject it loudly instead.
+
+    The truncation message only fires for a value that is plausibly half an id,
+    i.e. actually hex. Anything else falls through to parse_hex's "not valid
+    hex" error rather than sending the operator hunting for a truncation that
+    never happened.
     """
     v = value.strip().lower()
-    if len(v) == 8:
+    if len(v) == 8 and all(c in "0123456789abcdef" for c in v):
         raise SystemExit(
             f"--keyset {value!r} is 8 hex chars, but a NUT-02 keyset id is 16 "
             f"(e.g. 0059534ce0bfa19a). Eight characters is half an id; a proof "
