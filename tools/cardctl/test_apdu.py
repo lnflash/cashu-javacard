@@ -204,7 +204,7 @@ def test_load_proof_round_trips_the_keyset_id_through_get_proof():
 
     body = b"\x01" + written + (8).to_bytes(4, "big") + bytes(32) + b"\x02" + bytes(32)
     read_back = make_card([(body, 0x9000)]).get_proof(0)
-    assert read_back["keyset_id"] == keyset_hex
+    assert read_back["keyset_id"] == keyset_hex, read_back["keyset_id"]
 
 
 def test_clear_spent_encoding():
@@ -271,7 +271,7 @@ def test_cmd_load_puts_the_raw_16_char_keyset_id_on_the_wire():
     sent = card.connection.last
     assert sent[:4] == bytes.fromhex("B0300000")
     assert sent[5:13] == bytes.fromhex("0059534ce0bfa19a"), sent[5:13].hex()
-    assert int.from_bytes(sent[13:17], "big") == 21
+    assert int.from_bytes(sent[13:17], "big") == 21, sent[13:17].hex()
 
 
 def test_cmd_load_rejects_a_half_length_keyset_id():
@@ -292,14 +292,33 @@ def test_cmd_load_rejects_a_half_length_keyset_id():
 def test_cmd_load_reads_the_nonce_flag_it_declares():
     """cmd_load reads args.nonce; build_parser must declare --nonce. Renaming
     either half alone is an AttributeError at the card reader, not in CI."""
-    nonce = "00" * 32
+    # A distinctive value, not zeros: bytes(32) is the one nonce that a
+    # hard-coded `nonce = bytes(32)` in cmd_load would also produce, so
+    # asserting on it would pass with the flag-reading deleted.
+    nonce = bytes(range(32))
     card = make_card([(b"\x00", 0x9000)])
     args = cardctl.build_parser().parse_args(
-        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "1", "--nonce", nonce]
+        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "1", "--nonce", nonce.hex()]
     )
     with stubbed_connect(card):
         assert args.func(args) == 0
-    assert card.connection.last[17:49] == bytes(32)
+    assert card.connection.last[17:49] == nonce, card.connection.last[17:49].hex()
+
+
+def test_cmd_load_generates_a_fresh_nonce_per_proof():
+    """A constant nonce makes every reconstructed P2PK secret identical, which is
+    what SPEND_PROOF replay resistance rests on (spec/APDU.md)."""
+    seen = []
+    for _ in range(2):
+        card = make_card([(b"\x00", 0x9000)])
+        args = cardctl.build_parser().parse_args(
+            ["load", "--keyset", "0059534ce0bfa19a", "--amount", "1"]
+        )
+        with stubbed_connect(card):
+            assert args.func(args) == 0
+        seen.append(card.connection.last[17:49])
+    assert seen[0] != seen[1], f"nonce is not fresh per proof: {seen[0].hex()}"
+    assert seen[0] != bytes(32), "nonce is all zeros"
 
 
 def test_load_parser_no_longer_accepts_keyset_hex():
