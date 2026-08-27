@@ -101,6 +101,16 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `lock [--yes]` | **irreversibly** disable writes |
 | `apdu <hex>` | send a raw APDU |
 
+Breaking changes to `load` (if you have a provisioning script written against an
+earlier revision, all three fail loudly rather than silently):
+
+- `--secret` was renamed `--nonce`. The value is unchanged — the card stores
+  32 bytes of P2PK *nonce*, and a reader rebuilds the full NUT-10 secret from
+  the nonce plus `GET_PUBKEY`.
+- `--keyset-hex` was removed. Hex is now the only interpretation of `--keyset`,
+  so the flag had no meaning left; pass the full 16-hex-char id to `--keyset`.
+- `Card.get_proof()` returns that field under the key `nonce`, not `secret`.
+
 Global flags: `-r/--reader N` to pick a reader, `-v/--verbose` to log every APDU
 to stderr — use `-v` when a command misbehaves, since the raw exchange usually
 makes it obvious whether the card rejected the command or never saw it.

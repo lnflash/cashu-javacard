@@ -249,14 +249,16 @@ def test_lock_card_sends_the_confirmation_byte_in_p2():
 def stubbed_connect(card):
     """Point cardctl.connect at a FakeConnection-backed Card.
 
-    Swallows the command's own stdout so the standalone runner's PASS/FAIL
-    lines stay readable.
+    Captures the command's own stdout — so the standalone runner's PASS/FAIL
+    lines stay readable — and yields the buffer, so a test that cares what the
+    command printed can assert on it.
     """
     real = cardctl.connect
     cardctl.connect = lambda args: card
+    buf = io.StringIO()
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            yield
+        with contextlib.redirect_stdout(buf):
+            yield buf
     finally:
         cardctl.connect = real
 
@@ -323,8 +325,14 @@ def test_cmd_load_generates_a_fresh_nonce_per_proof():
 
 def test_load_parser_no_longer_accepts_keyset_hex():
     """--keyset-hex selected the ASCII path this PR deleted. It must stay gone,
-    or a stale runbook silently re-enables half-id encoding."""
-    with contextlib.redirect_stderr(io.StringIO()):
+    or a stale runbook silently re-enables half-id encoding.
+
+    A bare `except SystemExit: pass` would not prove that: argparse exits 2 for
+    any parser failure, so renaming --keyset would keep this green while saying
+    nothing about --keyset-hex. Assert on the message argparse actually wrote.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
         try:
             cardctl.build_parser().parse_args(
                 ["load", "--keyset", "0059534ce0bfa19a", "--amount", "1", "--keyset-hex"]
@@ -333,6 +341,35 @@ def test_load_parser_no_longer_accepts_keyset_hex():
             pass
         else:
             raise AssertionError("--keyset-hex is still accepted")
+    assert "unrecognized arguments: --keyset-hex" in buf.getvalue(), buf.getvalue()
+
+
+def test_cmd_proof_prints_the_full_keyset_id_and_the_nonce():
+    """The read side of the same seam. cmd_proof indexes p['keyset_id'] and
+    p['nonce'] out of a dict Card.get_proof builds ~120 lines away; renaming
+    either half alone is a KeyError in front of a card, with no CI signal.
+
+    Distinctive values on both fields: a nonce of zeros would still match a
+    cmd_proof that printed a constant, and the keyset id is asserted at its
+    full 16 chars so an ASCII-decoding regression (8 chars) fails here too.
+    """
+    nonce = bytes(range(32, 64))
+    body = (
+        b"\x01"
+        + bytes.fromhex("0059534ce0bfa19a")
+        + (4242).to_bytes(4, "big")
+        + nonce
+        + b"\x02" + bytes(range(32))
+    )
+    assert len(body) == 78
+    card = make_card([(body, 0x9000)])
+    args = cardctl.build_parser().parse_args(["proof", "0"])
+    with stubbed_connect(card) as out:
+        assert args.func(args) == 0
+    printed = out.getvalue()
+    assert "0059534ce0bfa19a" in printed, printed
+    assert nonce.hex() in printed.lower(), printed
+    assert "4242" in printed, printed
 
 
 # ── error handling ───────────────────────────────────────────────────────────
@@ -366,7 +403,9 @@ if __name__ == "__main__":
             # — both were verified to escape an AssertionError-only handler, kill
             # the run with no summary line, and silently skip every later test.
             # A detected regression must read as a FAIL, not as a crash.
-            except (AssertionError, SystemExit, Exception) as exc:
+            # SystemExit is spelled out because it derives from BaseException, not
+            # Exception; everything else a test can raise is already covered.
+            except (SystemExit, Exception) as exc:
                 failures += 1
                 print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
                 if not isinstance(exc, (AssertionError, SystemExit)):
