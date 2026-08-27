@@ -104,11 +104,23 @@ Each proof occupies exactly 78 bytes of EEPROM:
 ```
 Offset  Size  Field
 0       1     status (0=empty, 1=unspent, 2=spent)
-1       8     keyset_id (8 ASCII bytes of the hex keyset id)
+1       8     keyset_id (the NUT-02 keyset id as 8 RAW bytes = 16 hex chars)
 9       4     amount (uint32, big-endian, in the keyset's base unit)
-13      32    secret (the NUT-10 P2PK secret string's bytes)
+13      32    nonce (the 32-byte nonce from the NUT-10 P2PK secret)
 45      33    C (compressed secp256k1 point — the mint's unblinded signature)
 ```
+
+Two fields here are easy to get wrong, and both make proofs unspendable:
+
+- **`keyset_id` is raw bytes, not ASCII.** A NUT-02 keyset id is 16 hex
+  characters. Stored raw it is exactly 8 bytes; stored as ASCII text only the
+  first 8 hex characters fit, which is half an id and matches no keyset at the
+  mint.
+- **The 32 bytes are the *nonce*, not the secret.** A NUT-10 P2PK secret is a
+  JSON string of roughly 150 bytes and cannot fit in a proof slot. The card
+  stores only the nonce; a reader rebuilds the full secret from the nonce plus
+  the card's public key. See [`spec/NUT-XX.md`](../spec/NUT-XX.md) —
+  *Reconstructing the full Proof from card storage*.
 
 32 slots × 78 bytes = **2,496 bytes** of proof storage, plus the EC keypair and
 applet code. The `amount` unit follows the keyset — sats for a `sat` keyset,

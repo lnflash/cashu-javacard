@@ -206,9 +206,13 @@ class Card:
         return {
             "slot": slot,
             "status": STATUS_NAMES.get(b[0], f"unknown({b[0]})"),
-            "keyset_id": b[1:9].decode("ascii", "replace"),
+            # Raw bytes -> hex gives the full 16-char NUT-02 id. Decoding these
+            # as ASCII would yield only 8 hex chars: half an id, matching no
+            # keyset at the mint.
+            "keyset_id": b[1:9].hex(),
             "amount": int.from_bytes(b[9:13], "big"),
-            "secret": b[13:45],
+            # The 32 bytes are the P2PK *nonce*, not the secret string.
+            "nonce": b[13:45],
             "c": b[45:78],
         }
 
@@ -225,14 +229,14 @@ class Card:
         return self.send(INS_SIGN_ARBITRARY, data=message, le=0x40, context="SIGN_ARBITRARY")
 
     # ── write commands ────────────────────────────────────────────────────────
-    def load_proof(self, keyset_id: bytes, amount: int, secret: bytes, c: bytes) -> int:
+    def load_proof(self, keyset_id: bytes, amount: int, nonce: bytes, c: bytes) -> int:
         if len(keyset_id) != 8:
-            raise SystemExit(f"keyset_id must be 8 bytes, got {len(keyset_id)}")
-        if len(secret) != 32:
-            raise SystemExit(f"secret must be 32 bytes, got {len(secret)}")
+            raise SystemExit(f"keyset_id must be 8 raw bytes, got {len(keyset_id)}")
+        if len(nonce) != 32:
+            raise SystemExit(f"nonce must be 32 bytes, got {len(nonce)}")
         if len(c) != 33:
             raise SystemExit(f"C must be 33 bytes, got {len(c)}")
-        payload = keyset_id + amount.to_bytes(4, "big") + secret + c
+        payload = keyset_id + amount.to_bytes(4, "big") + nonce + c
         return self.send(INS_LOAD_PROOF, data=payload, le=0x01, context="LOAD_PROOF")[0]
 
     def clear_spent(self) -> int:
@@ -328,7 +332,7 @@ def cmd_proof(args) -> int:
     print(f"status    : {p['status']}")
     print(f"keyset_id : {p['keyset_id']}")
     print(f"amount    : {p['amount']}")
-    print(f"secret    : {_hex(p['secret'])}")
+    print(f"nonce     : {_hex(p['nonce'])}")
     print(f"C         : {_hex(p['c'])}")
     return 0
 
@@ -364,18 +368,35 @@ def cmd_spend(args) -> int:
     return 0 if ok else 1
 
 
+def parse_keyset_id(value: str) -> bytes:
+    """
+    A NUT-02 keyset id is 16 hex characters, which is 8 bytes raw.
+
+    Earlier versions accepted an 8-character value and ASCII-encoded it. That
+    silently stored half an id — the resulting proof matches no keyset at the
+    mint and the funds are stranded on the card. Reject it loudly instead.
+    """
+    v = value.strip().lower()
+    if len(v) == 8:
+        raise SystemExit(
+            f"--keyset {value!r} is 8 hex chars, but a NUT-02 keyset id is 16 "
+            f"(e.g. 0059534ce0bfa19a). Eight characters is half an id; a proof "
+            f"loaded with it cannot be spent. Pass the full id."
+        )
+    return parse_hex(v, 8, "keyset")
+
+
 def cmd_load(args) -> int:
     card = connect(args)
     if args.pin:
         card.verify_pin(args.pin.encode())
-    keyset = args.keyset.encode() if len(args.keyset) == 8 and not args.keyset_hex \
-        else parse_hex(args.keyset, 8, "keyset")
-    secret = parse_hex(args.secret, 32, "secret") if args.secret else secrets.token_bytes(32)
+    keyset = parse_keyset_id(args.keyset)
+    nonce = parse_hex(args.nonce, 32, "nonce") if args.nonce else secrets.token_bytes(32)
     c = parse_hex(args.c, 33, "C") if args.c else b"\x02" + secrets.token_bytes(32)
-    slot = card.load_proof(keyset, args.amount, secret, c)
+    slot = card.load_proof(keyset, args.amount, nonce, c)
     print(f"loaded into slot {slot}")
-    if not args.secret:
-        print(f"secret : {_hex(secret)}")
+    if not args.nonce:
+        print(f"nonce  : {_hex(nonce)}")
     if not args.c:
         print(f"C      : {_hex(c)}  (placeholder, not a real mint signature)")
     return 0
@@ -534,10 +555,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_spend)
 
     s = sub.add_parser("load", help="LOAD_PROOF into the next free slot")
-    s.add_argument("--keyset", required=True, help="8-byte keyset id (ascii, or hex with --keyset-hex)")
-    s.add_argument("--keyset-hex", action="store_true", help="treat --keyset as hex")
+    s.add_argument("--keyset", required=True,
+                   help="NUT-02 keyset id, 16 hex chars (e.g. 0059534ce0bfa19a)")
     s.add_argument("--amount", type=int, required=True)
-    s.add_argument("--secret", help="32-byte secret as hex (random if omitted)")
+    s.add_argument("--nonce", help="32-byte P2PK nonce as hex (random if omitted)")
     s.add_argument("--c", help="33-byte C point as hex (placeholder if omitted)")
     s.add_argument("--pin", help="verify this PIN first")
     s.set_defaults(func=cmd_load)

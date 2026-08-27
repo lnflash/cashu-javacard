@@ -122,9 +122,9 @@ Returns full proof data at a given slot index. Slot must be non-empty.
 | Offset | Length | Description |
 |--------|--------|-------------|
 | 0 | 1 | Status: `01`=unspent, `02`=spent |
-| 1 | 8 | Keyset ID (hex string bytes, e.g. `30 30 35 39 35 33 34 63`) |
+| 1 | 8 | Keyset ID — the NUT-02 id as 8 **raw** bytes, e.g. `00 59 53 4c e0 bf a1 9a` for `0059534ce0bfa19a` |
 | 9 | 4 | Amount (big-endian uint32) |
-| 13 | 32 | Secret (x) |
+| 13 | 32 | Nonce — the 32-byte nonce from the NUT-10 P2PK secret, **not** the secret string |
 | 45 | 33 | C point (compressed secp256k1) |
 
 **Errors:**
@@ -226,7 +226,7 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | P1 | 00 |
 | P2 | 00 |
 | Lc | 4D (77 bytes) |
-| Data | 8-byte keyset_id + 4-byte amount + 32-byte secret + 33-byte C point |
+| Data | 8-byte keyset_id (raw) + 4-byte amount + 32-byte nonce + 33-byte C point |
 | Le | 01 |
 | Response | 1-byte slot index assigned |
 
@@ -379,11 +379,19 @@ Each proof occupies exactly **78 bytes** of persistent EEPROM:
 Offset  Len  Field
 ------  ---  -----
 0       1    Status (00=empty, 01=unspent, 02=spent)
-1       8    Keyset ID (8 ASCII hex bytes, e.g. "0059534c")
+1       8    Keyset ID (NUT-02 id as 8 RAW bytes, e.g. 00 59 53 4c e0 bf a1 9a)
 9       4    Amount (big-endian uint32)
-13      32   Secret (x)
+13      32   Nonce (32-byte nonce from the NUT-10 P2PK secret)
 45      33   C point (compressed secp256k1, 02/03 prefix)
 ```
+
+The keyset id is stored **raw**, not as ASCII text. A NUT-02 id is 16 hex
+characters, which is 8 bytes raw but 16 bytes as ASCII — storing it as text
+would fit only half the id and match no keyset at the mint.
+
+The 32-byte field is the **nonce**, not the secret. A NUT-10 P2PK secret is a
+JSON string of ~150 bytes; the card stores the nonce and a reader rebuilds the
+secret from it plus `GET_PUBKEY`. See [`NUT-XX.md`](NUT-XX.md).
 
 Total: 32 slots × 78 bytes = **2,496 bytes** EEPROM for proof storage.
 

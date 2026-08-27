@@ -89,19 +89,52 @@ def test_get_proof_puts_slot_in_p1_and_asks_for_78_bytes():
 
 def test_get_proof_parses_the_slot_layout():
     body = (
-        b"\x01"                       # status: unspent
-        + b"0059534c"[:8].ljust(8, b"0")  # keyset id (ascii bytes)
-        + (1234).to_bytes(4, "big")   # amount
-        + bytes(range(32))            # secret
-        + b"\x02" + bytes(range(32))  # C
+        b"\x01"                                   # status: unspent
+        + bytes.fromhex("0059534ce0bfa19a")       # keyset id (8 RAW bytes)
+        + (1234).to_bytes(4, "big")               # amount
+        + bytes(range(32))                        # nonce
+        + b"\x02" + bytes(range(32))              # C
     )
     assert len(body) == 78
     card = make_card([(body, 0x9000)])
     p = card.get_proof(0)
     assert p["status"] == "unspent"
     assert p["amount"] == 1234
-    assert p["secret"] == bytes(range(32))
+    assert p["nonce"] == bytes(range(32))
     assert p["c"][0] == 0x02 and len(p["c"]) == 33
+
+
+def test_get_proof_returns_the_full_16_char_keyset_id():
+    """
+    A NUT-02 keyset id is 16 hex chars. Decoding the 8 stored bytes as ASCII
+    would yield only 8 chars — half an id, matching no keyset at the mint.
+    """
+    body = (
+        b"\x01"
+        + bytes.fromhex("0059534ce0bfa19a")
+        + (1).to_bytes(4, "big")
+        + bytes(32)
+        + b"\x02" + bytes(32)
+    )
+    p = make_card([(body, 0x9000)]).get_proof(0)
+    assert p["keyset_id"] == "0059534ce0bfa19a", p["keyset_id"]
+    assert len(p["keyset_id"]) == 16
+
+
+def test_parse_keyset_id_rejects_a_half_length_id():
+    """Eight hex chars used to be ASCII-encoded, silently stranding the funds."""
+    try:
+        cardctl.parse_keyset_id("0059534c")
+    except SystemExit as exc:
+        assert "16" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected SystemExit for a truncated keyset id")
+
+
+def test_parse_keyset_id_accepts_a_full_id():
+    assert cardctl.parse_keyset_id("0059534ce0bfa19a") == bytes.fromhex("0059534ce0bfa19a")
+    # case-insensitive
+    assert cardctl.parse_keyset_id("0059534CE0BFA19A") == bytes.fromhex("0059534ce0bfa19a")
 
 
 def test_get_info_decodes_capabilities_and_pin_state():
@@ -134,15 +167,30 @@ def test_sign_arbitrary_encoding():
 # ── write commands ───────────────────────────────────────────────────────────
 def test_load_proof_builds_a_77_byte_payload():
     card = make_card([(b"\x07", 0x9000)])
-    slot = card.load_proof(b"0059534c", 5000, bytes(range(32)), b"\x02" + bytes(range(32)))
+    keyset = bytes.fromhex("0059534ce0bfa19a")
+    slot = card.load_proof(keyset, 5000, bytes(range(32)), b"\x02" + bytes(range(32)))
     assert slot == 7
     sent = card.connection.last
     assert sent[:4] == bytes.fromhex("B0300000")
     assert sent[4] == 0x4D, f"Lc should be 77, got {sent[4]}"
     payload = sent[5:5 + 77]
-    assert payload[:8] == b"0059534c"
+    assert payload[:8] == keyset
     assert int.from_bytes(payload[8:12], "big") == 5000
     assert sent[-1] == 0x01  # Le
+
+
+def test_load_proof_round_trips_the_keyset_id_through_get_proof():
+    """What load writes must be what get_proof reads back — the seam that
+    decides whether a proof can be matched to a keyset at the mint."""
+    keyset_hex = "008288762774ace1"
+    keyset = cardctl.parse_keyset_id(keyset_hex)
+    card = make_card([(b"\x00", 0x9000)])
+    card.load_proof(keyset, 8, bytes(32), b"\x02" + bytes(32))
+    written = card.connection.last[5:5 + 8]
+
+    body = b"\x01" + written + (8).to_bytes(4, "big") + bytes(32) + b"\x02" + bytes(32)
+    read_back = make_card([(body, 0x9000)]).get_proof(0)
+    assert read_back["keyset_id"] == keyset_hex
 
 
 def test_clear_spent_encoding():

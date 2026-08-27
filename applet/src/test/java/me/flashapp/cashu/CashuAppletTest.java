@@ -66,9 +66,10 @@ class CashuAppletTest {
     static final byte[] WRONG_PIN    = { 0x00, 0x00, 0x00, 0x00 };
     static final byte[] NEW_PIN      = { 0x35, 0x36, 0x37, 0x38 };  // "5678"
 
-    // Sample proof data (77 bytes = keyset_id[8] + amount[4] + secret[32] + C[33])
-    static final byte[] PROOF_1 = buildProof("0059534c", 1000, 1);
-    static final byte[] PROOF_2 = buildProof("008288762774ace1".substring(0,8), 500, 2);
+    // Sample proof data (77 bytes = keyset_id[8] + amount[4] + nonce[32] + C[33]).
+    // Full 16-hex-char NUT-02 keyset ids, as a real mint issues them.
+    static final byte[] PROOF_1 = buildProof("0059534ce0bfa19a", 1000, 1);
+    static final byte[] PROOF_2 = buildProof("008288762774ace1", 500, 2);
 
     private CardSimulator simulator;
 
@@ -848,10 +849,17 @@ class CashuAppletTest {
         throw new IllegalArgumentException("Unexpected pubkey length: " + pubBytes.length);
     }
 
-    /** Build a 77-byte proof payload: keyset_id[8] + amount[4] + secret[32] + C[33] */
+    /**
+     * Build a 77-byte proof payload: keyset_id[8] + amount[4] + nonce[32] + C[33].
+     *
+     * keysetIdHex is hex-decoded to 8 RAW bytes, never ASCII-encoded. A NUT-02
+     * keyset id is 16 hex chars, which is exactly 8 bytes raw; storing it as
+     * ASCII text would fit only half the id. The 32-byte field is the P2PK
+     * nonce, not the secret string — see spec/NUT-XX.md.
+     */
     static byte[] buildProof(String keysetIdHex, long amount, int seed) {
         byte[] proof = new byte[77];
-        // keyset_id: 8 bytes from hex string (padded)
+        // keyset_id: 8 raw bytes from the hex string (right-padded if short)
         byte[] kid = hexToBytes(keysetIdHex.length() >= 16
             ? keysetIdHex.substring(0, 16)
             : String.format("%-16s", keysetIdHex).replace(' ', '0'));
@@ -861,7 +869,7 @@ class CashuAppletTest {
         proof[9]  = (byte)((amount >> 16) & 0xFF);
         proof[10] = (byte)((amount >> 8)  & 0xFF);
         proof[11] = (byte)( amount        & 0xFF);
-        // secret: 32 bytes filled with seed value
+        // nonce: 32 bytes filled with seed value
         for (int i = 0; i < 32; i++) proof[12 + i] = (byte) seed;
         // C point: 33 bytes (02 prefix + 32 bytes of seed+1)
         proof[44] = 0x02;

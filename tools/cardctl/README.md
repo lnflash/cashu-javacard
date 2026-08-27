@@ -95,7 +95,7 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `proof <slot>` | decode one proof slot |
 | `sign [--message HEX]` | SIGN_ARBITRARY, then verify |
 | `spend <slot> [--message HEX]` | SPEND_PROOF, verify, confirm the slot flipped to spent |
-| `load --keyset ID --amount N [--secret HEX] [--c HEX] [--pin P]` | LOAD_PROOF |
+| `load --keyset ID --amount N [--nonce HEX] [--c HEX] [--pin P]` | LOAD_PROOF. `ID` is the full 16-hex-char NUT-02 keyset id. |
 | `clear-spent [--pin P]` | free spent slots |
 | `verify-pin` / `set-pin` / `change-pin` | PIN management |
 | `lock [--yes]` | **irreversibly** disable writes |
