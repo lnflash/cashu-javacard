@@ -55,7 +55,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # Both suites run with no reader, no card and no pyscard: cardctl imports
+      # All three suites run with no reader, no card and no pyscard: cardctl imports
       # pyscard lazily precisely so the APDU encodings and the BIP-340 verifier
       # can be checked anywhere. That matters because the verifier is what
       # `cardctl selftest` trusts when it declares a physical card's signature
@@ -66,6 +66,7 @@ jobs:
         run: |
           python test_bip340.py
           python test_apdu.py
+          python test_spec_consistency.py
 
       # Prove requirements.txt is actually installable. pyscard ships a native
       # _scard module and is the one dependency that can install "successfully"
