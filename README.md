@@ -129,7 +129,8 @@ exhaustion or hardware crypto framing. See [D10](docs/DECISIONS.md#d10).
 applet/src/main/java/   applet source (JavaCard 3.0.5+)
 applet/src/test/java/   jCardSim test suite
 tools/cardctl/          PC/SC host driver + its own tests
-spec/                   NUT-XX.md (protocol), APDU.md (wire format)
+spec/                   NUT-XX.md (protocol), APDU.md (wire format),
+                        CARD-FILE.md (host↔mint interchange format)
 docs/                   vision, architecture, decisions, security, glossary
 ```
 

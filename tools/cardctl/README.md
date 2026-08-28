@@ -96,6 +96,8 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `sign [--message HEX]` | SIGN_ARBITRARY, then verify |
 | `spend <slot> [--message HEX]` | SPEND_PROOF, verify, confirm the slot flipped to spent |
 | `load --keyset ID --amount N [--nonce HEX] [--c HEX] [--pin P]` | LOAD_PROOF. `ID` is the full 16-hex-char NUT-02 keyset id. |
+| `load-file PATH [--pin P]` | LOAD_PROOF every proof in a card file. Refuses if the file is for a different card, or if the card has too few free slots. Re-runnable: proofs already on the card are skipped, spent ones are never written back. |
+| `dump --mint URL [--unit U] [--out PATH] [--force] [--unspent-only]` | Write the card's slots out as a card file. `--out` refuses to overwrite without `--force`. |
 | `clear-spent [--pin P]` | free spent slots |
 | `verify-pin` / `set-pin` / `change-pin` | PIN management |
 | `lock [--yes]` | **irreversibly** disable writes |
@@ -126,14 +128,51 @@ same signing path without consuming anything.
 signature. That is fine for exercising storage and slot management, but such a
 proof can never be redeemed at a mint.
 
+## Card files
+
+`dump` and `load-file` speak the interchange format in
+[`spec/CARD-FILE.md`](../../spec/CARD-FILE.md), the intended contract with
+cashu-client's `serializeCardFile` / `parseCardFile`. `test_card_file.py` parses
+the spec and asserts this driver's parser and writer against the published field
+tables, so a rename on this side fails in CI rather than at a card reader.
+
+> **The two halves do not interoperate yet.** cashu-client (`lnflash/cashu-client#5`)
+> does not know the `spent` field and rejects any key outside its allowlist, so
+> today it refuses what `dump` writes and `load-file` refuses what it writes.
+> The spec's status note has the details; the two changes must merge together.
+
+Four things the format insists on, all because a card file is bearer money:
+
+- **`spent` is required, not defaulted.** A file that omits it is not a file of
+  unspent proofs, it is a file whose state is unknown — and guessing "unspent"
+  turns settled money back into spendable balance on the next `load-file`.
+- **Unknown fields are refused, not ignored.** At document and slot level. An
+  unrecognised key means the writer added something without bumping `version`;
+  dropping it silently is how the two sides drift apart in the first place.
+- **Amounts are positive powers of two below 2^32,** and keyset ids are NUT-02
+  v0 (`00` version byte). Both are enforced by `load` and `load-file` alike, so
+  the tool cannot put a proof on a card that the file format then refuses to
+  carry back off it.
+- **`load-file` is re-runnable.** `LOAD_PROOF` commits one proof at a time with
+  no transaction around the file, so a failure part-way through leaves half of
+  it on the card. Re-running skips whatever is already there by nonce instead of
+  writing duplicates, and everything checkable — capacity, amounts, points — is
+  checked before the first write. A nonce the card has already *spent* is
+  reported as spent, not as "already loaded".
+
+`dump` validates the document it assembled before writing it, so a mistake like
+`dump --mint "$UNSET_VAR"` fails loudly instead of leaving an unloadable backup.
+
 ## Tests
 
 ```bash
-python3 test_bip340.py    # verifier: spec vectors, reference round-trip, mutations
-python3 test_apdu.py      # every command's bytes, against spec/APDU.md
+python3 test_bip340.py            # verifier: spec vectors, reference round-trip, mutations
+python3 test_apdu.py              # every command's bytes, against spec/APDU.md
+python3 test_spec_consistency.py  # cardctl vs spec/APDU.md, parsed from the doc
+python3 test_card_file.py         # card file read/write, against spec/CARD-FILE.md
 ```
 
-Both run without a reader or a card. The BIP-340 tests matter more than they
+All four run without a reader or a card. The BIP-340 tests matter more than they
 look: `selftest`'s verdict is only as trustworthy as the verifier behind it, so
 that verifier is checked against the specification's own vectors, round-tripped
 against an independent reference signer, and mutation-tested to prove it can
