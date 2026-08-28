@@ -62,6 +62,12 @@ LOCK_CONFIRM_BYTE = 0xDE
 PROOF_SIZE = 78
 STATUS_NAMES = {0x00: "empty", 0x01: "unspent", 0x02: "spent"}
 
+# The card's amount field is a 4-byte unsigned integer (spec/APDU.md,
+# LOAD_PROOF). Anything at or above this bound makes `amount.to_bytes(4, "big")`
+# raise a bare OverflowError — and on the file path that happens mid-load, after
+# earlier proofs are already committed. Bound it before the first write.
+MAX_SLOT_AMOUNT = 2 ** 32
+
 SW_MEANINGS = {
     0x9000: "success",
     0x6700: "wrong length",
@@ -95,6 +101,50 @@ class CardError(Exception):
 
 def _hex(b: bytes) -> str:
     return binascii.hexlify(b).decode()
+
+
+def validate_slot_amount(value, where: str = "") -> int:
+    """
+    A Cashu denomination that the card's 4-byte field can hold.
+
+    Two rules, both of which cost nothing here and cost a burned slot anywhere
+    else:
+
+    * **A positive power of two.** A mint keyset has no key for amount 3, so a
+      proof carrying one is rejected on redemption — after the slot is gone.
+      This is the same rule cashu-client's `requireAmount` enforces on the other
+      side of the card file; a value it refuses is a value this tool must never
+      write, or the two halves disagree about what a valid proof is.
+    * **Below `2**32`.** The APDU field is a 4-byte unsigned integer, so
+      anything larger makes `amount.to_bytes(4, "big")` raise a bare
+      OverflowError part-way through a load, after earlier proofs have already
+      committed.
+
+    Lives here rather than in the file parser because both entry points to
+    LOAD_PROOF — `cardctl load` and `cardctl load-file` — must agree on what a
+    valid amount is. They did not, and `load --amount 5` wrote a proof that the
+    file format then refused to carry back off the card.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        # Reported before the range check so a string "8" out of an untyped
+        # reader bridge does not render as `got 8` — a message that looks like a
+        # valid value and hides the type error.
+        raise SystemExit(
+            f"{where}amount must be a positive integer, got "
+            f"{type(value).__name__} {value!r}"
+        )
+    if not 0 < value < MAX_SLOT_AMOUNT:
+        raise SystemExit(
+            f"{where}amount must be a positive integer below 2**32 "
+            f"(the card's amount field is a 4-byte uint), got {value!r}"
+        )
+    if value & (value - 1) != 0:
+        raise SystemExit(
+            f"{where}amount must be a positive power of two — a mint keyset has "
+            f"no key for other denominations, so the proof is rejected on "
+            f"redemption after the slot is already burned. Got {value!r}."
+        )
+    return value
 
 
 # ── PC/SC transport ───────────────────────────────────────────────────────────
@@ -233,6 +283,11 @@ class Card:
     def load_proof(self, keyset_id: bytes, amount: int, nonce: bytes, c: bytes) -> int:
         if len(keyset_id) != 8:
             raise SystemExit(f"keyset_id must be 8 raw bytes, got {len(keyset_id)}")
+        # Every caller goes through here, so this is the one place that cannot be
+        # bypassed. `cardctl load --amount 4294967296` used to reach
+        # `amount.to_bytes(4, "big")` and die on a bare OverflowError traceback;
+        # `--amount 0` used to burn one of 32 scarce slots on a worthless proof.
+        validate_slot_amount(amount)
         if len(nonce) != 32:
             raise SystemExit(f"nonce must be 32 bytes, got {len(nonce)}")
         if len(c) != 33:
@@ -394,7 +449,17 @@ def parse_keyset_id(value: str, what: str = "--keyset") -> bytes:
             f"(e.g. 0059534ce0bfa19a). Eight characters is half an id; a proof "
             f"loaded with it cannot be spent. Pass the full id."
         )
-    return parse_hex(v, 8, what.lstrip("-"))
+    raw = parse_hex(v, 8, what.lstrip("-"))
+    # NUT-02 v0 ids begin with a 0x00 version byte. cashu-client runs the same
+    # check (`requireKeysetV0`) on both the card path and the file path, so an id
+    # this tool accepts and writes but the other half refuses is a proof that
+    # dies at the boundary — after the slot is spent.
+    if raw[0] != 0x00:
+        raise SystemExit(
+            f"{what} {value!r} must be a NUT-02 v0 keyset id (00 version byte), "
+            f"got 0x{raw[0]:02x}"
+        )
+    return raw
 
 
 def cmd_load(args) -> int:
@@ -403,6 +468,7 @@ def cmd_load(args) -> int:
     # --keyset costs a PIN attempt on a command that could never have succeeded.
     # Pure argument validation must never require a card tap.
     keyset = parse_keyset_id(args.keyset)
+    validate_slot_amount(args.amount)
     nonce = parse_hex(args.nonce, 32, "nonce") if args.nonce else secrets.token_bytes(32)
     c = parse_hex(args.c, 33, "C") if args.c else b"\x02" + secrets.token_bytes(32)
     card = connect(args)
@@ -433,11 +499,33 @@ def cmd_load(args) -> int:
 
 CARD_FILE_VERSION = 1
 
-# The card's amount field is a 4-byte unsigned integer (spec/APDU.md,
-# LOAD_PROOF). Anything at or above this bound makes `amount.to_bytes(4, "big")`
-# raise a bare OverflowError — mid-load, after earlier proofs are already
-# committed. Bound it during validation, before the first write.
-MAX_SLOT_AMOUNT = 2 ** 32
+# The published field lists, mirroring cashu-client's SLOT_FIELDS / FILE_FIELDS.
+# Kept as the exact names in spec/CARD-FILE.md's tables — test_card_file.py
+# parses the document and asserts these against it, so a rename fails in CI.
+SLOT_FIELDS = ("keysetId", "amount", "nonce", "C", "spent")
+FILE_FIELDS = ("version", "mint", "unit", "cardPubkey", "slots", "note")
+
+
+def _reject_unknown_fields(raw: dict, known, where: str) -> None:
+    """
+    Refuse a field this version does not know about.
+
+    The format's whole claim is that a field which drifts fails at the boundary.
+    Silently ignoring an unrecognised key is that drift: a future writer adds
+    one, forgets to bump `version`, and this side discards it without a word —
+    the failure then surfaces at the mint, or as money that quietly went
+    nowhere. `version` exists precisely so an additive change announces itself.
+
+    Strict on both sides on purpose: cashu-client's `rejectUnknownFields` does
+    exactly this, and a format whose two halves disagree about forward
+    compatibility is not one format.
+    """
+    extra = [k for k in raw if k not in known]
+    if extra:
+        raise SystemExit(
+            f"{where}unknown field(s): {', '.join(sorted(extra))} — bump the "
+            f"card file version rather than adding fields silently"
+        )
 
 
 def _slot_from_json(entry, index: int) -> dict:
@@ -446,19 +534,16 @@ def _slot_from_json(entry, index: int) -> dict:
     if not isinstance(entry, dict):
         raise SystemExit(f"{where}expected an object, got {type(entry).__name__}")
 
+    # A file that spells this `secret` was written against the wrong mental
+    # model. Say so, rather than reporting it as an unknown field.
     if "nonce" not in entry and "secret" in entry:
         raise SystemExit(
             f'{where}has "secret" but no "nonce" — the card stores the 32-byte '
             f"P2PK nonce, not the secret string (~150 bytes of JSON). See NUT-XX."
         )
+    _reject_unknown_fields(entry, SLOT_FIELDS, where)
 
-    amount = entry.get("amount")
-    if (not isinstance(amount, int) or isinstance(amount, bool)
-            or not 0 < amount < MAX_SLOT_AMOUNT):
-        raise SystemExit(
-            f"{where}amount must be a positive integer below 2**32 "
-            f"(the card's amount field is a 4-byte uint), got {amount!r}"
-        )
+    amount = validate_slot_amount(entry.get("amount"), where)
 
     keyset = entry.get("keysetId")
     if not isinstance(keyset, str):
@@ -506,16 +591,17 @@ def _slot_from_json(entry, index: int) -> dict:
     }
 
 
-def read_card_file(path: str) -> dict:
-    """Parse and validate a card file. Refuses anything malformed."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    except FileNotFoundError:
-        raise SystemExit(f"no such card file: {path}")
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"{path} is not valid JSON: {exc}")
+def validate_card_doc(doc) -> dict:
+    """
+    Validate an already-decoded card file document.
 
+    Split out of `read_card_file` so the *writer* can run it too: `cardctl dump`
+    used to emit whatever it was handed — `dump --mint ""` exited 0, printed
+    "wrote 2 slot(s)", and produced a file this same module refuses. The only
+    off-card record of a card's proofs is not a thing to discover is unloadable
+    later, possibly after the card has been re-provisioned. cashu-client's
+    `serializeCardFile` round-trips through `parseCardFile` for the same reason.
+    """
     if not isinstance(doc, dict):
         raise SystemExit("card file must be a JSON object")
     if doc.get("version") != CARD_FILE_VERSION:
@@ -523,6 +609,7 @@ def read_card_file(path: str) -> dict:
             f"unsupported card file version {doc.get('version')!r}, "
             f"expected {CARD_FILE_VERSION}"
         )
+    _reject_unknown_fields(doc, FILE_FIELDS, "card file: ")
     for field in ("mint", "unit"):
         if not isinstance(doc.get(field), str) or not doc[field]:
             raise SystemExit(f"card file {field} must be a non-empty string")
@@ -547,21 +634,40 @@ def read_card_file(path: str) -> dict:
     }
 
 
+def read_card_file(path: str) -> dict:
+    """Parse and validate a card file. Refuses anything malformed."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        raise SystemExit(f"no such card file: {path}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{path} is not valid JSON: {exc}")
+
+    return validate_card_doc(doc)
+
+
 def _nonces_on_card(card) -> dict:
     """
-    {nonce: slot index} for every occupied slot.
+    {nonce: (slot index, status byte)} for every occupied slot.
 
     This is what makes `load-file` re-runnable. LOAD_PROOF commits one proof at
     a time with no transaction around the file, so any mid-file failure leaves
     part of it on the card; without this, the obvious recovery — run it again —
     writes the already-loaded proofs a second time into fresh slots, inflating
     the on-card balance with duplicates the mint rejects on redemption.
+
+    The status byte comes back with the index because "already there" and
+    "already burned" are different answers. A file slot marked unspent whose
+    nonce the card has already spent used to be reported as "already loaded,
+    skipping" — which reads as "your proof is safely on the card" when the truth
+    is the opposite, and the money is gone.
     """
     found = {}
     for index, status in enumerate(card.get_slot_status()):
         if status == 0x00:
             continue
-        found.setdefault(card.get_proof(index)["nonce"], index)
+        found.setdefault(card.get_proof(index)["nonce"], (index, status))
     return found
 
 
@@ -604,21 +710,33 @@ def cmd_load_file(args) -> int:
 
     total = 0
     loaded = 0
+    burned = 0
     for slot in doc["slots"]:
         if slot["spent"]:
             continue
         if slot["nonce"] in already:
-            print(f"slot {already[slot['nonce']]}: already loaded, skipping")
+            index, status = already[slot["nonce"]]
+            if status == 0x02:
+                # The file says unspent, the card says burned. Reporting this as
+                # "already loaded" tells the operator their money is safely on
+                # the card when it is already gone — and the summary counts
+                # would fold it in with the genuinely-present proofs.
+                burned += 1
+                print(f"slot {index}: already SPENT on this card, skipping "
+                      f"({slot['amount']} {doc['unit']} — the file is stale)")
+            else:
+                print(f"slot {index}: already loaded, skipping")
             continue
         index = card.load_proof(slot["keyset"], slot["amount"], slot["nonce"], slot["c"])
-        already[slot["nonce"]] = index
+        already[slot["nonce"]] = (index, 0x01)
         loaded += 1
         total += slot["amount"]
         print(f"slot {index}: {slot['amount']} {doc['unit']}")
 
-    skipped = len(loadable) - loaded
+    skipped = len(loadable) - loaded - burned
     print(f"loaded {loaded} proof(s), {total} {doc['unit']} total"
           + (f"; {skipped} already on the card" if skipped else "")
+          + (f"; {burned} already SPENT on the card" if burned else "")
           + (f"; {len(settled)} spent slot(s) not loaded" if settled else ""))
     return 0
 
@@ -656,6 +774,25 @@ def cmd_dump(args) -> int:
         "slots": slots,
         "note": f"dumped by cardctl from {len(slots)} slot(s)",
     }
+
+    # Never emit a document this module would refuse to read back. `dump --mint
+    # ""` used to exit 0 and report success while producing an unloadable file —
+    # and this file is the card's only off-card record, so the operator finds out
+    # long after the card has moved on. The same round-trip cashu-client's
+    # `serializeCardFile` does through `parseCardFile`.
+    try:
+        validate_card_doc(doc)
+    except SystemExit as exc:
+        # The failure can come from the arguments (fixable: pass a real --mint)
+        # or from the card itself, if it was provisioned by an older cardctl that
+        # allowed a denomination v1 cannot carry. Say which, and point at the
+        # command that still gets the bytes out slot by slot.
+        raise SystemExit(
+            f"refusing to write a card file this tool could not read back: {exc}\n"
+            f"Nothing was written. If the card holds a proof the v1 format "
+            f"cannot represent, read it out with `cardctl proof <slot>`."
+        )
+
     text = json.dumps(doc, indent=2)
     if args.out:
         # A card file is a bearer-money artifact and the only off-card record of

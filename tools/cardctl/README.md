@@ -131,22 +131,37 @@ proof can never be redeemed at a mint.
 ## Card files
 
 `dump` and `load-file` speak the interchange format in
-[`spec/CARD-FILE.md`](../../spec/CARD-FILE.md), which is also what cashu-client's
-`serializeCardFile` / `parseCardFile` produce and consume. The spec is the
-contract between the two implementations; `test_card_file.py` parses it and
-asserts this driver's parser and writer against the published field tables, so
-a rename on this side fails in CI rather than at a card reader.
+[`spec/CARD-FILE.md`](../../spec/CARD-FILE.md), the intended contract with
+cashu-client's `serializeCardFile` / `parseCardFile`. `test_card_file.py` parses
+the spec and asserts this driver's parser and writer against the published field
+tables, so a rename on this side fails in CI rather than at a card reader.
 
-Two things the format insists on, both because a card file is bearer money:
+> **The two halves do not interoperate yet.** cashu-client (`lnflash/cashu-client#5`)
+> does not know the `spent` field and rejects any key outside its allowlist, so
+> today it refuses what `dump` writes and `load-file` refuses what it writes.
+> The spec's status note has the details; the two changes must merge together.
+
+Four things the format insists on, all because a card file is bearer money:
 
 - **`spent` is required, not defaulted.** A file that omits it is not a file of
   unspent proofs, it is a file whose state is unknown — and guessing "unspent"
   turns settled money back into spendable balance on the next `load-file`.
+- **Unknown fields are refused, not ignored.** At document and slot level. An
+  unrecognised key means the writer added something without bumping `version`;
+  dropping it silently is how the two sides drift apart in the first place.
+- **Amounts are positive powers of two below 2^32,** and keyset ids are NUT-02
+  v0 (`00` version byte). Both are enforced by `load` and `load-file` alike, so
+  the tool cannot put a proof on a card that the file format then refuses to
+  carry back off it.
 - **`load-file` is re-runnable.** `LOAD_PROOF` commits one proof at a time with
   no transaction around the file, so a failure part-way through leaves half of
   it on the card. Re-running skips whatever is already there by nonce instead of
   writing duplicates, and everything checkable — capacity, amounts, points — is
-  checked before the first write.
+  checked before the first write. A nonce the card has already *spent* is
+  reported as spent, not as "already loaded".
+
+`dump` validates the document it assembled before writing it, so a mistake like
+`dump --mint "$UNSET_VAR"` fails loudly instead of leaving an unloadable backup.
 
 ## Tests
 

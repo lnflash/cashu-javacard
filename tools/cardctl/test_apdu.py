@@ -182,14 +182,14 @@ def test_sign_arbitrary_encoding():
 def test_load_proof_builds_a_77_byte_payload():
     card = make_card([(b"\x07", 0x9000)])
     keyset = bytes.fromhex("0059534ce0bfa19a")
-    slot = card.load_proof(keyset, 5000, bytes(range(32)), b"\x02" + bytes(range(32)))
+    slot = card.load_proof(keyset, 4096, bytes(range(32)), b"\x02" + bytes(range(32)))
     assert slot == 7
     sent = card.connection.last
     assert sent[:4] == bytes.fromhex("B0300000")
     assert sent[4] == 0x4D, f"Lc should be 77, got {sent[4]}"
     payload = sent[5:5 + 77]
     assert payload[:8] == keyset
-    assert int.from_bytes(payload[8:12], "big") == 5000
+    assert int.from_bytes(payload[8:12], "big") == 4096
     assert sent[-1] == 0x01  # Le
 
 
@@ -266,20 +266,20 @@ def stubbed_connect(card):
 def test_cmd_load_puts_the_raw_16_char_keyset_id_on_the_wire():
     card = make_card([(b"\x03", 0x9000)])
     args = cardctl.build_parser().parse_args(
-        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "21"]
+        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "16"]
     )
     with stubbed_connect(card):
         assert args.func(args) == 0
     sent = card.connection.last
     assert sent[:4] == bytes.fromhex("B0300000")
     assert sent[5:13] == bytes.fromhex("0059534ce0bfa19a"), sent[5:13].hex()
-    assert int.from_bytes(sent[13:17], "big") == 21, sent[13:17].hex()
+    assert int.from_bytes(sent[13:17], "big") == 16, sent[13:17].hex()
 
 
 def test_cmd_load_rejects_a_half_length_keyset_id():
     card = make_card([(b"\x03", 0x9000)])
     args = cardctl.build_parser().parse_args(
-        ["load", "--keyset", "0059534c", "--amount", "21"]
+        ["load", "--keyset", "0059534c", "--amount", "16"]
     )
     with stubbed_connect(card):
         try:
@@ -305,12 +305,19 @@ def test_cmd_load_validates_arguments_before_opening_the_reader():
     """
     bad = [
         # a half-length keyset id, and a nonce that is 31 bytes instead of 32
-        ["--keyset", "0059534c", "--amount", "21", "--pin", "4321"],
-        ["--keyset", "0059534ce0bfa19a", "--amount", "21", "--pin", "4321",
+        ["--keyset", "0059534c", "--amount", "16", "--pin", "4321"],
+        ["--keyset", "0059534ce0bfa19a", "--amount", "16", "--pin", "4321",
          "--nonce", "00" * 31],
         # ...and a C that is 32 bytes instead of the compressed-point 33
-        ["--keyset", "0059534ce0bfa19a", "--amount", "21", "--pin", "4321",
+        ["--keyset", "0059534ce0bfa19a", "--amount", "16", "--pin", "4321",
          "--c", "00" * 32],
+        # ...and the three amounts the card's 4-byte field or a mint keyset
+        # cannot represent. These used to reach the card: 2**32 died on a bare
+        # OverflowError out of load_proof, and 0 burned a slot on a worthless
+        # proof, both after VERIFY_PIN had already spent a retry.
+        ["--keyset", "0059534ce0bfa19a", "--amount", "4294967296", "--pin", "4321"],
+        ["--keyset", "0059534ce0bfa19a", "--amount", "0", "--pin", "4321"],
+        ["--keyset", "0059534ce0bfa19a", "--amount", "5", "--pin", "4321"],
     ]
     for flags in bad:
         card = make_card([(b"\x03", 0x9000)])

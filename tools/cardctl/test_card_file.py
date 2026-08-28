@@ -100,12 +100,27 @@ def _spec_fields(section: str) -> dict:
 def test_spec_publishes_every_document_field_the_parser_requires():
     """Drop a field the spec calls required; the parser must name it and refuse."""
     fields = _spec_fields("Document")
-    assert set(fields) == {"version", "mint", "unit", "cardPubkey", "slots"}, fields
+    assert set(fields) == {"version", "mint", "unit", "cardPubkey", "slots", "note"}, fields
     for name, (_, required) in fields.items():
-        assert required == "yes", f"{name} is optional in the spec but not in the parser"
+        if required == "no":
+            # An optional field must actually be optional, and must still be on
+            # the allowlist — the strict reader refuses anything not published.
+            assert cardctl.read_card_file(_write(_doc())) is not None
+            assert name in cardctl.FILE_FIELDS, f"{name} is published but not allowed"
+            continue
         d = _doc()
         del d[name]
         _expect_exit(d, name)
+
+
+def test_the_spec_allowlist_and_the_parser_allowlist_are_the_same_list():
+    """
+    The strict-reader half of the contract. A key the document does not publish
+    is a hard failure, so the published set and the enforced set must be equal —
+    otherwise `note` works only because someone hardcoded it.
+    """
+    assert set(cardctl.FILE_FIELDS) == set(_spec_fields("Document"))
+    assert set(cardctl.SLOT_FIELDS) == set(_spec_fields("Slot"))
 
 
 def test_spec_publishes_every_slot_field_the_parser_requires():
@@ -125,8 +140,11 @@ def test_dump_emits_exactly_the_slot_fields_the_spec_publishes():
 
 def test_fixture_matches_the_published_schema():
     """The fixture is a real cashu-client artifact; it must satisfy the spec too."""
+    fields = _spec_fields("Document")
+    required = {n for n, (_, req) in fields.items() if req == "yes"}
     raw = json.loads(FIXTURE.read_text())
-    assert set(raw) >= set(_spec_fields("Document"))
+    assert set(raw) >= required
+    assert set(raw) <= set(fields), "fixture carries a field the spec does not publish"
     assert set(raw["slots"][0]) == set(_spec_fields("Slot"))
 
 
@@ -259,10 +277,74 @@ def test_rejects_an_amount_the_cards_four_byte_field_cannot_hold():
         d = _doc()
         d["slots"][0]["amount"] = bad
         _expect_exit(d, "amount must be a positive integer")
-    # The largest value the field does hold is still accepted.
+    # The largest denomination the field does hold is still accepted. 2**32 - 1
+    # is not one: it fits the four bytes but is not a power of two, and a mint
+    # has no key for it.
     d = _doc()
-    d["slots"][0]["amount"] = 2 ** 32 - 1
-    assert cardctl.read_card_file(_write(d))["slots"][0]["amount"] == 2 ** 32 - 1
+    d["slots"][0]["amount"] = 2 ** 31
+    assert cardctl.read_card_file(_write(d))["slots"][0]["amount"] == 2 ** 31
+
+
+def test_rejects_an_amount_that_is_not_a_power_of_two():
+    """
+    A mint keyset has no key for amount 3, so such a proof is rejected on
+    redemption — after the slot is burned. cashu-client's `requireAmount`
+    refuses these, so a file this side accepted would die at the boundary.
+    """
+    for bad in (3, 5, 7, 100, 2 ** 32 - 1):
+        d = _doc()
+        d["slots"][0]["amount"] = bad
+        _expect_exit(d, "amount must be a positive power of two")
+    for good in (1, 2, 4, 8, 2 ** 20, 2 ** 31):
+        d = _doc()
+        d["slots"][0]["amount"] = good
+        assert cardctl.read_card_file(_write(d))["slots"][0]["amount"] == good
+
+
+def test_rejects_a_keyset_id_that_is_not_nut02_v0():
+    """
+    cashu-client runs `requireKeysetV0` on both the card path and the file path.
+    An id this side writes but that side refuses is a proof that dies at the
+    boundary, so refuse it here where it costs nothing.
+    """
+    for bad in ("0159534ce0bfa19a", "ff59534ce0bfa19a"):
+        d = _doc()
+        d["slots"][0]["keysetId"] = bad
+        _expect_exit(d, "NUT-02 v0 keyset id")
+
+    # The flag path takes the same rule — both entry points to LOAD_PROOF must
+    # agree about what a valid id is.
+    try:
+        cardctl.parse_keyset_id("0159534ce0bfa19a")
+    except SystemExit as exc:
+        assert "NUT-02 v0 keyset id" in str(exc), str(exc)
+    else:
+        raise AssertionError("parse_keyset_id accepted a non-v0 keyset id")
+
+
+# ── strict readers: unknown fields are refused, never ignored ────────────────
+
+def test_rejects_an_unknown_top_level_field():
+    """
+    Ignoring it is the drift the format exists to prevent: a writer adds a field,
+    forgets to bump `version`, and this side discards it without a word.
+    """
+    _expect_exit(_doc(spendable=True), "unknown field(s): spendable")
+    _expect_exit(_doc(spendable=True), "bump the card file version")
+
+
+def test_rejects_an_unknown_slot_field():
+    d = _doc()
+    d["slots"][0]["memo"] = "hi"
+    _expect_exit(d, "slot 0: unknown field(s): memo")
+
+
+def test_allows_the_one_optional_top_level_field():
+    """`note` is published as optional, so it must parse — and so must its absence."""
+    assert cardctl.read_card_file(_write(_doc(note="dumped by cardctl"))) is not None
+    d = _doc()
+    d.pop("note", None)
+    assert cardctl.read_card_file(_write(d)) is not None
 
 
 def test_requires_the_spent_bit_and_will_not_default_it():
@@ -333,7 +415,7 @@ class _DumpCard:
         return self._slots[index]
 
 
-def _run_dump(extra=()) -> str:
+def _run_dump(extra=(), mint="https://forge.flashapp.me") -> str:
     """Run cmd_dump against the fake card. Returns everything it printed."""
     real = cardctl.connect
     cardctl.connect = lambda a: _DumpCard()
@@ -341,9 +423,7 @@ def _run_dump(extra=()) -> str:
     real_stdout = sys.stdout
     sys.stdout = out
     try:
-        args = cardctl.build_parser().parse_args(
-            ["dump", "--mint", "https://forge.flashapp.me", *extra]
-        )
+        args = cardctl.build_parser().parse_args(["dump", "--mint", mint, *extra])
         assert args.func(args) == 0
     finally:
         sys.stdout = real_stdout
@@ -445,6 +525,80 @@ def test_dump_out_force_overwrites():
         assert doc["cardPubkey"] == CARD_PUBKEY
 
 
+# ── dump validates what it writes ────────────────────────────────────────────
+
+def test_dump_refuses_to_write_a_document_it_could_not_read_back():
+    """
+    `dump --mint "$MINT_URL"` with the variable unset used to exit 0, print
+    "wrote 2 slot(s)", and leave a file this same module refuses — discovered
+    long after the card had moved on. The file is the card's only off-card
+    record; a successful-looking failure here is the expensive kind.
+    """
+    for bad_mint, extra in (("", []), ("", ["--unspent-only"])):
+        try:
+            _run_dump(extra, mint=bad_mint)
+        except SystemExit as exc:
+            assert "mint must be a non-empty string" in str(exc), str(exc)
+        else:
+            raise AssertionError("dump wrote a document read_card_file refuses")
+
+
+def test_dump_writes_nothing_when_the_document_is_invalid():
+    """Validation happens before the file is touched, not after."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "card1.json"
+        try:
+            _run_dump(["--out", str(path)], mint="")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("dump --mint '' succeeded")
+        assert not path.exists(), "dump left a file behind after refusing"
+
+
+def test_dump_refuses_an_empty_unit():
+    try:
+        _run_dump(["--unit", ""])
+    except SystemExit as exc:
+        assert "unit must be a non-empty string" in str(exc), str(exc)
+    else:
+        raise AssertionError("dump wrote a document with an empty unit")
+
+
+def test_dump_emits_only_fields_the_spec_publishes():
+    """The writer is held to the same allowlist the reader enforces."""
+    assert set(_dump()) <= set(cardctl.FILE_FIELDS)
+
+
+def test_dump_names_the_escape_hatch_when_a_card_holds_an_unrepresentable_proof():
+    """
+    A card provisioned by an older cardctl can hold a denomination v1 cannot
+    carry. Refusing is right — the file would be unloadable — but the operator
+    must be told how to get the bytes off anyway, not just that it failed.
+    """
+    class _LegacyCard(_DumpCard):
+        def __init__(self):
+            super().__init__()
+            self._slots[0] = dict(self._slots[0], amount=5)
+
+    real = cardctl.connect
+    cardctl.connect = lambda a: _LegacyCard()
+    try:
+        args = cardctl.build_parser().parse_args(
+            ["dump", "--mint", "https://forge.flashapp.me"]
+        )
+        args.func(args)
+    except SystemExit as exc:
+        assert "could not read back" in str(exc), str(exc)
+        assert "positive power of two" in str(exc), str(exc)
+        assert "cardctl proof <slot>" in str(exc), str(exc)
+        assert "Nothing was written" in str(exc), str(exc)
+    else:
+        raise AssertionError("dump wrote a file it cannot read back")
+    finally:
+        cardctl.connect = real
+
+
 # ── load-file ────────────────────────────────────────────────────────────────
 
 class _LoadCard:
@@ -452,17 +606,23 @@ class _LoadCard:
     Enough of Card for cmd_load_file. Records every call and writes nothing.
 
     `occupied` seeds slots already on the card, in slot order, so the
-    re-run-after-a-crash path can be driven.
+    re-run-after-a-crash path can be driven. `burned` seeds slots the card has
+    already *spent* — same nonces, different status byte, and a very different
+    thing to tell an operator.
     """
 
     MAX_SLOTS = 32
 
-    def __init__(self, pubkey: str = CARD_PUBKEY, occupied=()):
+    def __init__(self, pubkey: str = CARD_PUBKEY, occupied=(), burned=()):
         self._pubkey = bytes.fromhex(pubkey)
         self._occupied = [
             {"keyset_id": "0059534ce0bfa19a", "amount": 8, "nonce": n,
              "c": bytes.fromhex(C_POINT), "status": "unspent"}
             for n in occupied
+        ] + [
+            {"keyset_id": "0059534ce0bfa19a", "amount": 8, "nonce": n,
+             "c": bytes.fromhex(C_POINT), "status": "spent"}
+            for n in burned
         ]
         self.loaded = []
         self.calls = []
@@ -478,8 +638,8 @@ class _LoadCard:
 
     def get_slot_status(self):
         self.calls.append("get_slot_status")
-        n = len(self._occupied)
-        return bytes([0x01] * n + [0x00] * (self.MAX_SLOTS - n))
+        statuses = [0x02 if s["status"] == "spent" else 0x01 for s in self._occupied]
+        return bytes(statuses + [0x00] * (self.MAX_SLOTS - len(statuses)))
 
     def get_proof(self, index):
         self.calls.append(f"get_proof {index}")
@@ -625,6 +785,120 @@ def test_load_file_rejects_an_oversized_amount_before_any_write():
     card, _ = _expect_load_exit(d, "amount must be a positive integer")
     assert card.loaded == []
     assert card.calls == [], "connected to a card before the file was valid"
+
+
+def test_load_file_says_SPENT_not_already_loaded_for_a_burned_nonce():
+    """
+    Dump a card, spend a slot, re-run load-file from the now-stale file. The
+    card has burned that nonce; reporting it as "already loaded, skipping" tells
+    the operator their proof is safely on the card when the money is gone, and
+    folds it into the "already on the card" count.
+    """
+    d = _doc(slots=[_slot(nonce="ab" * 32), _slot(amount=16, nonce="cd" * 32)])
+    card = _LoadCard(burned=[bytes.fromhex("ab" * 32)])
+    card, printed = _load_file(d, card=card)
+
+    assert [amount for _, amount, _, _ in card.loaded] == [16], "reloaded a burned proof"
+    assert "already SPENT on this card" in printed, printed
+    assert "already loaded, skipping" not in printed, printed
+    assert "1 already SPENT on the card" in printed, printed
+    # The burned one must not be counted as safely present.
+    assert "1 already on the card" not in printed, printed
+
+
+def test_load_file_still_says_already_loaded_for_an_unspent_nonce():
+    """The other branch must keep its own wording — this is not a rename."""
+    d = _doc(slots=[_slot(nonce="ab" * 32), _slot(amount=16, nonce="cd" * 32)])
+    card = _LoadCard(occupied=[bytes.fromhex("ab" * 32)])
+    _, printed = _load_file(d, card=card)
+    assert "already loaded, skipping" in printed, printed
+    assert "SPENT" not in printed, printed
+
+
+def test_load_file_counts_loaded_present_and_burned_separately():
+    """One of each, so the summary line cannot conflate two of them."""
+    d = _doc(slots=[
+        _slot(nonce="ab" * 32),                 # already on the card, unspent
+        _slot(nonce="cd" * 32),                 # already on the card, spent
+        _slot(amount=16, nonce="ef" * 32),      # actually loaded
+        _slot(amount=32, nonce="12" * 32, spent=True),  # spent in the file
+    ])
+    card = _LoadCard(occupied=[bytes.fromhex("ab" * 32)],
+                     burned=[bytes.fromhex("cd" * 32)])
+    card, printed = _load_file(d, card=card)
+
+    assert [amount for _, amount, _, _ in card.loaded] == [16]
+    assert "loaded 1 proof(s), 16 sat total" in printed, printed
+    assert "1 already on the card" in printed, printed
+    assert "1 already SPENT on the card" in printed, printed
+    assert "1 spent slot(s) not loaded" in printed, printed
+
+
+# ── `load`: the single-proof path takes the same rules ───────────────────────
+
+class _RefuseCard:
+    """Any use of this is a bug: `load` must validate before touching a card."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"cmd_load reached the card ({name}) with bad arguments")
+
+
+def _run_load(argv, card=None):
+    real = cardctl.connect
+    cardctl.connect = lambda a: (card or _RefuseCard())
+    out = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = out
+    try:
+        args = cardctl.build_parser().parse_args(["load", *argv])
+        return args.func(args), out.getvalue()
+    finally:
+        sys.stdout = real_stdout
+        cardctl.connect = real
+
+
+def _expect_load_arg_exit(argv, needle: str):
+    try:
+        _run_load(argv)
+    except SystemExit as exc:
+        assert needle in str(exc), f"expected {needle!r} in {str(exc)!r}"
+    else:
+        raise AssertionError(f"expected SystemExit containing {needle!r}")
+
+
+def test_load_rejects_amounts_the_card_file_format_cannot_carry():
+    """
+    The sibling of the file path, and it used to disagree with it: 2**32 died on
+    a bare `OverflowError: int too big to convert` out of Card.load_proof, -1 on
+    "can't convert negative int to unsigned", and 0 silently burned one of 32
+    scarce slots on a worthless proof. All three now fail the same way the file
+    parser fails them, before the reader is touched.
+    """
+    base = ["--keyset", "0059534ce0bfa19a"]
+    for bad in ("4294967296", "-1", "0"):
+        _expect_load_arg_exit(base + ["--amount", bad], "amount must be a positive integer")
+    for bad in ("5", "100"):
+        _expect_load_arg_exit(base + ["--amount", bad], "amount must be a positive power of two")
+
+
+def test_load_rejects_a_non_v0_keyset_id_before_touching_the_card():
+    _expect_load_arg_exit(["--keyset", "0159534ce0bfa19a", "--amount", "8"],
+                          "NUT-02 v0 keyset id")
+
+
+def test_card_load_proof_bounds_the_amount_itself():
+    """
+    The check lives on Card.load_proof, so no caller can route around it — a
+    future command that builds a proof some other way inherits the same bound.
+    """
+    card = cardctl.Card.__new__(cardctl.Card)
+    for bad in (2 ** 32, 0, -1, 5):
+        try:
+            card.load_proof(bytes(8), bad, bytes(32), b"\x02" + bytes(32))
+        except SystemExit as exc:
+            assert "amount" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"load_proof accepted amount {bad}")
 
 
 if __name__ == "__main__":
