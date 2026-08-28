@@ -314,8 +314,13 @@ class Card:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def parse_hex(value: str, expected_len: Optional[int] = None, what: str = "value") -> bytes:
+    # spec/CARD-FILE.md: hex is case-insensitive on read and `0x` prefixes are
+    # tolerated. That has to include `0X` — a prefix check that is itself
+    # case-sensitive would make the spec's claim false for exactly the values
+    # the case-insensitivity claim invites.
+    stripped = value[2:] if value[:2].lower() == "0x" else value
     try:
-        b = bytes.fromhex(value.removeprefix("0x"))
+        b = bytes.fromhex(stripped)
     except ValueError:
         raise SystemExit(f"{what} is not valid hex: {value!r}")
     if expected_len is not None and len(b) != expected_len:
@@ -604,9 +609,15 @@ def validate_card_doc(doc) -> dict:
     """
     if not isinstance(doc, dict):
         raise SystemExit("card file must be a JSON object")
-    if doc.get("version") != CARD_FILE_VERSION:
+    version = doc.get("version")
+    # The bool guard matters: True == 1 in Python, so `!= CARD_FILE_VERSION`
+    # alone accepts `"version": true` — a file TypeScript's `!== 1` refuses.
+    # Two halves disagreeing about one file is the drift this format exists to
+    # prevent. Same trap validate_slot_amount already guards.
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version != CARD_FILE_VERSION:
         raise SystemExit(
-            f"unsupported card file version {doc.get('version')!r}, "
+            f"unsupported card file version {version!r}, "
             f"expected {CARD_FILE_VERSION}"
         )
     _reject_unknown_fields(doc, FILE_FIELDS, "card file: ")
@@ -625,12 +636,29 @@ def validate_card_doc(doc) -> dict:
     slots = doc.get("slots")
     if not isinstance(slots, list):
         raise SystemExit("card file slots must be an array")
+    parsed_slots = [_slot_from_json(e, i) for i, e in enumerate(slots)]
+
+    # A nonce identifies one proof. A file carrying the same nonce twice — a
+    # hand-merge of two dumps, a corrupted file — would make cmd_load_file write
+    # the first and report the second as "already loaded, skipping": the
+    # operator is told a proof is safely on the card that was never written.
+    # cashu-client's parser refuses duplicates for the same reason.
+    seen = {}
+    for i, slot in enumerate(parsed_slots):
+        nonce = slot["nonce"]
+        if nonce in seen:
+            raise SystemExit(
+                f"slot {i}: duplicate nonce {_hex(nonce)} (also in slot "
+                f"{seen[nonce]}) — a nonce identifies one proof; this file "
+                f"claims two"
+            )
+        seen[nonce] = i
 
     return {
         "mint": doc["mint"],
         "unit": doc["unit"],
         "card_pubkey": card_pubkey,
-        "slots": [_slot_from_json(e, i) for i, e in enumerate(slots)],
+        "slots": parsed_slots,
     }
 
 
@@ -751,6 +779,20 @@ def cmd_dump(args) -> int:
     for index, status in enumerate(statuses):
         if status == 0x00:
             continue
+        if status not in (0x01, 0x02):
+            # A status byte this tool does not recognise — a newer applet
+            # revision, or a corrupted read. Folding it through the spent check
+            # below would write it into the file as `spent: false`: unknown
+            # state recorded as spendable money, resurrected by the next
+            # load-file. Unknown state is refused, never guessed at — the same
+            # rule the reader applies to an unknown version. Checked before
+            # --unspent-only so the flag cannot silently drop it either.
+            raise SystemExit(
+                f"slot {index}: unknown status byte 0x{status:02x} — this tool "
+                f"knows unspent (0x01) and spent (0x02), and the v1 card file "
+                f"cannot represent anything else. Nothing was written. Read "
+                f"the slot out with `cardctl proof {index}`."
+            )
         if args.unspent_only and status != 0x01:
             continue
         p = card.get_proof(index)

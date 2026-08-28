@@ -19,20 +19,23 @@ wrong model — a NUT-10 P2PK secret is ~150 bytes of JSON and cannot live in a
 32-byte slot field.
 
 > **Status: v1 is not final until both halves ship it.**
-> `spent` (below) exists on the Python side only. `lnflash/cashu-client#5` — the
-> other half of v1 — does not know the field: its `SLOT_FIELDS` allowlist is
-> `keysetId, amount, nonce, C`, and its parser rejects any key outside it. Until
-> that PR adds `spent` to `SLOT_FIELDS`, `CardProofSlot`, `parseCardSlot` and
-> `serializeCardFile`, every file `cardctl dump` writes is refused by
-> `parseCardFile` and every file `serializeCardFile` writes is refused by
-> `cardctl load-file`. **Neither PR may merge alone.** The paired change, and a
-> regenerated `tools/cardctl/testdata/card-file-v1.json`, land together or v1
-> ships without `spent` on both sides and gains it as v2.
+> `spent` (below) now exists on both sides: `lnflash/cashu-client#5` — the other
+> half of v1 — carries it in its `SLOT_FIELDS` allowlist, its slot type and
+> `parseCardSlot`, and has adopted the `amount < 2^32` bound
+> (`MAX_CARD_AMOUNT`) that the card's 4-byte field makes the real one. Its
+> `serializeCardFile` emits the field too — while refusing `spent: true`
+> outright, because that direction ends at `LOAD_PROOF`, which cannot carry the
+> bit; full dumps with spent slots are `cardctl dump`'s side of the format.
+> `tools/cardctl/testdata/card-file-v1.json` was regenerated with that branch's
+> toolchain, so the fixture is once again a file the TypeScript side's
+> `parseCardFile` accepts.
 >
-> One more thing owed on that side: `requireAmount` accepts any power of two up
-> to `Number.MAX_SAFE_INTEGER`. The card's field is four bytes wide, so the
-> bound below (`amount < 2^32`) is the real one and cashu-client must adopt it —
-> otherwise the TypeScript half writes files the card physically cannot hold.
+> But agreement on a branch is not agreement on `main`. Until #5 lands, `main`'s
+> `parseCardFile` still rejects `spent` as an unknown field — merged alone, this
+> PR puts a tool on `main` whose dump output the shipped cashu-client refuses,
+> and whose load-file refuses `serializeCardFile`'s output, in both directions.
+> **Neither PR may merge alone.** The pair lands together, or v1 ships without
+> `spent` on both sides and gains it as v2.
 
 ---
 
@@ -87,7 +90,10 @@ appears here with a version bump.
 | `spent` | boolean | yes | Whether the card has already marked this slot spent. |
 
 Hex is case-insensitive on read and lower-case on write. `0x` prefixes are
-tolerated on read and never written.
+tolerated on read — in either case, `0x` or `0X`, because the prefix is hex too
+— and never written. Both claims are asserted by `test_card_file.py`
+(`test_normalises_hex_case`, `test_tolerates_0x_prefixes_in_any_case`) rather
+than trusted.
 
 ### Why `spent` is required and not defaulted
 
@@ -123,12 +129,11 @@ Additive-looking changes still require a bump, because "field absent" and
 - `tools/cardctl/test_card_file.py` parses the two tables above and asserts that
   the names `cardctl`'s parser requires, and the names its writer emits, are
   exactly the names published here. A rename on the Python side fails in CI.
-- `tools/cardctl/testdata/card-file-v1.json` is a fixture whose body was produced
-  by cashu-client's `serializeCardFile`, kept so the Python side is checked
-  against bytes the TypeScript side actually wrote. Its `spent` fields were
-  added by hand, because `serializeCardFile` does not emit them yet — see the
-  status note at the top. Regenerating it from an updated `serializeCardFile` is
-  part of the paired change, not optional cleanup.
+- `tools/cardctl/testdata/card-file-v1.json` is a fixture generated with
+  cashu-client's `#5`-branch toolchain — the version that knows `spent` — kept
+  so the Python side is checked against a file the TypeScript side accepts,
+  not only against prose. Any future schema change regenerates it through that
+  toolchain as part of the paired change, not as optional cleanup.
 - **Not yet true, and required before v1 ships:** cashu-client asserting these
   same tables from its own suite. Today it holds its own copies of the field
   lists and does not read this document, so the "contract" is enforced on the

@@ -189,8 +189,39 @@ def test_normalises_hex_case():
     d = _doc()
     d["cardPubkey"] = CARD_PUBKEY.upper()
     d["slots"][0]["keysetId"] = "0059534CE0BFA19A"
+    d["slots"][0]["nonce"] = ("ab" * 32).upper()
+    d["slots"][0]["C"] = C_POINT.upper()
     doc = cardctl.read_card_file(_write(d))
     assert doc["slots"][0]["keyset"] == bytes.fromhex("0059534ce0bfa19a")
+    assert doc["slots"][0]["nonce"] == bytes.fromhex("ab" * 32)
+    assert doc["slots"][0]["c"] == bytes.fromhex(C_POINT)
+
+
+def test_tolerates_0x_prefixes_in_any_case():
+    """
+    spec/CARD-FILE.md: hex is case-insensitive on read and `0x` prefixes are
+    tolerated on read. Both claims together mean `0X` + UPPERCASE must parse —
+    the exact combination a case-sensitive removeprefix("0x") used to refuse,
+    making the spec's claim false for the values its own case rule invites.
+    """
+    for prefix in ("0x", "0X"):
+        d = _doc()
+        d["cardPubkey"] = prefix + CARD_PUBKEY.upper()
+        d["slots"][0]["keysetId"] = prefix + "0059534CE0BFA19A"
+        d["slots"][0]["nonce"] = prefix + ("AB" * 32)
+        d["slots"][0]["C"] = prefix + C_POINT.upper()
+        doc = cardctl.read_card_file(_write(d))
+        assert cardctl._hex(doc["card_pubkey"]) == CARD_PUBKEY
+        assert doc["slots"][0]["keyset"] == bytes.fromhex("0059534ce0bfa19a")
+        assert doc["slots"][0]["nonce"] == bytes.fromhex("ab" * 32)
+        assert doc["slots"][0]["c"] == bytes.fromhex(C_POINT)
+
+
+def test_the_prefix_is_stripped_only_at_the_front():
+    """`0x` is a prefix, not a licence for stray characters mid-string."""
+    d = _doc()
+    d["slots"][0]["nonce"] = "ab" * 16 + "0x" + "ab" * 15
+    _expect_exit(d, "not valid hex")
 
 
 # ── rejections ───────────────────────────────────────────────────────────────
@@ -214,6 +245,11 @@ def test_rejects_a_non_object_document():
 def test_rejects_an_unknown_version():
     _expect_exit(_doc(version=2), "unsupported card file version")
     _expect_exit(_doc(version=None), "unsupported card file version")
+    # True == 1 in Python, so a naive `!= 1` accepts `"version": true` — a file
+    # TypeScript's `!== 1` refuses. The two halves must refuse the same bytes.
+    _expect_exit(_doc(version=True), "unsupported card file version")
+    _expect_exit(_doc(version="1"), "unsupported card file version")
+    _expect_exit(_doc(version=1.0), "unsupported card file version")
 
 
 def test_rejects_missing_mint_or_unit():
@@ -395,16 +431,47 @@ def test_rejects_a_non_object_slot():
     _expect_exit(_doc(slots=["nope"]), "slot 0: expected an object")
 
 
+def test_rejects_duplicate_nonces():
+    """
+    A nonce identifies one proof. A hand-merged or corrupted file carrying the
+    same nonce twice would make load-file write the first and report the second
+    as "already loaded, skipping" — telling the operator a proof is safely on
+    the card that was never written.
+    """
+    d = _doc(slots=[_slot(nonce="ab" * 32), _slot(amount=16, nonce="ab" * 32)])
+    _expect_exit(d, "slot 1: duplicate nonce " + "ab" * 32)
+    _expect_exit(d, "a nonce identifies one proof; this file claims two")
+    # The message points at both claimants, not just the second one.
+    _expect_exit(d, "also in slot 0")
+    # Distinct nonces stay accepted — this is a duplicate check, not a rename.
+    d = _doc(slots=[_slot(nonce="ab" * 32), _slot(amount=16, nonce="cd" * 32)])
+    assert len(cardctl.read_card_file(_write(d))["slots"]) == 2
+
+
+def test_rejects_duplicate_nonces_even_across_case_and_prefix():
+    """The same 32 bytes are the same proof however the file spells them."""
+    d = _doc(slots=[_slot(nonce="ab" * 32),
+                    _slot(amount=16, nonce="0x" + "AB" * 32)])
+    _expect_exit(d, "duplicate nonce")
+
+
 # ── dump writes what read accepts ────────────────────────────────────────────
 
 class _DumpCard:
-    """Enough of Card for cmd_dump: two slots, one unspent, one spent."""
+    """
+    Enough of Card for cmd_dump: two slots, one unspent, one spent.
+
+    The nonces are distinct because a nonce identifies one proof and the
+    validator refuses a file carrying the same one twice — a fake sharing a
+    nonce across slots models a card state the tool itself rejects, the same
+    way the fixture's slots had to stop sharing a C point.
+    """
 
     def __init__(self):
         self._slots = [
             {"keyset_id": "0059534ce0bfa19a", "amount": 8, "nonce": bytes(range(32)),
              "c": bytes.fromhex(C_POINT), "status": "unspent"},
-            {"keyset_id": "008288762774ace1", "amount": 16, "nonce": bytes(range(32)),
+            {"keyset_id": "008288762774ace1", "amount": 16, "nonce": bytes(range(32, 64)),
              "c": bytes.fromhex(C_POINT), "status": "spent"},
         ]
 
@@ -598,6 +665,46 @@ def test_dump_names_the_escape_hatch_when_a_card_holds_an_unrepresentable_proof(
         assert "Nothing was written" in str(exc), str(exc)
     else:
         raise AssertionError("dump wrote a file it cannot read back")
+    finally:
+        cardctl.connect = real
+
+
+def test_dump_refuses_a_status_byte_it_does_not_recognise():
+    """
+    A newer applet revision adds a status value, or a read corrupts. Folding it
+    through `status == "spent"` writes `spent: false` into the file — unknown
+    state recorded as spendable money, resurrected by the next load-file.
+    Unknown state is refused, never guessed at, on the writer exactly as the
+    reader refuses an unknown version — and --unspent-only must not silently
+    drop it either, because the unknown slot may be the unspent money.
+    """
+
+    class _FutureCard(_DumpCard):
+        def get_slot_status(self):
+            return bytes([0x01, 0x03] + [0x00] * 30)
+
+    real = cardctl.connect
+    cardctl.connect = lambda a: _FutureCard()
+    try:
+        for extra in ([], ["--unspent-only"]):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "card1.json"
+                try:
+                    args = cardctl.build_parser().parse_args(
+                        ["dump", "--mint", "https://forge.flashapp.me",
+                         "--out", str(path), *extra]
+                    )
+                    args.func(args)
+                except SystemExit as exc:
+                    assert "slot 1" in str(exc), str(exc)
+                    assert "unknown status byte 0x03" in str(exc), str(exc)
+                    assert "cardctl proof 1" in str(exc), str(exc)
+                    assert "Nothing was written" in str(exc), str(exc)
+                else:
+                    raise AssertionError(
+                        f"dump {extra} wrote unknown slot state as spendable money"
+                    )
+                assert not path.exists(), "dump left a file behind after refusing"
     finally:
         cardctl.connect = real
 
