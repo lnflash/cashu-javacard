@@ -96,8 +96,8 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `sign [--message HEX]` | SIGN_ARBITRARY, then verify |
 | `spend <slot> [--message HEX]` | SPEND_PROOF, verify, confirm the slot flipped to spent |
 | `load --keyset ID --amount N [--nonce HEX] [--c HEX] [--pin P]` | LOAD_PROOF. `ID` is the full 16-hex-char NUT-02 keyset id. |
-| `load-file PATH [--pin P]` | LOAD_PROOF every proof in a card file. Refuses if the file is for a different card. |
-| `dump --mint URL [--unit U] [--out PATH] [--unspent-only]` | Write the card's slots out as a card file. |
+| `load-file PATH [--pin P]` | LOAD_PROOF every proof in a card file. Refuses if the file is for a different card, or if the card has too few free slots. Re-runnable: proofs already on the card are skipped, spent ones are never written back. |
+| `dump --mint URL [--unit U] [--out PATH] [--force] [--unspent-only]` | Write the card's slots out as a card file. `--out` refuses to overwrite without `--force`. |
 | `clear-spent [--pin P]` | free spent slots |
 | `verify-pin` / `set-pin` / `change-pin` | PIN management |
 | `lock [--yes]` | **irreversibly** disable writes |
@@ -128,14 +128,36 @@ same signing path without consuming anything.
 signature. That is fine for exercising storage and slot management, but such a
 proof can never be redeemed at a mint.
 
+## Card files
+
+`dump` and `load-file` speak the interchange format in
+[`spec/CARD-FILE.md`](../../spec/CARD-FILE.md), which is also what cashu-client's
+`serializeCardFile` / `parseCardFile` produce and consume. The spec is the
+contract between the two implementations; `test_card_file.py` parses it and
+asserts this driver's parser and writer against the published field tables, so
+a rename on this side fails in CI rather than at a card reader.
+
+Two things the format insists on, both because a card file is bearer money:
+
+- **`spent` is required, not defaulted.** A file that omits it is not a file of
+  unspent proofs, it is a file whose state is unknown — and guessing "unspent"
+  turns settled money back into spendable balance on the next `load-file`.
+- **`load-file` is re-runnable.** `LOAD_PROOF` commits one proof at a time with
+  no transaction around the file, so a failure part-way through leaves half of
+  it on the card. Re-running skips whatever is already there by nonce instead of
+  writing duplicates, and everything checkable — capacity, amounts, points — is
+  checked before the first write.
+
 ## Tests
 
 ```bash
-python3 test_bip340.py    # verifier: spec vectors, reference round-trip, mutations
-python3 test_apdu.py      # every command's bytes, against spec/APDU.md
+python3 test_bip340.py            # verifier: spec vectors, reference round-trip, mutations
+python3 test_apdu.py              # every command's bytes, against spec/APDU.md
+python3 test_spec_consistency.py  # cardctl vs spec/APDU.md, parsed from the doc
+python3 test_card_file.py         # card file read/write, against spec/CARD-FILE.md
 ```
 
-Both run without a reader or a card. The BIP-340 tests matter more than they
+All four run without a reader or a card. The BIP-340 tests matter more than they
 look: `selftest`'s verdict is only as trustworthy as the verifier behind it, so
 that verifier is checked against the specification's own vectors, round-tripped
 against an independent reference signer, and mutation-tested to prove it can

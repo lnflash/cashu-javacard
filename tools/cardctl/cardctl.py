@@ -369,7 +369,7 @@ def cmd_spend(args) -> int:
     return 0 if ok else 1
 
 
-def parse_keyset_id(value: str) -> bytes:
+def parse_keyset_id(value: str, what: str = "--keyset") -> bytes:
     """
     A NUT-02 keyset id is 16 hex characters, which is 8 bytes raw.
 
@@ -381,15 +381,20 @@ def parse_keyset_id(value: str) -> bytes:
     i.e. actually hex. Anything else falls through to parse_hex's "not valid
     hex" error rather than sending the operator hunting for a truncation that
     never happened.
+
+    `what` names the thing the operator has to go and fix. The same id arrives
+    from two places — the `--keyset` flag and a card file's `keysetId` field —
+    and pointing at a CLI flag that the failing command does not even have
+    sends them looking in the wrong file.
     """
     v = value.strip().lower()
     if len(v) == 8 and all(c in "0123456789abcdef" for c in v):
         raise SystemExit(
-            f"--keyset {value!r} is 8 hex chars, but a NUT-02 keyset id is 16 "
+            f"{what} {value!r} is 8 hex chars, but a NUT-02 keyset id is 16 "
             f"(e.g. 0059534ce0bfa19a). Eight characters is half an id; a proof "
             f"loaded with it cannot be spent. Pass the full id."
         )
-    return parse_hex(v, 8, "keyset")
+    return parse_hex(v, 8, what.lstrip("-"))
 
 
 def cmd_load(args) -> int:
@@ -421,8 +426,18 @@ def cmd_load(args) -> int:
 # The field names are the card's own vocabulary — `nonce`, not `secret`, and a
 # 16-hex-char `keysetId`. A file that says `secret` was written against a wrong
 # model: a NUT-10 P2PK secret is ~150 bytes of JSON and cannot live in a slot.
+#
+# The schema is published in spec/CARD-FILE.md and test_card_file.py asserts
+# this parser against it, the same way test_spec_consistency.py asserts the APDU
+# encodings against spec/APDU.md.
 
 CARD_FILE_VERSION = 1
+
+# The card's amount field is a 4-byte unsigned integer (spec/APDU.md,
+# LOAD_PROOF). Anything at or above this bound makes `amount.to_bytes(4, "big")`
+# raise a bare OverflowError — mid-load, after earlier proofs are already
+# committed. Bound it during validation, before the first write.
+MAX_SLOT_AMOUNT = 2 ** 32
 
 
 def _slot_from_json(entry, index: int) -> dict:
@@ -438,8 +453,12 @@ def _slot_from_json(entry, index: int) -> dict:
         )
 
     amount = entry.get("amount")
-    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
-        raise SystemExit(f"{where}amount must be a positive integer, got {amount!r}")
+    if (not isinstance(amount, int) or isinstance(amount, bool)
+            or not 0 < amount < MAX_SLOT_AMOUNT):
+        raise SystemExit(
+            f"{where}amount must be a positive integer below 2**32 "
+            f"(the card's amount field is a 4-byte uint), got {amount!r}"
+        )
 
     keyset = entry.get("keysetId")
     if not isinstance(keyset, str):
@@ -451,15 +470,40 @@ def _slot_from_json(entry, index: int) -> dict:
     if not isinstance(nonce_hex, str):
         raise SystemExit(f"{where}nonce must be a hex string")
 
+    # Required, never defaulted. A file that omits it is not a file of unspent
+    # proofs, it is a file whose state is unknown — and guessing "unspent"
+    # resurrects settled money as spendable balance. See spec/CARD-FILE.md.
+    spent = entry.get("spent")
+    if not isinstance(spent, bool):
+        raise SystemExit(
+            f"{where}spent must be a boolean — without it there is no way to "
+            f"tell an unspent proof from one the card already burned, and "
+            f"loading the file back would resurrect the spent ones. "
+            f"Got {spent!r}."
+        )
+
     try:
-        return {
-            "keyset": parse_keyset_id(keyset),
-            "amount": amount,
-            "nonce": parse_hex(nonce_hex, 32, f"{where}nonce"),
-            "c": parse_hex(c_hex, 33, f"{where}C"),
-        }
+        keyset_id = parse_keyset_id(keyset, what="keysetId")
+        nonce = parse_hex(nonce_hex, 32, f"{where}nonce")
+        c = parse_hex(c_hex, 33, f"{where}C")
     except SystemExit as exc:
         raise SystemExit(f"{where}{exc}" if not str(exc).startswith(where) else str(exc))
+
+    # Same guard cardPubkey gets. A C that is not a compressed point is an
+    # unspendable proof, which is the whole reason this validator exists.
+    if c[0] not in (0x02, 0x03):
+        raise SystemExit(
+            f"{where}C must be a compressed secp256k1 point (02/03 prefix), "
+            f"got 0x{c[0]:02x}"
+        )
+
+    return {
+        "keyset": keyset_id,
+        "amount": amount,
+        "nonce": nonce,
+        "c": c,
+        "spent": spent,
+    }
 
 
 def read_card_file(path: str) -> dict:
@@ -503,6 +547,24 @@ def read_card_file(path: str) -> dict:
     }
 
 
+def _nonces_on_card(card) -> dict:
+    """
+    {nonce: slot index} for every occupied slot.
+
+    This is what makes `load-file` re-runnable. LOAD_PROOF commits one proof at
+    a time with no transaction around the file, so any mid-file failure leaves
+    part of it on the card; without this, the obvious recovery — run it again —
+    writes the already-loaded proofs a second time into fresh slots, inflating
+    the on-card balance with duplicates the mint rejects on redemption.
+    """
+    found = {}
+    for index, status in enumerate(card.get_slot_status()):
+        if status == 0x00:
+            continue
+        found.setdefault(card.get_proof(index)["nonce"], index)
+    return found
+
+
 def cmd_load_file(args) -> int:
     """Load every proof in a card file, in order."""
     doc = read_card_file(args.path)
@@ -511,7 +573,8 @@ def cmd_load_file(args) -> int:
     on_card = card.get_pubkey()
     if on_card != doc["card_pubkey"]:
         # Proofs are P2PK-locked to one card. Loading them onto a different card
-        # writes money nothing can ever spend.
+        # writes money nothing can ever spend. Checked before the PIN and before
+        # any write: there is nothing to undo yet.
         raise SystemExit(
             f"card file is for {_hex(doc['card_pubkey'])}\n"
             f"but this card is  {_hex(on_card)}\n"
@@ -520,12 +583,43 @@ def cmd_load_file(args) -> int:
     if args.pin:
         card.verify_pin(args.pin.encode())
 
+    # A spent proof has already been burned by the card. LOAD_PROOF has no spent
+    # bit, so writing one back returns it as unspent — balance the holder cannot
+    # actually move. Dump keeps them because they are still owed at the mint;
+    # load must not put them back on a card.
+    settled = [s for s in doc["slots"] if s["spent"]]
+    loadable = [s for s in doc["slots"] if not s["spent"]]
+
+    # Pre-flight. Everything checkable before the first write happens before the
+    # first write, because after it there is no rollback.
+    already = _nonces_on_card(card)
+    pending = [s for s in loadable if s["nonce"] not in already]
+    empty = card.get_info()["empty"]
+    if len(pending) > empty:
+        raise SystemExit(
+            f"card file needs {len(pending)} free slot(s) but this card has "
+            f"{empty}. Nothing was written. Free space with `cardctl clear-spent` "
+            f"or split the file across cards."
+        )
+
     total = 0
-    for i, slot in enumerate(doc["slots"]):
+    loaded = 0
+    for slot in doc["slots"]:
+        if slot["spent"]:
+            continue
+        if slot["nonce"] in already:
+            print(f"slot {already[slot['nonce']]}: already loaded, skipping")
+            continue
         index = card.load_proof(slot["keyset"], slot["amount"], slot["nonce"], slot["c"])
+        already[slot["nonce"]] = index
+        loaded += 1
         total += slot["amount"]
         print(f"slot {index}: {slot['amount']} {doc['unit']}")
-    print(f"loaded {len(doc['slots'])} proof(s), {total} {doc['unit']} total")
+
+    skipped = len(loadable) - loaded
+    print(f"loaded {loaded} proof(s), {total} {doc['unit']} total"
+          + (f"; {skipped} already on the card" if skipped else "")
+          + (f"; {len(settled)} spent slot(s) not loaded" if settled else ""))
     return 0
 
 
@@ -547,6 +641,11 @@ def cmd_dump(args) -> int:
             "amount": p["amount"],
             "nonce": _hex(p["nonce"]),
             "C": _hex(p["c"]),
+            # The bit that says whether this money still moves. Dropping it
+            # keeps the proof and loses the state needed to act on it: the mint
+            # side gets N indistinguishable proofs, and a reload resurrects the
+            # spent ones as spendable. See spec/CARD-FILE.md.
+            "spent": p["status"] == "spent",
         })
 
     doc = {
@@ -559,6 +658,14 @@ def cmd_dump(args) -> int:
     }
     text = json.dumps(doc, indent=2)
     if args.out:
+        # A card file is a bearer-money artifact and the only off-card record of
+        # these proofs. Shell clobber semantics are the wrong default: dumping a
+        # second card over card1.json would destroy the first card's only backup.
+        if os.path.exists(args.out) and not args.force:
+            raise SystemExit(
+                f"{args.out} already exists; pass --force to overwrite. "
+                f"(It may be the only copy of another card's proofs.)"
+            )
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text + "\n")
         print(f"wrote {len(slots)} slot(s) to {args.out}")
@@ -737,6 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mint", required=True, help="mint URL these proofs belong to")
     s.add_argument("--unit", default="sat", help="keyset unit (default: sat)")
     s.add_argument("--out", help="write here instead of stdout")
+    s.add_argument("--force", action="store_true",
+                   help="overwrite --out if it already exists")
     s.add_argument("--unspent-only", action="store_true",
                    help="skip spent slots (they are still readable, and still owed)")
     s.set_defaults(func=cmd_dump)

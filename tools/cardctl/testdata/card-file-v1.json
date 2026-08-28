@@ -8,13 +8,15 @@
       "keysetId": "0059534ce0bfa19a",
       "amount": 8,
       "nonce": "abababababababababababababababababababababababababababababababab",
-      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "spent": false
     },
     {
       "keysetId": "0059534ce0bfa19a",
       "amount": 16,
       "nonce": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "spent": true
     }
   ]
 }
