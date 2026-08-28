@@ -25,10 +25,16 @@ Three artefacts have to agree, so all three are read here:
     of the proof layout in it (the GET_PROOF response table and the
     "Proof Slot Layout" block) are parsed and cross-asserted, because a second
     copy nobody checks is just a second place for the same bug to live.
-  * cardctl.py is *driven*, not read: the documented Lc/Le and field order are
-    checked against the bytes the real encoder puts on the wire. Summing field
-    lengths would leave the field *order* unconstrained, and a misordered load
-    strands money on a card permanently.
+  * cardctl.py is *driven*, not read: the documented header (CLA/INS/P1/P2),
+    Lc/Le, response sizes and field order are checked against the bytes the real
+    encoder puts on the wire, SELECT included. Summing field lengths would leave
+    the field *order* unconstrained, and a misordered load strands money on a
+    card permanently. Every documented command is driven — two completeness
+    ratchets (`test_every_documented_command_is_driven_through_the_encoder` and
+    `test_every_command_with_a_fixed_length_is_length_checked`) fail the day a
+    command is added to the doc and to cardctl but not to the case tables,
+    because a hand-maintained list of what to check is a list that stops being
+    complete.
   * CashuApplet.java's layout constants are scraped with a regex — no JVM
     needed — because the applet is the copy that actually writes EEPROM, and a
     symmetric offset change there would otherwise pass every suite in the repo.
@@ -93,6 +99,20 @@ def _section(name: str) -> str:
     return m.group(1)
 
 
+def _hex_spans(text: str) -> list:
+    """Every backticked run of hex pairs in `text`, as bytes.
+
+    Used to find AIDs wherever prose puts them, so documenting the fallback AID
+    does not have to happen in one exact sentence shape.
+    """
+    spans = []
+    for span in re.findall(r"`([0-9A-Fa-f][0-9A-Fa-f ]*)`", text):
+        cleaned = span.replace(" ", "")
+        if cleaned and len(cleaned) % 2 == 0:
+            spans.append(bytes.fromhex(cleaned))
+    return spans
+
+
 def _command_headings() -> list:
     """Every `### NAME (0xII)` as (name, opcode). SELECT is a `##` heading."""
     headings = re.findall(r"^### ([A-Z_]+) \(0x([0-9A-Fa-f]{2})\)", _apdu_text(), re.M)
@@ -135,6 +155,54 @@ def test_documented_cla_matches():
     stated = f"CLA = {cardctl.CLA:02X}"
     assert f"`{stated}`" in text or f"CLA = `{cardctl.CLA:02X}`" in text, (
         f"APDU.md no longer states {stated} in the expected form"
+    )
+
+
+def test_select_application_matches_the_apdu_the_driver_sends():
+    """
+    SELECT is a `##` heading with no opcode, so every other check in this file
+    skips it — and it is the one command that has to work before any other can.
+    A single wrong AID byte in this table (`…85 01 03`) selects nothing, and the
+    driver then reports "The applet is probably not installed on this card",
+    pointing the operator at the card instead of at the doc.
+    """
+    body = _heading_body("SELECT APPLICATION")
+
+    fields = {}
+    for field in ("CLA", "INS", "P1", "P2", "Lc"):
+        m = re.search(rf"^\| {field} \| ([0-9A-Fa-f]{{2}}) \|$", body, re.M)
+        assert m, f"SELECT APPLICATION's table has no parsable {field} row"
+        fields[field] = int(m.group(1), 16)
+
+    data = re.search(r"^\| Data \| `([0-9A-Fa-f ]+)` \|$", body, re.M)
+    assert data, "SELECT APPLICATION's table has no parsable Data row"
+    documented_aid = bytes.fromhex(data.group(1).replace(" ", ""))
+
+    assert documented_aid == cardctl.PACKAGE_AID, (
+        f"SELECT's Data row is {documented_aid.hex()}, cardctl.PACKAGE_AID is "
+        f"{cardctl.PACKAGE_AID.hex()}"
+    )
+    assert fields["Lc"] == len(cardctl.PACKAGE_AID), (
+        f"SELECT documents Lc {fields['Lc']:02X} for a {len(cardctl.PACKAGE_AID)}-byte AID"
+    )
+
+    # The whole documented header, driven through the real selector.
+    card = make_card([(b"\x00\x01", 0x9000)])
+    card.select()
+    documented_apdu = bytes(
+        [fields["CLA"], fields["INS"], fields["P1"], fields["P2"], fields["Lc"]]
+    ) + documented_aid
+    assert card.connection.last == documented_apdu, (
+        f"spec's SELECT is {documented_apdu.hex()}, cardctl sends "
+        f"{card.connection.last.hex()}"
+    )
+
+    # cardctl.select() retries with the 8-byte applet AID when the 7-byte
+    # package AID is refused. A reader built from a doc that omits the fallback
+    # fails on exactly the cards that decline partial matches.
+    assert cardctl.APPLET_AID in _hex_spans(body), (
+        f"SELECT APPLICATION does not document the {len(cardctl.APPLET_AID)}-byte fallback AID "
+        f"{cardctl.APPLET_AID.hex()} that cardctl.select() actually tries"
     )
 
 
@@ -345,26 +413,46 @@ def _length_row(name: str, field: str) -> int:
     return int(m.group(1), 16)
 
 
+def _param_row(name: str, field: str) -> str:
+    """The raw cell text of a command table's `P1`/`P2` row."""
+    m = re.search(rf"^\| {field} \| (.+?) \|$", _section(name), re.M)
+    assert m, f"could not parse {name}'s {field} row"
+    return m.group(1).strip()
+
+
+def _param_byte(name: str, field: str) -> int:
+    """
+    Parse `| P2 | DE (deadbeef confirmation byte) |` out of a command table.
+
+    A trailing parenthetical is prose for the reader; the leading hex pair is
+    what goes on the wire.
+    """
+    value = _param_row(name, field)
+    m = re.fullmatch(r"`?([0-9A-Fa-f]{2})`?(?: \(.*\))?", value)
+    assert m, f"{name}'s {field} row is not a literal byte: {value!r}"
+    return int(m.group(1), 16)
+
+
 def _wire(method: str, *args, response: bytes = b"") -> tuple:
-    """Run a real Card method against a fake reader; return its (Lc, Le)."""
+    """Run a real Card method against a fake reader; return (P1, P2, Lc, Le)."""
     card = make_card([(response, 0x9000)])
     getattr(card, method)(*args)
     apdu = card.connection.last
     assert apdu[:2] == bytes([cardctl.CLA, apdu[1]]) and len(apdu) >= 4, apdu.hex()
+    p1, p2 = apdu[2], apdu[3]
     if len(apdu) == 4:
-        return None, None
+        return p1, p2, None, None
     if len(apdu) == 5:
-        return None, apdu[4]
+        return p1, p2, None, apdu[4]
     lc = apdu[4]
     assert len(apdu) >= 5 + lc, f"{method}: Lc {lc} exceeds the APDU it was sent in"
-    return lc, apdu[5 + lc] if len(apdu) > 5 + lc else None
+    return p1, p2, lc, apdu[5 + lc] if len(apdu) > 5 + lc else None
 
 
 _PROOF_BODY = b"\x01" + bytes(8) + bytes(4) + bytes(32) + b"\x02" + bytes(32)
 
 # (command, method, args, canned response). Every command whose table states an
-# Lc or Le in the fixed `XX` form; the PIN commands document ranges (`04–08`)
-# and are covered by test_apdu.py's encoding tests instead.
+# Lc or Le in the fixed `XX` form.
 _LENGTH_CASES = (
     ("GET_INFO", "get_info", (), bytes(8)),
     ("GET_PUBKEY", "get_pubkey", (), bytes(33)),
@@ -378,6 +466,223 @@ _LENGTH_CASES = (
     ("CLEAR_SPENT", "clear_spent", (), b"\x00"),
 )
 
+# The commands deliberately absent from _LENGTH_CASES, and why — this set is the
+# only sanctioned way out of the completeness ratchet below, so the reason has to
+# live here rather than in a comment nobody re-reads:
+#
+#   * VERIFY_PIN / SET_PIN document `Lc | 04–08` and CHANGE_PIN documents
+#     `Lc | Variable`, because a PIN is 4–8 bytes. There is no single documented
+#     number to compare a sent byte against; test_apdu.py pins those encodings.
+#   * LOCK_CARD is a bare 4-byte APDU — it carries no data and expects no
+#     response body, so it documents neither Lc nor Le. Its P2 is the
+#     confirmation byte, checked in test_lock_card_p2_is_the_confirmation_byte.
+_NOT_FIXED_LENGTH = {"VERIFY_PIN", "SET_PIN", "CHANGE_PIN", "LOCK_CARD"}
+
+# Every documented command, driven through the real encoder. The four above are
+# absent from _LENGTH_CASES but their headers are still checked, so they are
+# added back here.
+_WIRE_CASES = _LENGTH_CASES + (
+    ("VERIFY_PIN", "verify_pin", (b"1234",), b""),
+    ("SET_PIN", "set_pin", (b"1234",), b""),
+    ("CHANGE_PIN", "change_pin", (b"1234", b"5678"), b""),
+    ("LOCK_CARD", "lock_card", (), b""),
+)
+
+# Commands whose P1 carries a caller-chosen slot index rather than a fixed byte.
+# These are the two that move money: a P1 documented as a literal `00` sends a
+# reader author to slot 0 on every tap, which for SPEND_PROOF is an irreversible
+# spend of the wrong proof.
+_SLOT_INDEXED = {"GET_PROOF", "SPEND_PROOF"}
+
+# The response body size each command's prose advertises. Tied to the driver's
+# constants where the driver has one, so a coordinated doc+encoder edit still has
+# to face cardctl's model of the card.
+_RESPONSE_SIZES = {
+    "GET_INFO": 8,
+    "GET_PUBKEY": 33,
+    "GET_BALANCE": 4,
+    "GET_PROOF_COUNT": 1,
+    "GET_PROOF": cardctl.PROOF_SIZE,
+    "GET_SLOT_STATUS": cardctl.MAX_PROOFS,
+    "SPEND_PROOF": 64,
+    "SIGN_ARBITRARY": 64,
+    "LOAD_PROOF": 1,
+    "CLEAR_SPENT": 1,
+}
+
+
+def test_every_documented_command_is_driven_through_the_encoder():
+    """
+    The completeness ratchet for _WIRE_CASES. Without it, command #15 arrives
+    with a documented section, an INS constant, and not one byte of its header
+    ever compared against the wire — and the suite reports success.
+    """
+    driven = {name for name, _, _, _ in _WIRE_CASES}
+    documented = {name for name, _ in _command_headings()}
+    assert driven == documented, (
+        f"_WIRE_CASES does not drive {sorted(documented - driven)}"
+        + (f" and drives undocumented {sorted(driven - documented)}" if driven - documented else "")
+    )
+
+
+def test_every_command_with_a_fixed_length_is_length_checked():
+    """
+    The completeness ratchet for _LENGTH_CASES. This suite exists because
+    GET_PROOF was documented `Le 4D (77 bytes)`; a hand-maintained tuple with no
+    ratchet lets that exact bug back in on the next command added, with all
+    tests green. `test_every_ins_constant_is_documented` forces the *section* to
+    exist; nothing forced it to be length-checked.
+    """
+    covered = {name for name, _, _, _ in _LENGTH_CASES}
+    documented = {name for name, _ in _command_headings()}
+    assert not covered & _NOT_FIXED_LENGTH, (
+        f"{sorted(covered & _NOT_FIXED_LENGTH)} is both length-checked and excused from being "
+        "length-checked — drop it from _NOT_FIXED_LENGTH"
+    )
+    assert covered | _NOT_FIXED_LENGTH == documented, (
+        f"_LENGTH_CASES does not cover {sorted(documented - covered - _NOT_FIXED_LENGTH)}"
+    )
+
+
+def test_every_command_with_a_response_body_is_size_checked():
+    """The same ratchet for _RESPONSE_SIZES, which tracks _LENGTH_CASES."""
+    assert set(_RESPONSE_SIZES) == {name for name, _, _, _ in _LENGTH_CASES}, (
+        "_RESPONSE_SIZES and _LENGTH_CASES have drifted apart: "
+        f"{sorted(set(_RESPONSE_SIZES) ^ {name for name, _, _, _ in _LENGTH_CASES})}"
+    )
+
+
+def test_fixed_p1_and_p2_match_the_bytes_cardctl_sends():
+    """
+    P1 and P2 were never compared against the wire. Rewriting SPEND_PROOF's
+    `| P1 |` row to a literal `00` therefore passed: a reader author built from
+    that doc irreversibly spends slot 0 on every tap regardless of which proof
+    the terminal picked, and the same edit to GET_PROOF makes every read return
+    slot 0.
+    """
+    for name, method, args, response in _WIRE_CASES:
+        p1, p2, _, _ = _wire(method, *args, response=response)
+        for field, sent in (("P1", p1), ("P2", p2)):
+            if name in _SLOT_INDEXED and field == "P1":
+                continue  # covered by the slot-index test below
+            assert _param_byte(name, field) == sent, (
+                f"{name}: spec's {field} is {_param_byte(name, field):02X}, cardctl sends "
+                f"{sent:02X}"
+            )
+
+
+def test_slot_indexed_commands_document_and_send_p1_as_the_slot():
+    """The two commands that move money must take the slot from the caller."""
+    driven = {name for name, _, _, _ in _LENGTH_CASES}
+    assert _SLOT_INDEXED <= driven, (
+        f"_SLOT_INDEXED names commands that are not driven here: {sorted(_SLOT_INDEXED - driven)}"
+    )
+    for name, method, args, response in _LENGTH_CASES:
+        if name not in _SLOT_INDEXED:
+            continue
+        documented = _param_row(name, "P1")
+        assert "slot" in documented.lower(), (
+            f"{name}'s P1 row no longer describes a slot index: {documented!r} — a reader built "
+            "from that sends a fixed P1 to every card"
+        )
+        assert not re.fullmatch(r"`?[0-9A-Fa-f]{2}`?", documented), (
+            f"{name}'s P1 is documented as the literal byte {documented!r}, but it carries the "
+            "caller's slot index"
+        )
+        slot = 5
+        p1, p2, _, _ = _wire(method, slot, *args[1:], response=response)
+        assert p1 == slot, f"{name}: asked for slot {slot}, cardctl put {p1} in P1"
+        assert _param_byte(name, "P2") == p2, (
+            f"{name}: spec's P2 is {_param_byte(name, 'P2'):02X}, cardctl sends {p2:02X}"
+        )
+
+
+def test_lock_card_p2_is_the_confirmation_byte():
+    """
+    LOCK_CARD is irreversible and its only guard is the P2 confirmation byte.
+    Nothing tied the documented `DE` to cardctl.LOCK_CONFIRM_BYTE, so the two
+    could drift and a reader's lock would be rejected — or worse, a doc change
+    to a byte the card does not require would suggest the guard is arbitrary.
+    """
+    assert _param_byte("LOCK_CARD", "P2") == cardctl.LOCK_CONFIRM_BYTE, (
+        f"spec's LOCK_CARD P2 is {_param_byte('LOCK_CARD', 'P2'):02X}, "
+        f"cardctl.LOCK_CONFIRM_BYTE is {cardctl.LOCK_CONFIRM_BYTE:02X}"
+    )
+    card = make_card([(b"", 0x9000)])
+    card.lock_card()
+    assert card.connection.last == bytes([
+        cardctl.CLA, cardctl.INS_LOCK_CARD,
+        _param_byte("LOCK_CARD", "P1"), cardctl.LOCK_CONFIRM_BYTE,
+    ]), card.connection.last.hex()
+
+
+def _documented_response_sizes(name: str) -> list:
+    """
+    Every response-body size the section states, in order.
+
+    Two forms carry it: the `| Response |` row's leading `N-byte`/`N bytes`, and
+    the `**Response (N bytes):**` header above a field table. Sizes deeper in the
+    row are describing sub-fields ("R || s, 32 bytes each") and are handled
+    separately.
+    """
+    section = _section(name)
+    sizes = [int(n) for n in re.findall(r"\*\*Response \((\d+) bytes\)", section)]
+    row = re.search(r"^\| Response \| (.+?) \|$", section, re.M)
+    if row:
+        lead = re.match(r"(\d+)[- ]bytes?\b", row.group(1).strip())
+        assert lead, (
+            f"{name}'s Response row no longer opens with its size in bytes: {row.group(1)!r}"
+        )
+        sizes.append(int(lead.group(1)))
+    return sizes
+
+
+def test_every_documented_response_size_matches_the_driver():
+    """
+    Only Lc/Le were checked, so the response prose could say anything. Verified
+    by mutation, all green before this test: GET_PUBKEY's `33-byte compressed
+    public key` → `32-byte` (a reader reads a truncated key, sets the NUT-11
+    P2PK condition to a key nobody holds, and the funds are unspendable);
+    GET_SLOT_STATUS's `32 bytes: one status byte per slot` → `16 bytes` (slots
+    16–31 invisible, balance looks halved); GET_PROOF's `**Response (78
+    bytes):**` → `(77 bytes)`.
+    """
+    for name, expected in sorted(_RESPONSE_SIZES.items()):
+        sizes = _documented_response_sizes(name)
+        assert sizes, f"{name} documents no response size at all"
+        for size in sizes:
+            assert size == expected, (
+                f"{name}: spec advertises a {size}-byte response, the driver expects {expected}"
+            )
+
+        # `(R || s, 32 bytes each)` — a component size stated after the total has
+        # to multiply back out to it.
+        each = re.search(
+            r"\|\s*Response\s*\|[^|\n]*?\(([^)]*?)(\d+) bytes each\)",
+            _section(name),
+        )
+        if each:
+            parts = each.group(1).count(r"\|\|") + 1
+            assert parts * int(each.group(2)) == expected, (
+                f"{name}: {parts} components of {each.group(2)} bytes is "
+                f"{parts * int(each.group(2))}, but the response is {expected} bytes"
+            )
+
+
+def test_documented_le_matches_the_documented_response_size():
+    """
+    The two halves of every read command's contract. GET_INFO is excluded on
+    purpose: it documents `Le 00`, the ISO shorthand for "up to 256 bytes",
+    which is not its 8-byte response size.
+    """
+    for name, expected in sorted(_RESPONSE_SIZES.items()):
+        if name == "GET_INFO":
+            continue
+        assert _length_row(name, "Le") == expected, (
+            f"{name}: spec asks for Le {_length_row(name, 'Le'):02X} but advertises a "
+            f"{expected}-byte response"
+        )
+
 
 def test_every_documented_length_matches_the_bytes_cardctl_sends():
     """
@@ -386,7 +691,7 @@ def test_every_documented_length_matches_the_bytes_cardctl_sends():
     the redemption — the failure looks like a bad card, not a bad doc.
     """
     for name, method, args, response in _LENGTH_CASES:
-        sent_lc, sent_le = _wire(method, *args, response=response)
+        _, _, sent_lc, sent_le = _wire(method, *args, response=response)
         for field, sent in (("Lc", sent_lc), ("Le", sent_le)):
             documented = re.search(rf"^\| {field} \|", _section(name), re.M)
             assert bool(documented) == (sent is not None), (
