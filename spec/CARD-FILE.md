@@ -86,8 +86,16 @@ appears here with a version bump.
 | `keysetId` | string | yes | NUT-02 **v0** keyset id: 8 raw bytes, written as exactly 16 hex chars, first byte `00`. Eight chars is half an id and a proof carrying it matches no keyset at the mint; a non-`00` version byte is not a v0 id and is refused rather than guessed at. |
 | `amount` | integer | yes | Proof amount: a **positive power of two**, and `0 < amount < 2^32`. A mint keyset has no key for amount 3, so a non-power-of-two proof is rejected on redemption — after the slot is burned. The upper bound is the card's field width: `LOAD_PROOF` carries the amount as a 4-byte unsigned integer. |
 | `nonce` | string | yes | The 32-byte P2PK nonce, 64 hex chars. **Not** the NUT-10 secret string — a reader rebuilds that from the nonce plus `cardPubkey`. |
-| `C` | string | yes | The mint's 33-byte compressed signature point, 66 hex chars, `02`/`03` prefix. |
+| `C` | string | yes | The mint's 33-byte compressed signature point, 66 hex chars, `02`/`03` prefix, x-coordinate **on the secp256k1 curve**. A prefix check alone accepts ~half of all random x values, and an off-curve C is a proof nothing can ever spend — loaded anyway, it burns a slot. |
 | `spent` | boolean | yes | Whether the card has already marked this slot spent. |
+
+A reader MUST refuse a file carrying the same `nonce` twice or the same `C`
+twice (compared byte-wise after hex normalization). A nonce identifies one
+proof and `C` is the mint's signature over one proof, so a repeat is a
+corrupted or hand-merged file: loading it either double-burns slots on one
+proof or tells the operator a proof is safely on the card that was never
+written. Both implementations enforce this; a third written from this document
+must too.
 
 Hex is case-insensitive on read and lower-case on write, and prefixes are never
 written. Prefix *tolerance* is not part of the format — it is one-sided:

@@ -31,6 +31,7 @@ import sys
 import tempfile
 import types
 
+import bip340
 import cardctl
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -57,7 +58,15 @@ def _default_c(nonce) -> str:
         bare = nonce.lower()
         bare = bare[2:] if bare.startswith("0x") else bare
         if len(bare) == 64 and all(ch in "0123456789abcdef" for ch in bare):
-            return "02" + bare
+            # Walk to the nearest on-curve x. The validator checks curve
+            # membership — "02" + nonce alone is off-curve for about half of
+            # all nonces, which would fail every multi-slot doc before the
+            # behaviour under test was reached. Distinctness per nonce is
+            # preserved: the test nonces are far apart.
+            x = int(bare, 16)
+            while bip340.lift_x(x) is None:
+                x += 1
+            return "02" + f"{x:064x}"
     return C_POINT
 
 
@@ -466,6 +475,23 @@ def test_reports_which_slot_failed():
 
 def test_rejects_a_non_object_slot():
     _expect_exit(_doc(slots=["nope"]), "slot 0: expected an object")
+
+
+def test_rejects_an_off_curve_C():
+    """
+    The 02/03 prefix alone accepts ~half of all random x values. cashu-client
+    checks curve membership, so without this the two halves disagree about one
+    file — and load-file burns a slot on money nothing can ever spend.
+    """
+    d = _doc()
+    d["slots"][0]["C"] = "02" + "cd" * 32  # valid prefix, x not on the curve
+    _expect_exit(d, "not on the secp256k1 curve")
+    d["slots"][0]["C"] = "02" + "ff" * 32  # x >= p
+    _expect_exit(d, "not on the secp256k1 curve")
+
+
+def test_rejects_an_off_curve_card_pubkey():
+    _expect_exit(_doc(cardPubkey="02" + "cd" * 32), "not on the secp256k1 curve")
 
 
 def test_rejects_duplicate_nonces():

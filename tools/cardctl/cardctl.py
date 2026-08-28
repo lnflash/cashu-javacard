@@ -586,6 +586,12 @@ def _slot_from_json(entry, index: int) -> dict:
             f"{where}C must be a compressed secp256k1 point (02/03 prefix), "
             f"got 0x{c[0]:02x}"
         )
+    # The prefix alone accepts ~half of all random x values. cashu-client's
+    # parseCardFile checks curve membership too, so without this the two halves
+    # disagree about one file — and load-file would burn a slot on money nothing
+    # can ever spend. lift_x returns None for off-curve x and for x >= p.
+    if bip340.lift_x(int.from_bytes(c[1:], "big")) is None:
+        raise SystemExit(f"{where}C is not on the secp256k1 curve: {_hex(c)}")
 
     return {
         "keyset": keyset_id,
@@ -639,6 +645,10 @@ def validate_card_doc(doc) -> dict:
         raise SystemExit(
             f"card file cardPubkey must be a compressed secp256k1 point "
             f"(02/03 prefix), got 0x{card_pubkey[0]:02x}"
+        )
+    if bip340.lift_x(int.from_bytes(card_pubkey[1:], "big")) is None:
+        raise SystemExit(
+            f"card file cardPubkey is not on the secp256k1 curve: {_hex(card_pubkey)}"
         )
     slots = doc.get("slots")
     if not isinstance(slots, list):
