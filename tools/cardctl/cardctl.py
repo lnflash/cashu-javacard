@@ -60,6 +60,9 @@ INS_LOCK_CARD = 0x50
 LOCK_CONFIRM_BYTE = 0xDE
 
 PROOF_SIZE = 78
+# Slot count the applet allocates (CashuApplet.MAX_PROOFS). GET_SLOT_STATUS
+# returns one byte per slot, so this is also that command's Le.
+MAX_PROOFS = 32
 STATUS_NAMES = {0x00: "empty", 0x01: "unspent", 0x02: "spent"}
 
 # The card's amount field is a 4-byte unsigned integer (spec/APDU.md,
@@ -250,7 +253,7 @@ class Card:
         return self.send(INS_GET_PROOF_COUNT, le=0x01, context="GET_PROOF_COUNT")[0]
 
     def get_slot_status(self) -> bytes:
-        return self.send(INS_GET_SLOT_STATUS, le=0x20, context="GET_SLOT_STATUS")
+        return self.send(INS_GET_SLOT_STATUS, le=MAX_PROOFS, context="GET_SLOT_STATUS")
 
     def get_proof(self, slot: int) -> dict:
         b = self.send(INS_GET_PROOF, p1=slot, le=PROOF_SIZE, context=f"GET_PROOF slot {slot}")

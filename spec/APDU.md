@@ -20,6 +20,14 @@ Issued by reader before any other command. Standard ISO 7816-4 SELECT.
 | Data | `D2 76 00 00 85 01 02` |
 | Response | 2-byte applet version (`MM mm`) + `90 00` |
 
+The Data field above is the 7-byte **package** AID. ISO 7816-4 SELECT does
+prefix matching, so it also selects the applet instance. Readers that decline
+partial matches must retry with the full 8-byte **applet** AID
+`D2 76 00 00 85 01 02 01` (Lc `08`) — that is exactly what `cardctl` does: the
+7-byte form first, the 8-byte form as a fallback on any error. A reader that
+sends neither selects nothing, and every subsequent command fails in a way that
+looks like an uninstalled applet.
+
 ---
 
 ## Category 0x1x — Read (no authentication required)
