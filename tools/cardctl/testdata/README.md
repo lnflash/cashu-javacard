@@ -2,18 +2,18 @@
 
 ## `card-file-v1.json`
 
-A v1 card file. The body was produced by cashu-client's `serializeCardFile`
-rather than hand-authored, so it cannot drift into agreement with a wrong
-Python parser — that is the point of keeping it here.
+A v1 card file, regenerated through the `lnflash/cashu-client#5` toolchain and
+verified **accepted by that branch's `parseCardFile`** — parseCardFile-accepts,
+not serializeCardFile-wrote: `serializeCardFile` refuses `spent: true` by
+design (that direction ends at LOAD_PROOF, which has no spent bit), so no
+serializer on either side can emit a full dump with a spent slot. Full dumps
+with spent slots are `cardctl dump`'s side of the format.
 
-The `spent` field was added by hand when the v1 schema gained it (see
-`spec/CARD-FILE.md`), because cashu-client does not emit it yet. That is not a
-cosmetic gap: `lnflash/cashu-client#5` rejects any slot key outside
-`keysetId, amount, nonce, C`, so the two halves currently refuse each other's
-files in both directions. **Regenerate this file from `serializeCardFile` as
-part of the paired change that adds `spent` on the TypeScript side** — the two
-must merge together, and this fixture goes back to being entirely
-TypeScript-written output when they do.
+Keeping the fixture TypeScript-verified is the point of keeping it here: it
+cannot drift into agreement with a wrong Python parser. Note that agreement is
+with the #5 branch, not `main` — until #5 lands, `main`'s `parseCardFile`
+still rejects `spent`, which is why the two PRs must merge together (see the
+status note in `spec/CARD-FILE.md`).
 
 A fixture only ever proves that one file parsed once. The contract both
 implementations are held to is `spec/CARD-FILE.md`, which

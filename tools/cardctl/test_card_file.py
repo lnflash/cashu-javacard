@@ -269,6 +269,13 @@ def test_rejects_a_missing_file():
     _expect_exit("/nonexistent/card-file.json", "no such card file")
 
 
+def test_rejects_an_unreadable_path_without_a_traceback():
+    """`load-file /some/dir` must get the same clean SystemExit every other
+    bad input gets — not a raw IsADirectoryError traceback."""
+    with tempfile.TemporaryDirectory() as d:
+        _expect_exit(d, "cannot read card file")
+
+
 def test_rejects_invalid_json():
     fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
     fh.write("{ not json")

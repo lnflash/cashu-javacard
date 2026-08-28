@@ -475,7 +475,26 @@ def cmd_load(args) -> int:
     keyset = parse_keyset_id(args.keyset)
     validate_slot_amount(args.amount)
     nonce = parse_hex(args.nonce, 32, "nonce") if args.nonce else secrets.token_bytes(32)
-    c = parse_hex(args.c, 33, "C") if args.c else b"\x02" + secrets.token_bytes(32)
+    if args.c:
+        # An explicit --c is claimed to be a real mint signature, so it gets the
+        # same check the file path (`_slot_from_json`) runs: a C that is not a
+        # compressed on-curve point is an unspendable proof, and LOAD_PROOF has
+        # no undo — a typo here burns a slot on money nothing can spend, and
+        # `dump` then refuses the whole card. The two entry points to
+        # LOAD_PROOF must agree about what a valid C is.
+        c = parse_hex(args.c, 33, "C")
+        if c[0] not in (0x02, 0x03):
+            raise SystemExit(
+                f"--c must be a compressed secp256k1 point (02/03 prefix), "
+                f"got 0x{c[0]:02x}"
+            )
+        if bip340.lift_x(int.from_bytes(c[1:], "big")) is None:
+            raise SystemExit(f"--c is not on the secp256k1 curve: {_hex(c)}")
+    else:
+        # The random placeholder is deliberately exempt — it is documented as
+        # "not a real mint signature" and exists for storage testing, where an
+        # off-curve x is fine because nothing will ever try to spend it.
+        c = b"\x02" + secrets.token_bytes(32)
     card = connect(args)
     if args.pin:
         card.verify_pin(args.pin.encode())
@@ -699,6 +718,10 @@ def read_card_file(path: str) -> dict:
             doc = json.load(fh)
     except FileNotFoundError:
         raise SystemExit(f"no such card file: {path}")
+    except OSError as exc:
+        # A directory, a permission problem, or any other unreadable path gets
+        # the same clean exit a missing file does — not a raw traceback.
+        raise SystemExit(f"cannot read card file {path}: {exc}")
     except json.JSONDecodeError as exc:
         raise SystemExit(f"{path} is not valid JSON: {exc}")
 

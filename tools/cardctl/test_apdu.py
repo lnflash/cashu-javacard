@@ -276,6 +276,33 @@ def test_cmd_load_puts_the_raw_16_char_keyset_id_on_the_wire():
     assert int.from_bytes(sent[13:17], "big") == 16, sent[13:17].hex()
 
 
+def test_cmd_load_accepts_an_on_curve_explicit_c_and_keeps_the_placeholder():
+    """The curve check on --c must not break either legitimate path.
+
+    An explicit on-curve C (a real mint signature) must reach the wire
+    unchanged, and the no---c placeholder workflow documented for storage
+    testing must survive — the placeholder is random and deliberately exempt
+    from the curve check, because nothing will ever try to spend it.
+    """
+    on_curve = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    card = make_card([(b"\x03", 0x9000)])
+    args = cardctl.build_parser().parse_args(
+        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "16",
+         "--c", on_curve]
+    )
+    with stubbed_connect(card):
+        assert args.func(args) == 0
+    assert card.connection.last[5 + 44:5 + 77] == bytes.fromhex(on_curve), \
+        card.connection.last.hex()
+
+    card = make_card([(b"\x03", 0x9000)])
+    args = cardctl.build_parser().parse_args(
+        ["load", "--keyset", "0059534ce0bfa19a", "--amount", "16"]
+    )
+    with stubbed_connect(card):
+        assert args.func(args) == 0, "placeholder default must still load"
+
+
 def test_cmd_load_rejects_a_half_length_keyset_id():
     card = make_card([(b"\x03", 0x9000)])
     args = cardctl.build_parser().parse_args(
@@ -311,6 +338,14 @@ def test_cmd_load_validates_arguments_before_opening_the_reader():
         # ...and a C that is 32 bytes instead of the compressed-point 33
         ["--keyset", "0059534ce0bfa19a", "--amount", "16", "--pin", "4321",
          "--c", "00" * 32],
+        # ...and a 33-byte C with a bad prefix, and one whose x is not on the
+        # curve. The file path (`_slot_from_json`) refuses both; an explicit
+        # --c must be held to the same rule, or a typo burns a slot on money
+        # nothing can spend and `dump` then refuses the whole card.
+        ["--keyset", "0059534ce0bfa19a", "--amount", "16", "--pin", "4321",
+         "--c", "05" + "cd" * 32],
+        ["--keyset", "0059534ce0bfa19a", "--amount", "16", "--pin", "4321",
+         "--c", "02" + "cd" * 32],
         # ...and the three amounts the card's 4-byte field or a mint keyset
         # cannot represent. These used to reach the card: 2**32 died on a bare
         # OverflowError out of load_proof, and 0 burned a slot on a worthless
