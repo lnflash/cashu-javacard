@@ -10,10 +10,14 @@ the published document, the same way test_spec_consistency.py parses APDU.md,
 because a shared constant cannot catch a doc that lies and the doc is what the
 other implementation is written from.
 
-`testdata/card-file-v1.json` backs that up with bytes cashu-client's
-`serializeCardFile` actually wrote, so the Python parser is also checked against
-a real artifact rather than only against prose. A fixture proves one file parsed
-once; the spec is the contract.
+`testdata/card-file-v1.json` backs that up with a full-dump-shaped file
+verified accepted by cashu-client#5's `parseCardFile`, so the Python parser is
+also checked against a file the TypeScript side accepts rather than only
+against prose. That is the guarantee — parseCardFile-accepts, not
+serializeCardFile-wrote: `serializeCardFile` refuses `spent: true` by design
+(that direction ends at LOAD_PROOF, which has no spent bit), so no serializer
+on either side can emit a full dump with a spent slot. A fixture proves one
+file parsed once; the spec is the contract.
 
 Runs with no card, no reader and no pyscard.
 """
@@ -36,6 +40,25 @@ SPEC = HERE.parents[1] / "spec" / "CARD-FILE.md"
 CARD_PUBKEY = "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da"
 OTHER_PUBKEY = "02" + "11" * 32
 C_POINT = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+# A second, distinct point: the validator refuses two slots sharing a C, so a
+# fake card with two occupied slots needs one signature per proof — like a
+# real card would have.
+C_POINT2 = "02734c02e8a47a9025dfc2bd447331502c8152175e188113b458c1e1ef92692798"
+
+
+def _default_c(nonce) -> str:
+    """
+    A default C distinct per nonce. C is the mint's signature over one proof,
+    so the validator refuses a repeated C the same way it refuses a repeated
+    nonce — a single shared default would make every multi-slot doc invalid
+    before the behaviour under test was ever reached.
+    """
+    if isinstance(nonce, str):
+        bare = nonce.lower()
+        bare = bare[2:] if bare.startswith("0x") else bare
+        if len(bare) == 64 and all(ch in "0123456789abcdef" for ch in bare):
+            return "02" + bare
+    return C_POINT
 
 
 def _slot(**over) -> dict:
@@ -43,10 +66,10 @@ def _slot(**over) -> dict:
         "keysetId": "0059534ce0bfa19a",
         "amount": 8,
         "nonce": "ab" * 32,
-        "C": C_POINT,
         "spent": False,
     }
     base.update(over)
+    base.setdefault("C", _default_c(base["nonce"]))
     return base
 
 
@@ -139,7 +162,7 @@ def test_dump_emits_exactly_the_slot_fields_the_spec_publishes():
 
 
 def test_fixture_matches_the_published_schema():
-    """The fixture is a real cashu-client artifact; it must satisfy the spec too."""
+    """The fixture is verified against parseCardFile; it must satisfy the spec too."""
     fields = _spec_fields("Document")
     required = {n for n, (_, req) in fields.items() if req == "yes"}
     raw = json.loads(FIXTURE.read_text())
@@ -150,8 +173,15 @@ def test_fixture_matches_the_published_schema():
 
 # ── the cross-toolchain check ────────────────────────────────────────────────
 
-def test_reads_a_file_written_by_cashu_client():
-    """The fixture was produced by serializeCardFile, not by hand."""
+def test_reads_a_file_the_typescript_side_accepts():
+    """
+    The fixture is a full-dump-shaped file built with cashu-client#5's
+    toolchain and verified accepted by that branch's `parseCardFile`. It was
+    NOT produced by `serializeCardFile` — it cannot have been: slot 2 is
+    `spent: true`, and serializeCardFile refuses spent slots by design because
+    that direction ends at LOAD_PROOF, which has no spent bit. The guarantee
+    this test rides on is parseCardFile-accepts, not serializeCardFile-wrote.
+    """
     assert FIXTURE.exists(), f"missing fixture {FIXTURE}"
     doc = cardctl.read_card_file(str(FIXTURE))
 
@@ -249,7 +279,14 @@ def test_rejects_an_unknown_version():
     # TypeScript's `!== 1` refuses. The two halves must refuse the same bytes.
     _expect_exit(_doc(version=True), "unsupported card file version")
     _expect_exit(_doc(version="1"), "unsupported card file version")
-    _expect_exit(_doc(version=1.0), "unsupported card file version")
+    # ...and accept the same bytes: JSON has one number type, so `"version": 1.0`
+    # reaches JSON.parse as the number 1 and TypeScript's `!== 1` accepts it.
+    # Python preserves the float; refusing it here would be the same drift in
+    # the opposite direction. Integral floats collapse to their integer value.
+    assert cardctl.read_card_file(_write(_doc(version=1.0)))["slots"]
+    # A non-integral or wrong-valued float stays refused — on both sides.
+    _expect_exit(_doc(version=1.5), "unsupported card file version")
+    _expect_exit(_doc(version=2.0), "unsupported card file version")
 
 
 def test_rejects_missing_mint_or_unit():
@@ -455,16 +492,43 @@ def test_rejects_duplicate_nonces_even_across_case_and_prefix():
     _expect_exit(d, "duplicate nonce")
 
 
+def test_rejects_duplicate_C_even_with_distinct_nonces():
+    """
+    C is the mint's signature over one proof; a repeat is never a coincidence.
+    cashu-client's parseCardFile dedupes nonce AND C in the same pass — deduping
+    only the nonce here let a file with two slots sharing a C slip through this
+    half and be refused wholesale by the other: load-file burned a slot the
+    mint rejects, and a dump of such a card passed this validator while the
+    redeeming side's parseCardFile refused the whole file.
+    """
+    d = _doc(slots=[_slot(nonce="ab" * 32, C=C_POINT),
+                    _slot(amount=16, nonce="cd" * 32, C=C_POINT)])
+    _expect_exit(d, "slot 1: duplicate C " + C_POINT)
+    _expect_exit(d, "C is the mint's signature over one proof")
+    # The message points at both claimants, not just the second one.
+    _expect_exit(d, "also in slot 0")
+    # Distinct C stays accepted — this is a duplicate check, not a rename.
+    d = _doc(slots=[_slot(nonce="ab" * 32), _slot(amount=16, nonce="cd" * 32)])
+    assert len(cardctl.read_card_file(_write(d))["slots"]) == 2
+
+
+def test_rejects_duplicate_C_even_across_case_and_prefix():
+    """The same 33 bytes are the same signature however the file spells them."""
+    d = _doc(slots=[_slot(nonce="ab" * 32, C=C_POINT),
+                    _slot(amount=16, nonce="cd" * 32, C="0x" + C_POINT.upper())])
+    _expect_exit(d, "duplicate C")
+
+
 # ── dump writes what read accepts ────────────────────────────────────────────
 
 class _DumpCard:
     """
     Enough of Card for cmd_dump: two slots, one unspent, one spent.
 
-    The nonces are distinct because a nonce identifies one proof and the
-    validator refuses a file carrying the same one twice — a fake sharing a
-    nonce across slots models a card state the tool itself rejects, the same
-    way the fixture's slots had to stop sharing a C point.
+    The nonces and C points are both distinct because each identifies one
+    proof and the validator refuses a file carrying either twice — a fake
+    sharing a nonce or a C across slots models a card state the tool itself
+    rejects, the same way the fixture's slots had to stop sharing a C point.
     """
 
     def __init__(self):
@@ -472,7 +536,7 @@ class _DumpCard:
             {"keyset_id": "0059534ce0bfa19a", "amount": 8, "nonce": bytes(range(32)),
              "c": bytes.fromhex(C_POINT), "status": "unspent"},
             {"keyset_id": "008288762774ace1", "amount": 16, "nonce": bytes(range(32, 64)),
-             "c": bytes.fromhex(C_POINT), "status": "spent"},
+             "c": bytes.fromhex(C_POINT2), "status": "spent"},
         ]
 
     def get_pubkey(self):
@@ -834,9 +898,9 @@ def test_load_file_sends_every_proof_in_file_order():
 
     assert card.loaded == [
         (bytes.fromhex("0059534ce0bfa19a"), 8, bytes.fromhex("ab" * 32),
-         bytes.fromhex(C_POINT)),
+         bytes.fromhex(_default_c("ab" * 32))),
         (bytes.fromhex("008288762774ace1"), 16, bytes.fromhex("cd" * 32),
-         bytes.fromhex(C_POINT)),
+         bytes.fromhex(_default_c("cd" * 32))),
     ]
     assert "loaded 2 proof(s), 24 sat total" in printed
 

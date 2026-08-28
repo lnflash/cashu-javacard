@@ -610,6 +610,13 @@ def validate_card_doc(doc) -> dict:
     if not isinstance(doc, dict):
         raise SystemExit("card file must be a JSON object")
     version = doc.get("version")
+    # JSON has one number type: JSON.parse turns `1.0` into the number 1, so
+    # cashu-client's `!== 1` accepts those bytes and refusing them here would
+    # be the two halves disagreeing about one file — the same drift, in the
+    # other direction. Integral floats collapse to their integer value; a
+    # non-integral version (1.5) stays refused, on both sides.
+    if isinstance(version, float) and version.is_integer():
+        version = int(version)
     # The bool guard matters: True == 1 in Python, so `!= CARD_FILE_VERSION`
     # alone accepts `"version": true` — a file TypeScript's `!== 1` refuses.
     # Two halves disagreeing about one file is the drift this format exists to
@@ -638,12 +645,17 @@ def validate_card_doc(doc) -> dict:
         raise SystemExit("card file slots must be an array")
     parsed_slots = [_slot_from_json(e, i) for i, e in enumerate(slots)]
 
-    # A nonce identifies one proof. A file carrying the same nonce twice — a
-    # hand-merge of two dumps, a corrupted file — would make cmd_load_file write
-    # the first and report the second as "already loaded, skipping": the
-    # operator is told a proof is safely on the card that was never written.
-    # cashu-client's parser refuses duplicates for the same reason.
+    # A nonce identifies one proof, and C is the mint's signature over one
+    # proof. A file carrying either twice — a hand-merge of two dumps, a
+    # corrupted file — would make cmd_load_file write the first and report the
+    # second as "already loaded, skipping" (nonce) or burn a slot on a proof
+    # the mint rejects as already spent (C): the operator is told a proof is
+    # safely on the card that was never written, or loses the slot outright.
+    # cashu-client's parseCardFile refuses both kinds in the same pass
+    # (seenNonce and seenC); refusing only one here would let the two halves
+    # disagree about one file — the drift this format exists to prevent.
     seen = {}
+    seen_c = {}
     for i, slot in enumerate(parsed_slots):
         nonce = slot["nonce"]
         if nonce in seen:
@@ -653,6 +665,14 @@ def validate_card_doc(doc) -> dict:
                 f"claims two"
             )
         seen[nonce] = i
+        c = slot["c"]
+        if c in seen_c:
+            raise SystemExit(
+                f"slot {i}: duplicate C {_hex(c)} (also in slot {seen_c[c]}) "
+                f"— C is the mint's signature over one proof; a repeat is "
+                f"never a coincidence"
+            )
+        seen_c[c] = i
 
     return {
         "mint": doc["mint"],

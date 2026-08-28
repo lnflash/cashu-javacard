@@ -89,11 +89,14 @@ appears here with a version bump.
 | `C` | string | yes | The mint's 33-byte compressed signature point, 66 hex chars, `02`/`03` prefix. |
 | `spent` | boolean | yes | Whether the card has already marked this slot spent. |
 
-Hex is case-insensitive on read and lower-case on write. `0x` prefixes are
-tolerated on read — in either case, `0x` or `0X`, because the prefix is hex too
-— and never written. Both claims are asserted by `test_card_file.py`
-(`test_normalises_hex_case`, `test_tolerates_0x_prefixes_in_any_case`) rather
-than trusted.
+Hex is case-insensitive on read and lower-case on write, and prefixes are never
+written. Prefix *tolerance* is not part of the format — it is one-sided:
+`cardctl`'s reader strips a `0x`/`0X` prefix, but cashu-client's `requireHex`
+requires bare hex (`/^[0-9a-f]+$/` after lowercasing), so a hand-authored
+prefixed file is accepted by the Python half and refused by the TypeScript
+half. **Never write prefixes.** The case claim and cardctl's prefix tolerance
+are asserted by `test_card_file.py` (`test_normalises_hex_case`,
+`test_tolerates_0x_prefixes_in_any_case`) rather than trusted.
 
 ### Why `spent` is required and not defaulted
 
@@ -120,6 +123,12 @@ operator money that is gone is safely present.
 renamed, or has its meaning changed. There is no minor version and no
 forward-compatibility window: a reader accepts the versions it knows and
 refuses the rest by number.
+
+JSON has one number type, so `"version": 1.0` reaches a JavaScript reader as
+the number 1 — `JSON.parse` cannot preserve the distinction. Readers therefore
+treat an integral float as its integer value (cardctl collapses `1.0` to `1`
+explicitly; cashu-client gets this from `JSON.parse` for free). A non-integral
+version (`1.5`) is refused by both halves. Writers emit a bare integer.
 
 Additive-looking changes still require a bump, because "field absent" and
 "field present and false" are different claims about money — see above.
