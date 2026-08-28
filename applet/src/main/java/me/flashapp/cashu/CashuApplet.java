@@ -67,7 +67,10 @@ public class CashuApplet extends Applet {
     static final short PROOF_STATUS_OFFSET = (short) 0;
     static final short PROOF_KEYSET_OFFSET = (short) 1;
     static final short PROOF_AMOUNT_OFFSET = (short) 9;
-    static final short PROOF_SECRET_OFFSET = (short) 13;
+    // The 32 bytes are the P2PK *nonce*, not the secret: a NUT-10 P2PK secret
+    // is a JSON string of ~150 bytes and cannot fit. The reader rebuilds the
+    // secret from this nonce plus GET_PUBKEY. See spec/NUT-XX.md.
+    static final short PROOF_NONCE_OFFSET  = (short) 13;
     static final short PROOF_C_OFFSET      = (short) 45;
 
     static final short PROOF_DATA_LEN      = (short) 77;  // PROOF_SIZE - 1 (no status byte on input)
