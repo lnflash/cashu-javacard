@@ -778,7 +778,9 @@ def test_load_proof_documents_the_fields_in_the_order_it_sends_them():
 def test_load_proof_sends_each_field_where_the_spec_says_it_goes():
     """The documented order, driven through the real encoder byte for byte."""
     keyset = b"\x01" * 8
-    amount = 1234
+    # A power of two: load_proof enforces valid denominations since #19,
+    # and 1024's big-endian bytes (00 00 04 00) are still position-distinct.
+    amount = 1024
     nonce = bytes(range(32))
     c = b"\x02" + bytes(range(1, 33))
     values = {
