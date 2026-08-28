@@ -377,6 +377,19 @@ def test_spend_proof_message_matches_nut_xx():
         "the bespoke recipient_pubkey message construction is back in APDU.md"
     )
 
+    # The `| Data |` row specifically, not just the section. The prose note
+    # below the table carries a second copy of the construction, so with only
+    # section-wide checks the row a reader author actually copies could be
+    # rewritten to any wrong message that avoids the word `recipient_pubkey` —
+    # and on this command that is unrecoverable: the slot is marked spent
+    # before the signature comes back, the mint rejects the redemption, and no
+    # error appears anywhere on the card side.
+    data = re.search(r"^\| Data \| (.+?) \|$", section, re.M)
+    assert data, "SPEND_PROOF has no parsable Data row"
+    assert "SHA-256(UTF8(Proof.secret))" in data.group(1), (
+        f"SPEND_PROOF's Data row no longer states the NUT-XX message: {data.group(1)!r}"
+    )
+
     # Unconditional on purpose. NUT-XX is a placeholder name, so the file gets
     # renamed the day the NUT is numbered — and a `if NUT_XX_MD.exists():`
     # guard turned that rename into a silent pass, with APDU.md's link left
@@ -466,17 +479,24 @@ _LENGTH_CASES = (
     ("CLEAR_SPENT", "clear_spent", (), b"\x00"),
 )
 
-# The commands deliberately absent from _LENGTH_CASES, and why — this set is the
-# only sanctioned way out of the completeness ratchet below, so the reason has to
-# live here rather than in a comment nobody re-reads:
+# Commands whose Lc is a documented *range* rather than a single byte:
+# VERIFY_PIN and SET_PIN document `Lc | 04–08`. There is no single sent byte to
+# compare, but the endpoints are directly comparable to the applet's
+# PIN_MIN_LEN/PIN_MAX_LEN — see test_pin_length_ranges_match_the_applet.
+_RANGE_LENGTH = {"VERIFY_PIN", "SET_PIN"}
+
+# The commands deliberately absent from both _LENGTH_CASES and _RANGE_LENGTH,
+# and why — these sets are the only sanctioned way out of the completeness
+# ratchet below, so the reason has to live here rather than in a comment nobody
+# re-reads:
 #
-#   * VERIFY_PIN / SET_PIN document `Lc | 04–08` and CHANGE_PIN documents
-#     `Lc | Variable`, because a PIN is 4–8 bytes. There is no single documented
-#     number to compare a sent byte against; test_apdu.py pins those encodings.
+#   * CHANGE_PIN documents `Lc | Variable` — old PIN length prefix + two PINs
+#     of 4–8 bytes each, so even its endpoints are not a single pair.
+#     test_apdu.py pins its encoding against the driver.
 #   * LOCK_CARD is a bare 4-byte APDU — it carries no data and expects no
 #     response body, so it documents neither Lc nor Le. Its P2 is the
 #     confirmation byte, checked in test_lock_card_p2_is_the_confirmation_byte.
-_NOT_FIXED_LENGTH = {"VERIFY_PIN", "SET_PIN", "CHANGE_PIN", "LOCK_CARD"}
+_NOT_FIXED_LENGTH = {"CHANGE_PIN", "LOCK_CARD"}
 
 # Every documented command, driven through the real encoder. The four above are
 # absent from _LENGTH_CASES but their headers are still checked, so they are
@@ -535,12 +555,13 @@ def test_every_command_with_a_fixed_length_is_length_checked():
     """
     covered = {name for name, _, _, _ in _LENGTH_CASES}
     documented = {name for name, _ in _command_headings()}
-    assert not covered & _NOT_FIXED_LENGTH, (
-        f"{sorted(covered & _NOT_FIXED_LENGTH)} is both length-checked and excused from being "
-        "length-checked — drop it from _NOT_FIXED_LENGTH"
+    excused = _NOT_FIXED_LENGTH | _RANGE_LENGTH
+    assert not covered & excused, (
+        f"{sorted(covered & excused)} is both length-checked and excused from being "
+        "length-checked — drop it from _NOT_FIXED_LENGTH/_RANGE_LENGTH"
     )
-    assert covered | _NOT_FIXED_LENGTH == documented, (
-        f"_LENGTH_CASES does not cover {sorted(documented - covered - _NOT_FIXED_LENGTH)}"
+    assert covered | excused == documented, (
+        f"_LENGTH_CASES does not cover {sorted(documented - covered - excused)}"
     )
 
 
@@ -729,6 +750,19 @@ def test_load_proof_documents_the_fields_in_the_order_it_sends_them():
     every proof loaded through it is unspendable — money stranded on the card
     with no error anywhere.
     """
+    # The row's own wording, before its structure. This is the third copy of
+    # the keyset description in APDU.md — the two proof layouts are guarded by
+    # _assert_field_wording, but this row was only parsed for field order, so
+    # `(raw)` could become `(ascii)` with every test green. That is historical
+    # bug #1 verbatim, in the table of the command that writes EEPROM.
+    row = re.search(r"^\| Data \| (.+?) \|$", _section("LOAD_PROOF"), re.M).group(1).lower()
+    assert "raw" in row, (
+        f"LOAD_PROOF's Data row no longer says the keyset id is raw: {row!r}"
+    )
+    assert "ascii" not in row, (
+        f"LOAD_PROOF's Data row describes ASCII encoding again — that stores half an id: {row!r}"
+    )
+
     layout = _proof_layout()
     # The status byte is read-only state, never sent on load.
     expected = [
@@ -827,6 +861,129 @@ def test_applet_layout_constants_match_the_spec_and_the_driver():
         assert consts[const] == offset, (
             f"spec puts {const[6:-7].lower()} at offset {offset}, applet {const} is "
             f"{consts[const]}"
+        )
+
+
+def test_get_info_response_table_matches_the_decoder():
+    """
+    GET_INFO's response table is the only documented decoder layout that had no
+    check, while get_info() hardcodes every offset. Three green mutations
+    before this test: swapping the unspent/spent rows (a POS shows spent proofs
+    as spendable), relabelling offset 2 as the PIN state (a reader enumerates
+    0-2 slots and misses 29 proofs), and swapping capability bits 0 and 1 (a
+    reader concludes the card cannot sign Schnorr and refuses to spend).
+    """
+    section = _section("GET_INFO")
+    rows = re.findall(r"^\| (\d+) \| (\d+) \| (.+?) \|$", section, re.M)
+    assert rows, "could not parse GET_INFO's response table"
+    layout = {int(off): (int(ln), desc) for off, ln, desc in rows}
+
+    # The table must tile the documented response exactly: contiguous one-byte
+    # fields covering all 8 bytes, so a row added or dropped fails before the
+    # per-field checks do.
+    assert sorted(layout) == list(range(_RESPONSE_SIZES["GET_INFO"])), (
+        f"GET_INFO's table offsets are {sorted(layout)}, expected 0..7"
+    )
+    assert all(ln == 1 for ln, _ in layout.values()), "GET_INFO fields are all single bytes"
+
+    # Every byte distinguishable, driven through the real decoder.
+    info = make_card([(bytes([9, 8, 7, 6, 5, 4, 0x01, 1]), 0x9000)]).get_info()
+    assert info["version"] == "9.8"
+    assert info["max_slots"] == 7
+    assert info["unspent"] == 6
+    assert info["spent"] == 5
+    assert info["empty"] == 4
+    assert info["secp256k1_native"] is True
+    assert info["schnorr"] is False
+    assert info["pin_state"] == "set"
+
+    # Each documented description must name the field the decoder reads there.
+    keywords = {
+        0: "major", 1: "minor", 2: "max", 3: "unspent", 4: "spent",
+        5: "empty", 6: "capabilit", 7: "pin",
+    }
+    for off, (_, desc) in sorted(layout.items()):
+        assert keywords[off] in desc.lower(), (
+            f"GET_INFO offset {off} is described as {desc!r}, expected it to mention "
+            f"{keywords[off]!r}"
+        )
+    # Offset 3 is unspent, not spent — "unspent" contains "spent", so pin the
+    # distinction both ways round.
+    assert "unspent" in layout[3][1].lower() and "unspent" not in layout[4][1].lower()
+
+    bits = re.findall(r"^\| (\d)(?:–\d)? \| (.+?) \|$", section.split("**Capabilities flags")[1], re.M)
+    bit_desc = {int(b): d.lower() for b, d in bits}
+    assert "secp256k1" in bit_desc.get(0, ""), (
+        f"capability bit 0 no longer names secp256k1: {bit_desc.get(0)!r}"
+    )
+    assert "schnorr" in bit_desc.get(1, ""), (
+        f"capability bit 1 no longer names Schnorr: {bit_desc.get(1)!r}"
+    )
+
+
+def _applet_ins() -> dict:
+    """Scrape the applet's INS_* dispatch bytes — the values the card acts on."""
+    ins = {
+        n: int(v, 16) for n, v in
+        re.findall(
+            r"static final byte (INS_\w+)\s*=\s*\(byte\)\s*0x([0-9A-Fa-f]{2})",
+            APPLET_JAVA.read_text(encoding="utf-8"),
+        )
+    }
+    assert ins, f"could not scrape INS constants from {APPLET_JAVA.name}"
+    return ins
+
+
+def test_applet_opcodes_match_the_spec_and_the_driver():
+    """
+    The applet's opcode table decides which handler runs, and nothing compared
+    it to anything. SPEND_PROOF (0x20) and SIGN_ARBITRARY (0x21) have
+    byte-identical wire shapes — Lc 20, 32-byte data, Le 40, 64-byte response —
+    so transposing those two constants in the applet passes every suite in the
+    repo while a terminal sending SPEND_PROOF gets a valid signature back and
+    the proof is never marked spent: a silent double-spend on a bearer card.
+    """
+    applet = _applet_ins()
+    for name, hex_value in _command_headings():
+        const = f"INS_{name}"
+        assert const in applet, f"{APPLET_JAVA.name} has no {const}"
+        documented = int(hex_value, 16)
+        assert applet[const] == documented == getattr(cardctl, const), (
+            f"{name}: spec 0x{documented:02X}, applet 0x{applet[const]:02X}, "
+            f"cardctl 0x{getattr(cardctl, const):02X}"
+        )
+    # The reverse: an opcode only the applet knows about is an undocumented
+    # command on firmware holding bearer money.
+    assert set(applet) == {f"INS_{n}" for n, _ in _command_headings()}, (
+        f"applet implements opcodes the spec does not document: "
+        f"{sorted(set(applet) - {f'INS_{n}' for n, _ in _command_headings()})}"
+    )
+
+
+def test_pin_length_ranges_match_the_applet():
+    """
+    VERIFY_PIN and SET_PIN document `Lc | 04–08`, and the applet enforces
+    PIN_MIN_LEN/PIN_MAX_LEN. Documenting `04–16` was green before this test: a
+    personalization tool built from the doc sets a 12-byte PIN, SET_PIN
+    returns 6700, and the card ships unpersonalized — loud, but loud at
+    manufacturing time, on a batch.
+    """
+    src = APPLET_JAVA.read_text(encoding="utf-8")
+    limits = {
+        n: int(v) for n, v in
+        re.findall(r"static final short (PIN_MIN_LEN|PIN_MAX_LEN)\s*=\s*\(short\)\s*(\d+)", src)
+    }
+    assert set(limits) == {"PIN_MIN_LEN", "PIN_MAX_LEN"}, (
+        f"could not scrape PIN limits from {APPLET_JAVA.name}: {limits}"
+    )
+
+    for name in sorted(_RANGE_LENGTH):
+        m = re.search(r"^\| Lc \| (\d+)[–-](\d+) \|$", _section(name), re.M)
+        assert m, f"{name} no longer documents its Lc as a range"
+        low, high = int(m.group(1)), int(m.group(2))
+        assert (low, high) == (limits["PIN_MIN_LEN"], limits["PIN_MAX_LEN"]), (
+            f"{name} documents Lc {low:02d}–{high:02d}, applet enforces "
+            f"{limits['PIN_MIN_LEN']}–{limits['PIN_MAX_LEN']}"
         )
 
 
