@@ -157,7 +157,10 @@ def test_reads_a_file_written_by_cashu_client():
 
     assert doc["mint"] == "https://forge.flashapp.me"
     assert doc["unit"] == "sat"
-    assert cardctl._hex(doc["card_pubkey"]) == CARD_PUBKEY
+    # Against the fixture's own field, not a constant: regenerating the fixture
+    # must never require editing this test, or the two drift and the "real
+    # artifact" guarantee quietly becomes "a constant someone kept in sync".
+    assert cardctl._hex(doc["card_pubkey"]) == json.loads(FIXTURE.read_text())["cardPubkey"]
     assert [s["amount"] for s in doc["slots"]] == [8, 16]
     assert [s["spent"] for s in doc["slots"]] == [False, True]
     # Keyset ids survive as 8 RAW bytes — the ASCII bug's blast radius.

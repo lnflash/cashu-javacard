@@ -2,20 +2,20 @@
   "version": 1,
   "mint": "https://forge.flashapp.me",
   "unit": "sat",
-  "cardPubkey": "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da",
+  "cardPubkey": "03df156e6d6b4fcd1c3750852fd177076f917e3ed8e3e48812acd516ca01d13bb8",
   "slots": [
     {
       "keysetId": "0059534ce0bfa19a",
       "amount": 8,
       "nonce": "abababababababababababababababababababababababababababababababab",
-      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "C": "0255296e80387c909f364d6ed32df4b28479d26d62c9762100d05c73796cc9d843",
       "spent": false
     },
     {
       "keysetId": "0059534ce0bfa19a",
       "amount": 16,
       "nonce": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "C": "02734c02e8a47a9025dfc2bd447331502c8152175e188113b458c1e1ef92692798",
       "spent": true
     }
   ]
