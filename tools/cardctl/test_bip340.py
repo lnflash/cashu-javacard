@@ -55,8 +55,9 @@ VECTORS = [
 
 def test_canonical_vectors():
     for pk, msg, sig in VECTORS:
-        assert bip340.verify(bytes.fromhex(pk), bytes.fromhex(msg), bytes.fromhex(sig)), \
-            f"canonical vector failed: pk={pk[:16]}…"
+        assert bip340.verify(
+            bytes.fromhex(pk), bytes.fromhex(msg), bytes.fromhex(sig)
+        ), f"canonical vector failed: pk={pk[:16]}…"
 
 
 # ── 2. Reference signer (BIP-340 default signing) ────────────────────────────
@@ -110,10 +111,16 @@ def test_mutations_are_rejected():
     assert bip340.verify(px, msg, sig)
 
     for i in (0, 31, 32, 63):
-        assert not bip340.verify(px, msg, _flip(sig, i)), f"corrupt sig byte {i} accepted"
+        assert not bip340.verify(px, msg, _flip(sig, i)), (
+            f"corrupt sig byte {i} accepted"
+        )
     for i in (0, 31):
-        assert not bip340.verify(px, _flip(msg, i), sig), f"corrupt msg byte {i} accepted"
-        assert not bip340.verify(_flip(px, i), msg, sig), f"corrupt pubkey byte {i} accepted"
+        assert not bip340.verify(px, _flip(msg, i), sig), (
+            f"corrupt msg byte {i} accepted"
+        )
+        assert not bip340.verify(_flip(px, i), msg, sig), (
+            f"corrupt pubkey byte {i} accepted"
+        )
 
 
 def test_out_of_range_components_are_rejected():
@@ -133,6 +140,34 @@ def test_x_only_strips_compressed_prefix():
     assert bip340.x_only(b"\x02" + raw) == raw
     assert bip340.x_only(b"\x03" + raw) == raw
     assert bip340.x_only(raw) == raw
+
+
+def test_x_only_accepts_uncompressed_65():
+    # Regression for the hardware-only GET_PUBKEY bug (PR #22): a real card
+    # returns the raw 65-byte point from ECPublicKey.getW(). The host must read
+    # its x-coordinate instead of crashing, whichever encoding the card emits.
+    seckey = secrets.randbelow(N - 1) + 1
+    x, y = _point_mul(G, seckey)
+    xb = x.to_bytes(32, "big")
+    compressed = bytes([0x02 | (y & 1)]) + xb
+    uncompressed = b"\x04" + xb + y.to_bytes(32, "big")
+    assert bip340.x_only(compressed) == xb
+    assert bip340.x_only(uncompressed) == xb
+
+    # And a signature verifies identically from either encoding.
+    msg = secrets.token_bytes(32)
+    px, sig = reference_sign(seckey, msg, secrets.token_bytes(32))
+    assert px == xb
+    assert bip340.verify(bip340.x_only(uncompressed), msg, sig)
+
+
+def test_x_only_rejects_unknown_lengths():
+    for bad in (b"", b"\x02" * 31, b"\x04" * 33, b"\x05" + b"\x00" * 64):
+        try:
+            bip340.x_only(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"x_only accepted {len(bad)} bytes / bad prefix")
 
 
 def test_lift_x_rejects_non_curve_points():

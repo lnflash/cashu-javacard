@@ -331,8 +331,27 @@ public class CashuApplet extends Applet {
 
     private void processGetPubkey(APDU apdu) {
         byte[] buf = apdu.getBuffer();
-        short len = cardPubKey.getW(buf, (short) 0);
+        short len = toCompressed(buf, cardPubKey.getW(buf, (short) 0));
         apdu.setOutgoingAndSend((short) 0, len);
+    }
+
+    /**
+     * Rewrite an EC public key to the spec's 33-byte compressed form, in place.
+     *
+     * ECPublicKey.getW() returns the uncompressed point (04 || X || Y, 65 bytes)
+     * on real silicon but 33 bytes under jCardSim, so this branch is otherwise
+     * never taken in CI — see the direct test. A part already returning 33 bytes
+     * is passed through untouched.
+     */
+    static short toCompressed(byte[] buf, short len) {
+        if (len == (short) 65 && buf[0] == (byte) 0x04) {
+            // Prefix replaces the 0x04 marker in place; X already sits at
+            // buf[1..32], so only the first byte changes. The prefix encodes the
+            // parity of Y's least-significant byte.
+            buf[0] = ((buf[64] & 0x01) == 0) ? (byte) 0x02 : (byte) 0x03;
+            return (short) 33;
+        }
+        return len;
     }
 
     private void processGetBalance(APDU apdu) {

@@ -130,24 +130,62 @@ class CashuAppletTest {
     // =========================================================================
 
     @Test @Order(3)
-    @DisplayName("GET_PUBKEY returns a valid secp256k1 public key (33 or 65 bytes)")
-    void testGetPubkey() {
+    @DisplayName("GET_PUBKEY returns a 33-byte compressed secp256k1 public key")
+    void testGetPubkey() throws Exception {
         ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256));
         assertEquals(SW_OK, resp.getSW());
         byte[] pub = resp.getData();
-        // jCardSim returns uncompressed (65 bytes, 0x04 prefix);
-        // real JavaCard hardware returns compressed (33 bytes, 0x02/0x03).
-        // Both are valid EC public key encodings.
-        assertTrue(pub.length == 33 || pub.length == 65,
-            "Public key must be 33 (compressed) or 65 (uncompressed) bytes, got: " + pub.length);
-        if (pub.length == 33) {
-            assertTrue(pub[0] == 0x02 || pub[0] == 0x03, "Compressed key prefix must be 0x02 or 0x03");
-        } else {
-            assertEquals(0x04, pub[0] & 0xFF, "Uncompressed key prefix must be 0x04");
-        }
+        // The wire format is fixed at 33 bytes (spec/APDU.md) even though
+        // ECPublicKey.getW() hands back the uncompressed point on hardware.
+        assertEquals(33, pub.length, "Public key must be 33-byte compressed");
+        assertTrue(pub[0] == 0x02 || pub[0] == 0x03,
+            "Compressed key prefix must be 0x02 or 0x03");
+        assertNotNull(liftX(new java.math.BigInteger(1,
+            java.util.Arrays.copyOfRange(pub, 1, 33))), "Public key must be on secp256k1");
+
+        // The compressed key must be the very key the card signs with: verify a
+        // real signature against its x-only form.
+        byte[] msg = new byte[32];
+        for (int i = 0; i < 32; i++) msg[i] = (byte) (i + 1);
+        ResponseAPDU signed = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
+        assertEquals(SW_OK, signed.getSW());
+        assertTrue(schnorrVerify(java.util.Arrays.copyOfRange(pub, 1, 33), msg, signed.getData()),
+            "Signature must verify against the key GET_PUBKEY returned");
     }
 
     @Test @Order(4)
+    @DisplayName("toCompressed normalises the 65-byte hardware point to 33 bytes")
+    void testToCompressed() {
+        // jCardSim's getW() already returns 33 bytes, so the branch that runs on
+        // real silicon is invisible here unless driven directly.
+        byte[] gx = toBytes32Test(SECP_GX);
+        byte[] gy = toBytes32Test(SECP_GY);
+        byte[] gyOdd = toBytes32Test(SECP_P.subtract(SECP_GY));
+
+        byte[] even = new byte[65];
+        even[0] = 0x04;
+        System.arraycopy(gx, 0, even, 1, 32);
+        System.arraycopy(gy, 0, even, 33, 32);
+        assertEquals(33, CashuApplet.toCompressed(even, (short) 65));
+        assertEquals(0x02, even[0] & 0xFF, "even Y must yield a 0x02 prefix");
+        assertArrayEquals(gx, java.util.Arrays.copyOfRange(even, 1, 33), "X must be preserved");
+
+        byte[] odd = new byte[65];
+        odd[0] = 0x04;
+        System.arraycopy(gx, 0, odd, 1, 32);
+        System.arraycopy(gyOdd, 0, odd, 33, 32);
+        assertEquals(33, CashuApplet.toCompressed(odd, (short) 65));
+        assertEquals(0x03, odd[0] & 0xFF, "odd Y must yield a 0x03 prefix");
+
+        byte[] compressed = new byte[33];
+        compressed[0] = 0x02;
+        System.arraycopy(gx, 0, compressed, 1, 32);
+        assertEquals(33, CashuApplet.toCompressed(compressed, (short) 33));
+        assertArrayEquals(gx, java.util.Arrays.copyOfRange(compressed, 1, 33),
+            "an already-compressed key must pass through untouched");
+    }
+
+    @Test @Order(5)
     @DisplayName("GET_PUBKEY is stable (same key across multiple calls)")
     void testGetPubkeyStable() {
         byte[] pub1 = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();

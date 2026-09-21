@@ -88,9 +88,12 @@ def verify(pubkey_x: bytes, msg: bytes, sig: bytes) -> bool:
     if r >= P or s >= N:
         return False
 
-    e = int.from_bytes(
-        tagged_hash("BIP0340/challenge", sig[:32] + pubkey_x + msg), "big"
-    ) % N
+    e = (
+        int.from_bytes(
+            tagged_hash("BIP0340/challenge", sig[:32] + pubkey_x + msg), "big"
+        )
+        % N
+    )
 
     # R = s*G - e*P
     big_r = _point_add(_point_mul(G, s), _point_mul(point, N - e))
@@ -99,10 +102,18 @@ def verify(pubkey_x: bytes, msg: bytes, sig: bytes) -> bool:
     return True
 
 
-def x_only(compressed_pubkey: bytes) -> bytes:
-    """Strip the 02/03 prefix from a 33-byte compressed key to get x-only."""
-    if len(compressed_pubkey) == 33 and compressed_pubkey[0] in (0x02, 0x03):
-        return compressed_pubkey[1:]
-    if len(compressed_pubkey) == 32:
-        return compressed_pubkey
-    raise ValueError(f"not a compressed secp256k1 pubkey: {len(compressed_pubkey)} bytes")
+def x_only(pubkey: bytes) -> bytes:
+    """Return the 32-byte x-only key, stripping a 02/03/04 prefix if present.
+
+    Accepts a 33-byte compressed key, a 32-byte x-only key, or a 65-byte
+    uncompressed key. The last is defensive interop: spec/APDU.md fixes the
+    card at 33 bytes, but ECPublicKey.getW() returns 65 bytes on real silicon,
+    and an applet built before that was normalised is still spendable.
+    """
+    if len(pubkey) == 33 and pubkey[0] in (0x02, 0x03):
+        return pubkey[1:]
+    if len(pubkey) == 65 and pubkey[0] == 0x04:
+        return pubkey[1:33]
+    if len(pubkey) == 32:
+        return pubkey
+    raise ValueError(f"not a secp256k1 pubkey: {len(pubkey)} bytes")
