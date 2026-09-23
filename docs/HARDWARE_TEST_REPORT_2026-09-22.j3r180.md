@@ -54,7 +54,36 @@ PASS  fresh nonce across identical messages
 - Two signatures over an identical message use a different `R`, so aux
   randomness works — no nonce reuse.
 
+## End-to-end load → spend → settle (2026-09-22)
+
+The full bearer-card round trip was run against the project mint
+`https://forge.flashapp.me` (Nutshell 0.20.3.1, NUT-11 + NUT-12): mint a proof
+locked to the card, load it, spend it on the card, redeem it at the mint, and
+return the change to the card. At no point does the host see the card's key.
+
+```text
+fund-card  → 16 sat quote paid → 1 proof, DLEQ verified
+load-file  → slot 0 = 16 sat; balance 16
+spend      → card marks slot 0 SPENT, returns BIP-340 signature over the NUT-11
+             message; host attaches the witness
+swap       → mint accepts the card's signature; input now SPENT
+change     → 16 sat returned, relocked to the card key, loaded back to slot 1
+```
+
+| Step | Evidence |
+|---|---|
+| Load | `load-file`: `slot 0: 16 sat`; `balance` → `16` |
+| Sign | `BIP-340 : VALID`; slot `unspent` → `spent` before the signature was returned |
+| Redeem | `swap : OK — 1 blind signature(s)` |
+| Double-spend | mint `checkstate`: input `SPENT`; change proof `UNSPENT` |
+| Change | `slot 1: 16 sat`; final `balance` → `16`, slot 0 `spent`, slot 1 `unspent` |
+
+This exercises `LOAD_PROOF`, `SPEND_PROOF` (spend-before-sign ordering), the
+NUT-10 secret reconstruction, NUT-11 witness, and NUT-03/DLEQ on real silicon —
+the applet, the card file, and the host client together.
+
 ## Not exercised
 
-`load`, `load-file`, `spend`, `clear-spent`, `set-pin`, `change-pin`, `lock`
-were not run (state-changing / irreversible). `sign` does not consume a proof.
+`clear-spent`, `set-pin`, `change-pin`, `lock` were not run (state-changing /
+irreversible). The change proof was relocked to the card and reloaded rather
+than melted, so a bolt11 melt (NUT-05) is also still unrun on silicon.
