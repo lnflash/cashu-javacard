@@ -431,6 +431,11 @@ def cmd_sign(args) -> int:
 
 def cmd_spend(args) -> int:
     card = connect(args)
+    # D13: the burn requires a verified session when a PIN is set. Verifying
+    # here (same session) means a wrong PIN fails before the burn — the gate
+    # is first on the card too, but this makes the CLI say so in one step.
+    if getattr(args, "pin", None):
+        card.verify_pin(args.pin.encode())
     msg = parse_hex(args.message, 32, "message") if args.message else secrets.token_bytes(32)
     if not args.message:
         print(f"message   : {_hex(msg)}  (random)")
@@ -1002,6 +1007,19 @@ def cmd_selftest(args) -> int:
     record("Schnorr capability advertised", info["schnorr"],
            f"caps=0x{info['caps_raw']:02X}")
 
+    # D13: spend/sign are PIN-gated when set, so selftest must verify inside
+    # this session or every signature check below would 6982.
+    if info["pin_state"] == "set":
+        if getattr(args, "pin", None):
+            try:
+                card.verify_pin(args.pin.encode())
+                record("VERIFY_PIN", True, "session verified (spend/sign gated)")
+            except CardError as exc:
+                record("VERIFY_PIN", False, str(exc))
+        else:
+            record("VERIFY_PIN", False,
+                   "card has a PIN — pass --pin or the signature checks below will fail")
+
     # Conformance, not mere parseability: spec/APDU.md fixes the wire format at
     # 33-byte compressed. Card.get_pubkey() normalises a 65-byte card so it is
     # still spendable, but selftest reads the raw bytes so the applet mismatch
@@ -1088,6 +1106,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_sign)
 
     s = sub.add_parser("spend", help="SPEND_PROOF: mark spent, sign, verify")
+    s.add_argument("--pin", help="verify this PIN first (required when the card has one, D13)")
     s.add_argument("slot", type=int)
     s.add_argument("--message", help="32-byte message as hex (random if omitted)")
     s.set_defaults(func=cmd_spend)
@@ -1145,6 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("selftest", help="full hardware check incl. BIP-340 signature verification")
     s.add_argument("--rounds", type=int, default=3, help="signature rounds (default 3)")
+    s.add_argument("--pin", help="verify this PIN first (required when the card has one, D13)")
     s.set_defaults(func=cmd_selftest)
 
     return p

@@ -412,6 +412,12 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
 
     private void processSpendProof(APDU apdu) {
+        // D13: gate FIRST — a wrong or missing PIN throws before the slot
+        // burn, so no proof is consumed by an unauthorised request. A LOCKED
+        // card still spends (lock disables writes, not the bearer's ability
+        // to pay — see the locked-card test).
+        requirePinIfSet();
+
         byte[] buf = apdu.getBuffer();
         short idx = (short)(buf[ISO7816.OFFSET_P1] & 0xFF);
         if (idx >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
@@ -435,6 +441,10 @@ public class CashuApplet extends Applet {
     }
 
     private void processSignArbitrary(APDU apdu) {
+        // D13: the signature is a spend authorisation under the card's key,
+        // so it is gated exactly like SPEND_PROOF.
+        requirePinIfSet();
+
         byte[] buf = apdu.getBuffer();
         short msgLen = apdu.setIncomingAndReceive();
         if (msgLen != (short) 32) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);

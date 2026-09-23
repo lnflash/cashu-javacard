@@ -166,15 +166,19 @@ Lightweight bulk status read. Returns a 1-byte status for every slot (0=empty, 1
 
 ---
 
-## Category 0x2x — Spend (no PIN required — bearer semantics)
+## Category 0x2x — Spend (PIN required if PIN is set — Profile B+)
 
-Spending does not require PIN. The card is a bearer instrument; physical possession authorises payment. The mint enforces validity via Cashu proof verification.
+If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). Cards provisioned without a PIN keep tap-and-go behaviour. The PIN session flag is transient (cleared on card deselect / tap end).
 
 ### SPEND_PROOF (0x20)
 
 Atomically marks a proof as spent (irreversible) and returns a NUT-11 P2PK Schnorr signature. The signature proves the card authorised this spend. The reader submits the proof + signature to the Cashu mint for redemption.
 
 This is the **core payment operation**.
+
+**PIN:** if a PIN is set, `VERIFY_PIN` must precede this command in the same
+session (D13). The gate runs *before* the slot burn, so a wrong or missing PIN
+never consumes a proof.
 
 | Field | Value |
 |-------|-------|
@@ -194,6 +198,7 @@ This is the **core payment operation**.
 | 6985 | Proof already spent — double-spend blocked |
 | 6A88 | Slot is empty |
 | 6A83 | Slot index out of range |
+| 6982 | PIN set but not verified in this session |
 | 6F00 | Signing failed (hardware error) |
 
 **Note on message construction:** The reader computes
@@ -216,6 +221,10 @@ Signs any 32-byte message with the card private key **without** consuming a proo
 - NUT-11 proof-of-ownership challenges (wallet queries card capability)
 - Card authentication during provisioning
 - Future NUT extensions requiring card identity proofs
+
+**PIN:** gated like `SPEND_PROOF` (D13) — the signature is a spend
+authorisation under the card's key, so an unverified session must not be able
+to mint one. `6982` when a PIN is set and unverified in this session.
 
 | Field | Value |
 |-------|-------|
