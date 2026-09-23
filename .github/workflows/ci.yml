@@ -97,6 +97,8 @@ jobs:
       - name: Run tests
         run: node --test 'tools/**/*.test.cjs'
 
+  cap:
+    name: CAP conversion
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
