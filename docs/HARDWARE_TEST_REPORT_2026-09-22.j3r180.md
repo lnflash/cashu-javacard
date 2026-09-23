@@ -205,6 +205,29 @@ wallet promises are now evicted. `Metro` needed
 `unstable_conditionNames: ['require', 'react-native']` for the tslib/Apollo
 interaction. See flash-pos `856713b` for the full change.
 
+## Payout: lightning address, funded from a tap (2026-09-23)
+
+The loop closed with real value on the full path. A fresh 21-sat fund was
+loaded onto the card through the PIN gate (`load-file --pin`, first
+PIN-gated write on silicon), spent from the iPhone (slot 0, 16 sat), settled
+through the terminal's queue into the settled-proof store, and then melted
+from the terminal to the merchant's lightning address
+(`flash@flashapp.me`) via LNURL-pay → NUT-05:
+
+```
+fund     : 21 sat invoice paid → 3 proofs (16+4+1), DLEQ verified
+load     : PIN-gated load-file → slots 0–2, balance 21
+tap      : slot 0 burned, witness returned, entry queued
+settle   : swap accepted; proof into the settled store (keep/send fix)
+payout   : flash@flashapp.me → LNURL-pay invoice → melt → PAID, preimage
+wallet   : the flash wallet balance credited on the Lightning Network
+mint     : slot 0's proof confirmed SPENT from the reference toolchain
+```
+
+That is the complete product loop — a physical card, a phone, an offline
+settlement queue, a mint, and a merchant wallet — with every hop on real
+hardware and real Lightning.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding
