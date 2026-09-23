@@ -264,7 +264,9 @@ The script sends only `SELECT`, `GET_PUBKEY`, and `SIGN_ARBITRARY`, and its pure
 Results:
 
 ```text
+GET_PUBKEY raw (65 bytes): 042f3253009b4481805ae7b87e46fcc0b1a469b9e510fd1d9767bf146fb61abec8987303f74519a22b0c75d9cccee43ae61025d018c28fb5be47a1de35cfdad628
 Public key point on secp256k1: True
+Compressed pubkey: 022f3253009b4481805ae7b87e46fcc0b1a469b9e510fd1d9767bf146fb61abec8
 SIGN_ARBITRARY + BIP-340 verify [1/3]: PASS
 SIGN_ARBITRARY + BIP-340 verify [2/3]: PASS
 SIGN_ARBITRARY + BIP-340 verify [3/3]: PASS

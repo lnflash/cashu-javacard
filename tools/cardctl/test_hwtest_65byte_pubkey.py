@@ -14,6 +14,7 @@ Run: python test_hwtest_65byte_pubkey.py
 """
 
 import io
+import os
 import secrets
 import sys
 
@@ -126,6 +127,50 @@ def test_run_passes_against_65_byte_card():
         "MANUAL HARDWARE SELFTEST: PASS",
     ):
         assert line in text, f"missing {line!r} in:\n{text}"
+
+
+REPORTS = (
+    "../../docs/HARDWARE_TEST_REPORT_2026-09-01.j3r452.md",
+    "../../docs/HARDWARE_TEST_REPORT_2026-09-01.j3r452.zh-CN.md",
+)
+
+
+def _section8_results(path: str) -> list:
+    """The lines inside the ```text block under the section-8 'Results' heading."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, path), encoding="utf-8") as f:
+        text = f.read()
+    start = text.index("MANUAL HARDWARE SELFTEST: PASS")
+    block_start = text.rindex("```text\n", 0, start) + len("```text\n")
+    block_end = text.index("```", block_start)
+    return text[block_start:block_end].rstrip("\n").split("\n")
+
+
+def test_every_run_line_is_quoted_in_both_reports():
+    """
+    The script's docstring says every line it prints is quoted verbatim in the
+    report. Hold it to that: run() against a 65-byte fake card must produce
+    exactly the lines of the section-8 results block, in order, with the two
+    key-bearing lines pinned to the section-6.1 key and its compressed form.
+    """
+    out = io.StringIO()
+    assert hw.run(_FakeCard(uncompressed=True), rounds=3, out=out)
+    emitted = out.getvalue().rstrip("\n").split("\n")
+
+    def shape(line: str) -> str:
+        head, _, _ = line.partition(": ")
+        return head if head in ("GET_PUBKEY raw (65 bytes)", "Compressed pubkey") else line
+
+    expected_raw = f"GET_PUBKEY raw (65 bytes): {J3R452_PUBKEY_65.hex()}"
+    expected_comp = f"Compressed pubkey: {hw.normalize_pubkey(J3R452_PUBKEY_65).hex()}"
+    for path in REPORTS:
+        quoted = _section8_results(path)
+        assert [shape(l) for l in quoted] == [shape(l) for l in emitted], (
+            f"{path} section 8 results differ from run() output:\n"
+            f"report: {quoted}\nrun():  {emitted}"
+        )
+        assert expected_raw in quoted, f"{path}: raw key line does not match section 6.1"
+        assert expected_comp in quoted, f"{path}: compressed key line does not match section 6.1"
 
 
 def test_run_passes_against_33_byte_card():

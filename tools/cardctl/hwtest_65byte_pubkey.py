@@ -19,9 +19,10 @@ Run from tools/cardctl with the same venv and reader index as cardctl:
 
     python hwtest_65byte_pubkey.py -r 1
 
-The output lines are the ones quoted verbatim in the report. Exit status is 0
-only if every check passed. The applet-side fix (#23) makes GET_PUBKEY return
-33 bytes, which this script also accepts, so it stays a valid post-fix check.
+Every line the script prints is quoted verbatim in the report's section 8
+results block. Exit status is 0 only if every check passed. The applet-side
+fix (#23) makes GET_PUBKEY return 33 bytes, which this script also accepts, so
+it stays a valid post-fix check.
 """
 
 import argparse
