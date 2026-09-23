@@ -15,6 +15,9 @@
  * reject (meltAmountRequired check) and reports the recovery path on failure:
  * the proof itself is still unspent at the mint and re-signable via
  * SIGN_ARBITRARY, which does not consume a slot.
+ *
+ * Recovered proofs (minted back + change) are written next to the card file as
+ * <card-file>.melt-<quote-id>.json; an existing file is never overwritten.
  */
 const path = require("path")
 const fs = require("fs")
@@ -26,12 +29,35 @@ const PY = process.env.CARDCTL_PY || path.resolve(REPO, "tools/cardctl/.venv/bin
 const CARDCTL = process.env.CARDCTL || path.resolve(REPO, "tools/cardctl/cardctl.py")
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-const cc = require(CLIENT_DIST)
-
-const [, , MINT, SLOT_ARG, CARDFILE, , INVOICE] = process.argv
-const SLOT = Number(SLOT_ARG)
+let cc // cashu-client, loaded in main() so parseArgs() is testable without the build
 
 const die = m => { console.error(`FAIL: ${m}`); process.exit(1) }
+
+// Positional <mint> <slot> <card-file>, then an optional `--invoice <bolt11>`.
+// Anything else in that position is an error, not a silent no-op: a bare
+// bolt11 or a mistyped flag must never fall through to the self-quote path.
+function parseArgs(argv) {
+  const [mint, slotArg, cardFile, ...rest] = argv
+  if (!mint || slotArg === undefined || !cardFile) throw new Error("usage: e2e-melt.cjs <mint> <slot> <card-file> [--invoice <bolt11>]")
+  const slot = Number(slotArg)
+  if (!Number.isInteger(slot) || slot < 0) throw new Error(`slot must be a non-negative integer, got ${JSON.stringify(slotArg)}`)
+  let invoice
+  if (rest.length) {
+    if (rest[0] !== "--invoice") throw new Error(`unknown argument ${JSON.stringify(rest[0])}`)
+    if (!rest[1]) throw new Error("--invoice requires a bolt11")
+    if (rest.length > 2) throw new Error(`unexpected argument ${JSON.stringify(rest[2])}`)
+    invoice = rest[1]
+  }
+  return { mint, slot, cardFile, invoice }
+}
+
+// Recovered proofs are bearer value and this file is the only copy of their
+// nonce/C, so the path is unique per melt and never overwritten (cardctl dump
+// takes the same stance behind --force).
+const recoveredPath = (cardFile, quoteId) =>
+  `${cardFile.replace(/\.json$/i, "")}.melt-${String(quoteId).replace(/[^A-Za-z0-9_-]/g, "_")}.json`
+
+let MINT, SLOT, CARDFILE, INVOICE
 const ensure = (v, what) => { if (v instanceof cc.CashuError) die(`${what}: ${v.message}`); return v }
 
 // Unblind a blind signature back into a spendable proof, carrying the nonce so
@@ -46,6 +72,10 @@ const unblind = (sig, bd, keys) => ({
 })
 
 async function main() {
+  try {
+    ;({ mint: MINT, slot: SLOT, cardFile: CARDFILE, invoice: INVOICE } = parseArgs(process.argv.slice(2)))
+  } catch (e) { die(e.message) }
+  cc = require(CLIENT_DIST)
   const file = cc.parseCardFile(fs.readFileSync(CARDFILE, "utf-8"))
   const slot = file.slots[SLOT] || die(`card file has no slot ${SLOT}`)
   if (slot.spent) die(`slot ${SLOT} is already spent on the card`)
@@ -118,14 +148,24 @@ async function main() {
   console.log(`recovered   : ${minted.length} minted + ${changeProofs.length} change = ${total} ${file.unit}` +
     ` (net Lightning cost ${proof.amount - total})`)
 
-  const outFile = "/tmp/melt-recovered.json"
-  fs.writeFileSync(outFile, cc.serializeCardFile({
+  const outFile = recoveredPath(CARDFILE, meltQuote.quoteId)
+  const body = cc.serializeCardFile({
     mint: MINT, unit: file.unit, cardPubkey: file.cardPubkey,
     slots: recovered.map(p => ({ keysetId: p.id, amount: p.amount, nonce: p.nonce, C: p.C, spent: false })),
     note: "recovered from NUT-05 melt",
-  }) + "\n")
+  }) + "\n"
+  try {
+    fs.writeFileSync(outFile, body, { flag: "wx" })
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e
+    // Never clobber: print the proofs so the money is not lost with the file.
+    console.error(`refusing to overwrite ${outFile}; recovered proofs follow:\n${body}`)
+    die(`${outFile} already exists`)
+  }
   console.log(`wrote       : ${outFile}`)
   console.log(`\nRESULT: NUT-05 melt settled on silicon — the mint paid a Lightning invoice with the card's proof.`)
 }
 
-main().catch(e => die(e.stack || String(e)))
+module.exports = { parseArgs, recoveredPath }
+
+if (require.main === module) main().catch(e => die(e.stack || String(e)))

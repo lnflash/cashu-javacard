@@ -21,7 +21,7 @@ import hashlib
 import secrets
 
 import bip340
-from bip340 import G, N, _point_mul, tagged_hash
+from bip340 import G, N, P, _point_mul, tagged_hash
 
 # ── 1. Canonical vectors (BIP-340 test-vectors.csv, verifying cases) ──────────
 VECTORS = [
@@ -159,6 +159,30 @@ def test_x_only_accepts_uncompressed_65():
     px, sig = reference_sign(seckey, msg, secrets.token_bytes(32))
     assert px == xb
     assert bip340.verify(bip340.x_only(uncompressed), msg, sig)
+
+
+def test_compress_rewrites_uncompressed_and_passes_compressed_through():
+    seckey = secrets.randbelow(N - 1) + 1
+    x, y = _point_mul(G, seckey)
+    xb = x.to_bytes(32, "big")
+    compressed = bytes([0x02 | (y & 1)]) + xb
+    uncompressed = b"\x04" + xb + y.to_bytes(32, "big")
+    assert bip340.compress(uncompressed) == compressed
+    assert bip340.compress(compressed) == compressed
+    # Parity is read from Y, not guessed: the negated point flips the prefix.
+    negated = b"\x04" + xb + (P - y).to_bytes(32, "big")
+    assert bip340.compress(negated) == bytes([0x02 | ((P - y) & 1)]) + xb
+    assert bip340.compress(negated)[0] != compressed[0]
+
+
+def test_compress_rejects_unknown_encodings():
+    for bad in (b"", b"\x00" * 32, b"\x04" + b"\x00" * 32, b"\x05" + b"\x00" * 64,
+                b"\x04" + b"\x00" * 64 + b"\x00"):
+        try:
+            bip340.compress(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"compress accepted {len(bad)} bytes / bad prefix")
 
 
 def test_x_only_rejects_unknown_lengths():

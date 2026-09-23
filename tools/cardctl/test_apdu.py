@@ -69,19 +69,46 @@ def test_select_falls_back_to_8_byte_applet_aid():
 
 # ── read commands: exact bytes from spec/APDU.md ─────────────────────────────
 def test_read_command_encodings():
+    # Each canned response is long enough not to trip length checks; get_pubkey
+    # additionally validates the point encoding, so its reply must parse.
     cases = [
-        ("get_info", (), "B0010000 00"),
-        ("get_pubkey", (), "B0100000 21"),
-        ("get_balance", (), "B0110000 04"),
-        ("get_proof_count", (), "B0120000 01"),
-        ("get_slot_status", (), "B0140000 20"),
+        ("get_info", (), "B0010000 00", b"\x00" * 40),
+        ("get_pubkey", (), "B0100000 21", b"\x02" + b"\x00" * 32),
+        ("get_balance", (), "B0110000 04", b"\x00" * 40),
+        ("get_proof_count", (), "B0120000 01", b"\x00" * 40),
+        ("get_slot_status", (), "B0140000 20", b"\x00" * 40),
     ]
-    for method, args, expected in cases:
-        # Give each call a response long enough not to trip length checks.
-        card = make_card([(b"\x00" * 40, 0x9000)])
+    for method, args, expected, response in cases:
+        card = make_card([(response, 0x9000)])
         getattr(card, method)(*args)
         assert card.connection.last == bytes.fromhex(expected.replace(" ", "")), \
             f"{method}: {card.connection.last.hex()} != {expected}"
+
+
+def test_get_pubkey_normalises_a_65_byte_card_to_33_bytes():
+    # An applet built before GET_PUBKEY was fixed returns getW()'s 65-byte
+    # uncompressed point on real silicon. Every consumer (sign, dump, load-file)
+    # goes through Card.get_pubkey(), so the normalisation has to live there —
+    # not in the verifier alone, or `dump` would write a 65-byte lock into the
+    # card file that validate_card_doc then refuses to read back.
+    x = bytes.fromhex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    y = bytes.fromhex("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+    uncompressed = b"\x04" + x + y
+    card = make_card([(uncompressed, 0x9000), (uncompressed, 0x9000)])
+    assert card.get_pubkey() == b"\x02" + x
+    assert card.get_pubkey(raw=True) == uncompressed
+
+    compressed = b"\x03" + x
+    card = make_card([(compressed, 0x9000)])
+    assert card.get_pubkey() == compressed
+
+    card = make_card([(b"\x05" + x + y, 0x9000)])
+    try:
+        card.get_pubkey()
+    except SystemExit as exc:
+        assert "GET_PUBKEY" in str(exc)
+    else:
+        raise AssertionError("get_pubkey accepted a 65-byte blob without 0x04")
 
 
 def test_get_proof_puts_slot_in_p1_and_asks_for_78_bytes():

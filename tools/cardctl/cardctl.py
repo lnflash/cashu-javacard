@@ -69,7 +69,7 @@ STATUS_NAMES = {0x00: "empty", 0x01: "unspent", 0x02: "spent"}
 # LOAD_PROOF). Anything at or above this bound makes `amount.to_bytes(4, "big")`
 # raise a bare OverflowError — and on the file path that happens mid-load, after
 # earlier proofs are already committed. Bound it before the first write.
-MAX_SLOT_AMOUNT = 2**32
+MAX_SLOT_AMOUNT = 2 ** 32
 
 SW_MEANINGS = {
     0x9000: "success",
@@ -155,7 +155,6 @@ def _load_pyscard():
     try:
         from smartcard.System import readers  # noqa
         from smartcard.util import toHexString  # noqa
-
         return readers
     except ImportError:
         sys.exit(
@@ -180,18 +179,14 @@ class Card:
                 "  - macOS: the daemon is built in; try replugging the reader."
             )
         if reader_index >= len(available):
-            sys.exit(
-                f"Reader index {reader_index} out of range ({len(available)} found)"
-            )
+            sys.exit(f"Reader index {reader_index} out of range ({len(available)} found)")
         self.reader = available[reader_index]
         self.verbose = verbose
         try:
             self.connection = self.reader.createConnection()
             self.connection.connect()
         except Exception as exc:  # noqa: BLE001 — surface the driver's own words
-            sys.exit(
-                f"Could not connect to a card on {self.reader}: {exc}\nIs a card on the reader?"
-            )
+            sys.exit(f"Could not connect to a card on {self.reader}: {exc}\nIs a card on the reader?")
 
     # ── raw APDU ──────────────────────────────────────────────────────────────
     def transmit(self, apdu: bytes, context: str = "") -> bytes:
@@ -206,15 +201,8 @@ class Card:
             raise CardError(sw, context)
         return body
 
-    def send(
-        self,
-        ins: int,
-        p1: int = 0,
-        p2: int = 0,
-        data: bytes = b"",
-        le: Optional[int] = None,
-        context: str = "",
-    ) -> bytes:
+    def send(self, ins: int, p1: int = 0, p2: int = 0,
+             data: bytes = b"", le: Optional[int] = None, context: str = "") -> bytes:
         apdu = bytes([CLA, ins, p1, p2])
         if data:
             apdu += bytes([len(data)]) + data
@@ -252,18 +240,30 @@ class Card:
             "caps_raw": caps,
             "secp256k1_native": bool(caps & 0x01),
             "schnorr": bool(caps & 0x02),
-            "pin_state": {0: "unset", 1: "set", 2: "locked"}.get(
-                b[7], f"unknown({b[7]})"
-            ),
+            "pin_state": {0: "unset", 1: "set", 2: "locked"}.get(b[7], f"unknown({b[7]})"),
         }
 
-    def get_pubkey(self) -> bytes:
-        return self.send(INS_GET_PUBKEY, le=0x21, context="GET_PUBKEY")
+    def get_pubkey(self, raw: bool = False) -> bytes:
+        """The card's secp256k1 public key, normalised to 33-byte compressed.
+
+        spec/APDU.md fixes the wire format at 33 bytes, but an applet built
+        before GET_PUBKEY was normalised returns ECPublicKey.getW()'s 65-byte
+        uncompressed point on real silicon. Compressing here, at the single
+        ingress, means every consumer — sign/spend verification, `dump`'s card
+        file, `load-file`'s ownership check — sees the same 33-byte key and an
+        old applet stays spendable end to end. `raw=True` returns the bytes as
+        the card sent them, for `selftest` to report the off-spec encoding.
+        """
+        pk = self.send(INS_GET_PUBKEY, le=0x21, context="GET_PUBKEY")
+        if raw:
+            return pk
+        try:
+            return bip340.compress(pk)
+        except ValueError as exc:
+            raise SystemExit(f"GET_PUBKEY: {exc}")
 
     def get_balance(self) -> int:
-        return int.from_bytes(
-            self.send(INS_GET_BALANCE, le=0x04, context="GET_BALANCE"), "big"
-        )
+        return int.from_bytes(self.send(INS_GET_BALANCE, le=0x04, context="GET_BALANCE"), "big")
 
     def get_proof_count(self) -> int:
         return self.send(INS_GET_PROOF_COUNT, le=0x01, context="GET_PROOF_COUNT")[0]
@@ -272,9 +272,7 @@ class Card:
         return self.send(INS_GET_SLOT_STATUS, le=MAX_PROOFS, context="GET_SLOT_STATUS")
 
     def get_proof(self, slot: int) -> dict:
-        b = self.send(
-            INS_GET_PROOF, p1=slot, le=PROOF_SIZE, context=f"GET_PROOF slot {slot}"
-        )
+        b = self.send(INS_GET_PROOF, p1=slot, le=PROOF_SIZE, context=f"GET_PROOF slot {slot}")
         return {
             "slot": slot,
             "status": STATUS_NAMES.get(b[0], f"unknown({b[0]})"),
@@ -291,25 +289,14 @@ class Card:
     # ── spend commands ────────────────────────────────────────────────────────
     def spend_proof(self, slot: int, message: bytes) -> bytes:
         if len(message) != 32:
-            raise SystemExit(
-                f"SPEND_PROOF message must be 32 bytes, got {len(message)}"
-            )
-        return self.send(
-            INS_SPEND_PROOF,
-            p1=slot,
-            data=message,
-            le=0x40,
-            context=f"SPEND_PROOF slot {slot}",
-        )
+            raise SystemExit(f"SPEND_PROOF message must be 32 bytes, got {len(message)}")
+        return self.send(INS_SPEND_PROOF, p1=slot, data=message, le=0x40,
+                         context=f"SPEND_PROOF slot {slot}")
 
     def sign(self, message: bytes) -> bytes:
         if len(message) != 32:
-            raise SystemExit(
-                f"SIGN_ARBITRARY message must be 32 bytes, got {len(message)}"
-            )
-        return self.send(
-            INS_SIGN_ARBITRARY, data=message, le=0x40, context="SIGN_ARBITRARY"
-        )
+            raise SystemExit(f"SIGN_ARBITRARY message must be 32 bytes, got {len(message)}")
+        return self.send(INS_SIGN_ARBITRARY, data=message, le=0x40, context="SIGN_ARBITRARY")
 
     # ── write commands ────────────────────────────────────────────────────────
     def load_proof(self, keyset_id: bytes, amount: int, nonce: bytes, c: bytes) -> int:
@@ -338,18 +325,14 @@ class Card:
         self.send(INS_SET_PIN, data=pin, context="SET_PIN")
 
     def change_pin(self, old: bytes, new: bytes) -> None:
-        self.send(
-            INS_CHANGE_PIN, data=bytes([len(old)]) + old + new, context="CHANGE_PIN"
-        )
+        self.send(INS_CHANGE_PIN, data=bytes([len(old)]) + old + new, context="CHANGE_PIN")
 
     def lock_card(self) -> None:
         self.transmit(bytes([CLA, INS_LOCK_CARD, 0x00, LOCK_CONFIRM_BYTE]), "LOCK_CARD")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-def parse_hex(
-    value: str, expected_len: Optional[int] = None, what: str = "value"
-) -> bytes:
+def parse_hex(value: str, expected_len: Optional[int] = None, what: str = "value") -> bytes:
     # spec/CARD-FILE.md: hex is case-insensitive on read and `0x` prefixes are
     # tolerated. That has to include `0X` — a prefix check that is itself
     # case-sensitive would make the spec's claim false for exactly the values
@@ -360,9 +343,7 @@ def parse_hex(
     except ValueError:
         raise SystemExit(f"{what} is not valid hex: {value!r}")
     if expected_len is not None and len(b) != expected_len:
-        raise SystemExit(
-            f"{what} must be {expected_len} bytes ({expected_len * 2} hex chars), got {len(b)}"
-        )
+        raise SystemExit(f"{what} must be {expected_len} bytes ({expected_len*2} hex chars), got {len(b)}")
     return b
 
 
@@ -392,14 +373,10 @@ def cmd_info(args) -> int:
     card = connect(args)
     i = card.get_info()
     print(f"applet version   : {i['version']}")
-    print(
-        f"slots            : {i['max_slots']} total — "
-        f"{i['unspent']} unspent, {i['spent']} spent, {i['empty']} empty"
-    )
-    print(
-        f"capabilities     : 0x{i['caps_raw']:02X} "
-        f"(secp256k1 native={i['secp256k1_native']}, schnorr={i['schnorr']})"
-    )
+    print(f"slots            : {i['max_slots']} total — "
+          f"{i['unspent']} unspent, {i['spent']} spent, {i['empty']} empty")
+    print(f"capabilities     : 0x{i['caps_raw']:02X} "
+          f"(secp256k1 native={i['secp256k1_native']}, schnorr={i['schnorr']})")
     print(f"PIN              : {i['pin_state']}")
     print(f"balance          : {card.get_balance()}")
     return 0
@@ -442,11 +419,7 @@ def cmd_proof(args) -> int:
 
 def cmd_sign(args) -> int:
     card = connect(args)
-    msg = (
-        parse_hex(args.message, 32, "message")
-        if args.message
-        else secrets.token_bytes(32)
-    )
+    msg = parse_hex(args.message, 32, "message") if args.message else secrets.token_bytes(32)
     if not args.message:
         print(f"message   : {_hex(msg)}  (random)")
     sig = card.sign(msg)
@@ -458,11 +431,7 @@ def cmd_sign(args) -> int:
 
 def cmd_spend(args) -> int:
     card = connect(args)
-    msg = (
-        parse_hex(args.message, 32, "message")
-        if args.message
-        else secrets.token_bytes(32)
-    )
+    msg = parse_hex(args.message, 32, "message") if args.message else secrets.token_bytes(32)
     if not args.message:
         print(f"message   : {_hex(msg)}  (random)")
     before = card.get_proof(args.slot)
@@ -474,10 +443,7 @@ def cmd_spend(args) -> int:
     after = card.get_proof(args.slot)
     print(f"slot {args.slot} after  : {after['status']}")
     if after["status"] != "spent":
-        print(
-            "WARNING: slot was not marked spent — single-spend enforcement failed",
-            file=sys.stderr,
-        )
+        print("WARNING: slot was not marked spent — single-spend enforcement failed", file=sys.stderr)
         return 1
     return 0 if ok else 1
 
@@ -527,9 +493,7 @@ def cmd_load(args) -> int:
     # Pure argument validation must never require a card tap.
     keyset = parse_keyset_id(args.keyset)
     validate_slot_amount(args.amount)
-    nonce = (
-        parse_hex(args.nonce, 32, "nonce") if args.nonce else secrets.token_bytes(32)
-    )
+    nonce = parse_hex(args.nonce, 32, "nonce") if args.nonce else secrets.token_bytes(32)
     if args.c:
         # An explicit --c is claimed to be a real mint signature, so it gets the
         # same check the file path (`_slot_from_json`) runs: a C that is not a
@@ -651,9 +615,7 @@ def _slot_from_json(entry, index: int) -> dict:
         nonce = parse_hex(nonce_hex, 32, f"{where}nonce")
         c = parse_hex(c_hex, 33, f"{where}C")
     except SystemExit as exc:
-        raise SystemExit(
-            f"{where}{exc}" if not str(exc).startswith(where) else str(exc)
-        )
+        raise SystemExit(f"{where}{exc}" if not str(exc).startswith(where) else str(exc))
 
     # Same guard cardPubkey gets. A C that is not a compressed point is an
     # unspendable proof, which is the whole reason this validator exists.
@@ -703,13 +665,11 @@ def validate_card_doc(doc) -> dict:
     # alone accepts `"version": true` — a file TypeScript's `!== 1` refuses.
     # Two halves disagreeing about one file is the drift this format exists to
     # prevent. Same trap validate_slot_amount already guards.
-    if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or version != CARD_FILE_VERSION
-    ):
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version != CARD_FILE_VERSION:
         raise SystemExit(
-            f"unsupported card file version {version!r}, expected {CARD_FILE_VERSION}"
+            f"unsupported card file version {version!r}, "
+            f"expected {CARD_FILE_VERSION}"
         )
     _reject_unknown_fields(doc, FILE_FIELDS, "card file: ")
     for field in ("mint", "unit"):
@@ -862,28 +822,22 @@ def cmd_load_file(args) -> int:
                 # the card when it is already gone — and the summary counts
                 # would fold it in with the genuinely-present proofs.
                 burned += 1
-                print(
-                    f"slot {index}: already SPENT on this card, skipping "
-                    f"({slot['amount']} {doc['unit']} — the file is stale)"
-                )
+                print(f"slot {index}: already SPENT on this card, skipping "
+                      f"({slot['amount']} {doc['unit']} — the file is stale)")
             else:
                 print(f"slot {index}: already loaded, skipping")
             continue
-        index = card.load_proof(
-            slot["keyset"], slot["amount"], slot["nonce"], slot["c"]
-        )
+        index = card.load_proof(slot["keyset"], slot["amount"], slot["nonce"], slot["c"])
         already[slot["nonce"]] = (index, 0x01)
         loaded += 1
         total += slot["amount"]
         print(f"slot {index}: {slot['amount']} {doc['unit']}")
 
     skipped = len(loadable) - loaded - burned
-    print(
-        f"loaded {loaded} proof(s), {total} {doc['unit']} total"
-        + (f"; {skipped} already on the card" if skipped else "")
-        + (f"; {burned} already SPENT on the card" if burned else "")
-        + (f"; {len(settled)} spent slot(s) not loaded" if settled else "")
-    )
+    print(f"loaded {loaded} proof(s), {total} {doc['unit']} total"
+          + (f"; {skipped} already on the card" if skipped else "")
+          + (f"; {burned} already SPENT on the card" if burned else "")
+          + (f"; {len(settled)} spent slot(s) not loaded" if settled else ""))
     return 0
 
 
@@ -914,19 +868,17 @@ def cmd_dump(args) -> int:
         if args.unspent_only and status != 0x01:
             continue
         p = card.get_proof(index)
-        slots.append(
-            {
-                "keysetId": p["keyset_id"],
-                "amount": p["amount"],
-                "nonce": _hex(p["nonce"]),
-                "C": _hex(p["c"]),
-                # The bit that says whether this money still moves. Dropping it
-                # keeps the proof and loses the state needed to act on it: the mint
-                # side gets N indistinguishable proofs, and a reload resurrects the
-                # spent ones as spendable. See spec/CARD-FILE.md.
-                "spent": p["status"] == "spent",
-            }
-        )
+        slots.append({
+            "keysetId": p["keyset_id"],
+            "amount": p["amount"],
+            "nonce": _hex(p["nonce"]),
+            "C": _hex(p["c"]),
+            # The bit that says whether this money still moves. Dropping it
+            # keeps the proof and loses the state needed to act on it: the mint
+            # side gets N indistinguishable proofs, and a reload resurrects the
+            # spent ones as spendable. See spec/CARD-FILE.md.
+            "spent": p["status"] == "spent",
+        })
 
     doc = {
         "version": CARD_FILE_VERSION,
@@ -1042,53 +994,39 @@ def cmd_selftest(args) -> int:
     print(f"reader: {card.reader}\n")
 
     version = card.select()
-    record(
-        "SELECT applet",
-        True,
-        f"version {version[0]}.{version[1]}" if len(version) >= 2 else "",
-    )
+    record("SELECT applet", True, f"version {version[0]}.{version[1]}" if len(version) >= 2 else "")
 
     info = card.get_info()
-    record(
-        "GET_INFO",
-        True,
-        f"v{info['version']}, {info['max_slots']} slots, PIN {info['pin_state']}",
-    )
-    record(
-        "Schnorr capability advertised",
-        info["schnorr"],
-        f"caps=0x{info['caps_raw']:02X}",
-    )
+    record("GET_INFO", True,
+           f"v{info['version']}, {info['max_slots']} slots, PIN {info['pin_state']}")
+    record("Schnorr capability advertised", info["schnorr"],
+           f"caps=0x{info['caps_raw']:02X}")
 
-    pk = card.get_pubkey()
     # Conformance, not mere parseability: spec/APDU.md fixes the wire format at
-    # 33-byte compressed. A 65-byte card still verifies (see bip340.x_only), but
-    # it is flagged here so the applet mismatch is visible rather than silent.
-    pk_spec = len(pk) == 33 and pk[0] in (0x02, 0x03)
-    pk_form = {33: "compressed", 65: "uncompressed"}.get(len(pk), "unknown")
-    record(
-        "GET_PUBKEY well-formed",
-        pk_spec,
-        f"{_hex(pk)[:20]}… ({len(pk)} bytes, {pk_form})",
-    )
+    # 33-byte compressed. Card.get_pubkey() normalises a 65-byte card so it is
+    # still spendable, but selftest reads the raw bytes so the applet mismatch
+    # is visible as a FAIL rather than silently papered over.
+    pk_raw = card.get_pubkey(raw=True)
+    pk_spec = len(pk_raw) == 33 and pk_raw[0] in (0x02, 0x03)
+    pk_form = {33: "compressed", 65: "uncompressed"}.get(len(pk_raw), "unknown")
+    record("GET_PUBKEY well-formed", pk_spec,
+           f"{_hex(pk_raw)[:20]}… ({len(pk_raw)} bytes, {pk_form})")
+    try:
+        pk = bip340.compress(pk_raw)
+    except ValueError:
+        pk = None
+
+    def verify(message: bytes, signature: bytes) -> bool:
+        # An encoding compress() does not know must read as a failed check,
+        # not as a crash: the card returning *something* is not a pass.
+        return pk is not None and check_signature(pk, message, signature)
 
     card.get_balance()
     record("GET_BALANCE", True, str(card.get_balance()))
 
     status = card.get_slot_status()
-    record(
-        "GET_SLOT_STATUS",
-        len(status) == info["max_slots"],
-        f"{len(status)} status bytes",
-    )
-
-    def verify(message: bytes, signature: bytes) -> bool:
-        try:
-            return check_signature(pk, message, signature)
-        except ValueError:
-            # An encoding x_only() does not know must read as a failed check,
-            # not as a crash: the card returning *something* is not a pass.
-            return False
+    record("GET_SLOT_STATUS", len(status) == info["max_slots"],
+           f"{len(status)} status bytes")
 
     # The whole point: does a signature off this card verify against BIP-340?
     all_sigs_ok = True
@@ -1097,11 +1035,8 @@ def cmd_selftest(args) -> int:
         sig = card.sign(msg)
         ok = verify(msg, sig)
         all_sigs_ok &= ok
-        record(
-            f"SIGN_ARBITRARY + BIP-340 verify [{i + 1}/{args.rounds}]",
-            ok,
-            "" if ok else f"msg={_hex(msg)} sig={_hex(sig)}",
-        )
+        record(f"SIGN_ARBITRARY + BIP-340 verify [{i + 1}/{args.rounds}]", ok,
+               "" if ok else f"msg={_hex(msg)} sig={_hex(sig)}")
 
     # A fresh nonce per call is a BIP-340 requirement and a real security
     # property here: a nonce that is a pure function of (d, msg) leaks the key
@@ -1109,11 +1044,8 @@ def cmd_selftest(args) -> int:
     if args.rounds >= 2:
         fixed = secrets.token_bytes(32)
         s1, s2 = card.sign(fixed), card.sign(fixed)
-        record(
-            "fresh nonce across identical messages",
-            s1[:32] != s2[:32],
-            "R reused — aux randomness is not working" if s1[:32] == s2[:32] else "",
-        )
+        record("fresh nonce across identical messages", s1[:32] != s2[:32],
+               "R reused — aux randomness is not working" if s1[:32] == s2[:32] else "")
 
     failed = [n for n, ok, _ in results if not ok]
     print()
@@ -1134,22 +1066,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Start with:  cardctl readers   then   cardctl selftest",
     )
-    p.add_argument(
-        "-r", "--reader", type=int, default=0, help="reader index (default 0)"
-    )
+    p.add_argument("-r", "--reader", type=int, default=0, help="reader index (default 0)")
     p.add_argument("-v", "--verbose", action="store_true", help="log APDUs to stderr")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("readers", help="list PC/SC readers").set_defaults(func=cmd_readers)
-    sub.add_parser(
-        "info", help="applet version, slot counts, capabilities, PIN state"
-    ).set_defaults(func=cmd_info)
-    sub.add_parser(
-        "pubkey", help="card's compressed secp256k1 public key"
-    ).set_defaults(func=cmd_pubkey)
-    sub.add_parser("balance", help="sum of unspent proof amounts").set_defaults(
-        func=cmd_balance
-    )
+    sub.add_parser("info", help="applet version, slot counts, capabilities, PIN state").set_defaults(func=cmd_info)
+    sub.add_parser("pubkey", help="card's compressed secp256k1 public key").set_defaults(func=cmd_pubkey)
+    sub.add_parser("balance", help="sum of unspent proof amounts").set_defaults(func=cmd_balance)
 
     s = sub.add_parser("slots", help="per-slot status")
     s.add_argument("--all", action="store_true", help="include empty slots")
@@ -1169,11 +1093,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_spend)
 
     s = sub.add_parser("load", help="LOAD_PROOF into the next free slot")
-    s.add_argument(
-        "--keyset",
-        required=True,
-        help="NUT-02 keyset id, 16 hex chars (e.g. 0059534ce0bfa19a)",
-    )
+    s.add_argument("--keyset", required=True,
+                   help="NUT-02 keyset id, 16 hex chars (e.g. 0059534ce0bfa19a)")
     s.add_argument("--amount", type=int, required=True)
     s.add_argument("--nonce", help="32-byte P2PK nonce as hex (random if omitted)")
     s.add_argument("--c", help="33-byte C point as hex (placeholder if omitted)")
@@ -1189,14 +1110,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mint", required=True, help="mint URL these proofs belong to")
     s.add_argument("--unit", default="sat", help="keyset unit (default: sat)")
     s.add_argument("--out", help="write here instead of stdout")
-    s.add_argument(
-        "--force", action="store_true", help="overwrite --out if it already exists"
-    )
-    s.add_argument(
-        "--unspent-only",
-        action="store_true",
-        help="skip spent slots (they are still readable, and still owed)",
-    )
+    s.add_argument("--force", action="store_true",
+                   help="overwrite --out if it already exists")
+    s.add_argument("--unspent-only", action="store_true",
+                   help="skip spent slots (they are still readable, and still owed)")
     s.set_defaults(func=cmd_dump)
 
     s = sub.add_parser("clear-spent", help="free all spent slots")
@@ -1226,9 +1143,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-select", action="store_true", help="skip SELECT first")
     s.set_defaults(func=cmd_apdu)
 
-    s = sub.add_parser(
-        "selftest", help="full hardware check incl. BIP-340 signature verification"
-    )
+    s = sub.add_parser("selftest", help="full hardware check incl. BIP-340 signature verification")
     s.add_argument("--rounds", type=int, default=3, help="signature rounds (default 3)")
     s.set_defaults(func=cmd_selftest)
 

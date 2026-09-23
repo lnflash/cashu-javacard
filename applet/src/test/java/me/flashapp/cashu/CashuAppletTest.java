@@ -153,7 +153,9 @@ class CashuAppletTest {
             "Signature must verify against the key GET_PUBKEY returned");
     }
 
-    @Test @Order(4)
+    // No @Order: a pure static helper with no card state, so it runs after the
+    // ordered APDU sequence rather than displacing its numbering.
+    @Test
     @DisplayName("toCompressed normalises the 65-byte hardware point to 33 bytes")
     void testToCompressed() {
         // jCardSim's getW() already returns 33 bytes, so the branch that runs on
@@ -185,7 +187,45 @@ class CashuAppletTest {
             "an already-compressed key must pass through untouched");
     }
 
-    @Test @Order(5)
+    @Test
+    @DisplayName("toCompressed refuses encodings it does not recognise")
+    void testToCompressedRejectsUnknownEncodings() {
+        // Same policy as SchnorrHW.sign() for the same getW() output: an
+        // encoding we cannot name must not reach the host as a "pubkey".
+        byte[] gx = toBytes32Test(SECP_GX);
+        byte[] gy = toBytes32Test(SECP_GY);
+
+        // 65 bytes without the 0x04 marker.
+        byte[] badMarker = new byte[65];
+        badMarker[0] = 0x05;
+        System.arraycopy(gx, 0, badMarker, 1, 32);
+        System.arraycopy(gy, 0, badMarker, 33, 32);
+        assertCryptoError(() -> CashuApplet.toCompressed(badMarker, (short) 65));
+
+        // A bare X || Y with no marker at all.
+        byte[] bare = new byte[64];
+        System.arraycopy(gx, 0, bare, 0, 32);
+        System.arraycopy(gy, 0, bare, 32, 32);
+        assertCryptoError(() -> CashuApplet.toCompressed(bare, (short) 64));
+
+        // 33 bytes with a prefix that is not 02/03.
+        byte[] badPrefix = new byte[33];
+        badPrefix[0] = 0x04;
+        System.arraycopy(gx, 0, badPrefix, 1, 32);
+        assertCryptoError(() -> CashuApplet.toCompressed(badPrefix, (short) 33));
+
+        // Wrong length outright.
+        assertCryptoError(() -> CashuApplet.toCompressed(new byte[32], (short) 32));
+    }
+
+    private static void assertCryptoError(org.junit.jupiter.api.function.Executable call) {
+        javacard.framework.ISOException thrown =
+            assertThrows(javacard.framework.ISOException.class, call);
+        assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason(),
+            "unrecognised encoding must fail with SW_CRYPTO_ERROR");
+    }
+
+    @Test @Order(4)
     @DisplayName("GET_PUBKEY is stable (same key across multiple calls)")
     void testGetPubkeyStable() {
         byte[] pub1 = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();

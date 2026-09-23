@@ -12,6 +12,10 @@
  *
  * The card is the only signer; this process never sees the private key.
  *
+ * Change proofs are written next to the card file as
+ * <card-file>.change-<slot-nonce-prefix>.json; an existing file is never
+ * overwritten.
+ *
  * Env overrides: CLIENT_DIST (cashu-client build), CARDCTL, CARDCTL_PY.
  */
 const path = require("path")
@@ -72,12 +76,23 @@ async function main() {
   const states = await cc.checkProofStates(MINT, [proof])
   console.log(`mint says   : input is ${states instanceof cc.CashuError ? states.message : states[0].state}`)
 
-  fs.writeFileSync("/tmp/change.json", cc.serializeCardFile({
+  // The change proofs are bearer value and this file is the only copy of their
+  // nonce/C, so the path is unique per run (keyed by the spent slot's nonce)
+  // and never overwritten — cardctl dump takes the same stance behind --force.
+  const outFile = `${CARDFILE.replace(/\.json$/i, "")}.change-${slot.nonce.slice(0, 16)}.json`
+  const body = cc.serializeCardFile({
     mint: MINT, unit: file.unit, cardPubkey: file.cardPubkey,
     slots: change.map((p, i) => ({ keysetId: p.id, amount: p.amount, nonce: blindings[i].nonce, C: p.C, spent: false })),
     note: "change from e2e redeem",
-  }) + "\n")
-  console.log(`wrote       : /tmp/change.json (${change.length} slot(s))`)
+  }) + "\n"
+  try {
+    fs.writeFileSync(outFile, body, { flag: "wx" })
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e
+    console.error(`refusing to overwrite ${outFile}; change proofs follow:\n${body}`)
+    die(`${outFile} already exists`)
+  }
+  console.log(`wrote       : ${outFile} (${change.length} slot(s))`)
   console.log(`\nRESULT: slot ${SLOT} redeemed — the mint accepted the card's signature.`)
 }
 

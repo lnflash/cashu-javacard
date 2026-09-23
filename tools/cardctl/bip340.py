@@ -102,18 +102,29 @@ def verify(pubkey_x: bytes, msg: bytes, sig: bytes) -> bool:
     return True
 
 
-def x_only(pubkey: bytes) -> bytes:
-    """Return the 32-byte x-only key, stripping a 02/03/04 prefix if present.
+def compress(pubkey: bytes) -> bytes:
+    """Return the 33-byte compressed encoding of a secp256k1 public key.
 
-    Accepts a 33-byte compressed key, a 32-byte x-only key, or a 65-byte
-    uncompressed key. The last is defensive interop: spec/APDU.md fixes the
-    card at 33 bytes, but ECPublicKey.getW() returns 65 bytes on real silicon,
-    and an applet built before that was normalised is still spendable.
+    A 33-byte compressed key passes through unchanged. A 65-byte uncompressed
+    key (04 || X || Y) is rewritten to 02/03 || X from the parity of Y. This
+    is the host-side half of the GET_PUBKEY fix: an applet built before the
+    card normalised its output returns ECPublicKey.getW()'s 65 bytes on real
+    silicon, and Card.get_pubkey() runs everything through here so the rest of
+    cardctl (sign, spend, dump, load-file) only ever sees 33 bytes.
     """
     if len(pubkey) == 33 and pubkey[0] in (0x02, 0x03):
-        return pubkey[1:]
+        return pubkey
     if len(pubkey) == 65 and pubkey[0] == 0x04:
-        return pubkey[1:33]
+        return bytes([0x02 | (pubkey[64] & 1)]) + pubkey[1:33]
+    raise ValueError(f"not a secp256k1 pubkey: {len(pubkey)} bytes")
+
+
+def x_only(pubkey: bytes) -> bytes:
+    """Return the 32-byte x-only key.
+
+    Accepts a 32-byte x-only key or anything compress() accepts (33-byte
+    compressed, 65-byte uncompressed).
+    """
     if len(pubkey) == 32:
         return pubkey
-    raise ValueError(f"not a secp256k1 pubkey: {len(pubkey)} bytes")
+    return compress(pubkey)[1:]
