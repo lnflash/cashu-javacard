@@ -110,8 +110,33 @@ melt-amount-required check (the card burns its slot before the mint sees
 anything, so an underfunded melt must be refused host-side), and quote-state
 reconciliation after a non-idempotent payment.
 
+## PIN + `CLEAR_SPENT` (2026-09-22)
+
+The full authentication surface, on silicon (`PIN_MAX_TRIES = 3`, OwnerPIN
+semantics — a successful verify resets the counter):
+
+| Check | Result |
+|---|---|
+| `SET_PIN 1234` | set once; `GET_INFO` flips `PIN unset` → `set` |
+| `VERIFY_PIN 9999` | `63C2` — wrong PIN, **2 retries remaining** |
+| `VERIFY_PIN 1234` | verified; retry counter resets |
+| `CHANGE_PIN 1234→5678` | old PIN invalid afterwards, new PIN verifies |
+| `CHANGE_PIN 5678→1234` | restored |
+| `CLEAR_SPENT` without PIN | `6982` — refused, nothing freed |
+| `CLEAR_SPENT --pin 1234` | **3 slots freed** (0–2), balance 16 intact |
+| `LOAD_PROOF` without a verified session | `6982` — refused before any write |
+
+The write gate was probed at the APDU level (`b0300000` in a fresh session) to
+confirm the applet's ordering: `requirePinIfSet()` is the first statement of
+`processLoadProof`, so an unverified session cannot reach payload validation or
+a slot write. Spends stay PIN-free by design — `SPEND_PROOF` sits in category
+0x2x precisely because a bearer card must tap-to-pay with no PIN (spec, line
+162–164); the e2e melt/redeem scripts therefore keep working with a PIN set.
+
+Card left personalised: PIN `1234`, slots 0–2 reclaimed, slot 3 unspent (16 sat).
+
 ## Not exercised
 
-`clear-spent`, `set-pin`, `change-pin`, `lock` were not run (state-changing /
-irreversible). Melting an *external* merchant invoice (rather than the
-self-referential mint quote used here) differs only in the bolt11 supplied.
+`lock` (permanently disables writes — deliberately not run on a card holding
+value). Melting an *external* merchant invoice (rather than the self-referential
+mint quote used here) differs only in the bolt11 supplied.
