@@ -243,8 +243,24 @@ class Card:
             "pin_state": {0: "unset", 1: "set", 2: "locked"}.get(b[7], f"unknown({b[7]})"),
         }
 
-    def get_pubkey(self) -> bytes:
-        return self.send(INS_GET_PUBKEY, le=0x21, context="GET_PUBKEY")
+    def get_pubkey(self, raw: bool = False) -> bytes:
+        """The card's secp256k1 public key, normalised to 33-byte compressed.
+
+        spec/APDU.md fixes the wire format at 33 bytes, but an applet built
+        before GET_PUBKEY was normalised returns ECPublicKey.getW()'s 65-byte
+        uncompressed point on real silicon. Compressing here, at the single
+        ingress, means every consumer — sign/spend verification, `dump`'s card
+        file, `load-file`'s ownership check — sees the same 33-byte key and an
+        old applet stays spendable end to end. `raw=True` returns the bytes as
+        the card sent them, for `selftest` to report the off-spec encoding.
+        """
+        pk = self.send(INS_GET_PUBKEY, le=0x21, context="GET_PUBKEY")
+        if raw:
+            return pk
+        try:
+            return bip340.compress(pk)
+        except ValueError as exc:
+            raise SystemExit(f"GET_PUBKEY: {exc}")
 
     def get_balance(self) -> int:
         return int.from_bytes(self.send(INS_GET_BALANCE, le=0x04, context="GET_BALANCE"), "big")
@@ -986,9 +1002,24 @@ def cmd_selftest(args) -> int:
     record("Schnorr capability advertised", info["schnorr"],
            f"caps=0x{info['caps_raw']:02X}")
 
-    pk = card.get_pubkey()
-    good_pk = len(pk) == 33 and pk[0] in (0x02, 0x03)
-    record("GET_PUBKEY well-formed", good_pk, f"{_hex(pk)[:20]}… ({len(pk)} bytes)")
+    # Conformance, not mere parseability: spec/APDU.md fixes the wire format at
+    # 33-byte compressed. Card.get_pubkey() normalises a 65-byte card so it is
+    # still spendable, but selftest reads the raw bytes so the applet mismatch
+    # is visible as a FAIL rather than silently papered over.
+    pk_raw = card.get_pubkey(raw=True)
+    pk_spec = len(pk_raw) == 33 and pk_raw[0] in (0x02, 0x03)
+    pk_form = {33: "compressed", 65: "uncompressed"}.get(len(pk_raw), "unknown")
+    record("GET_PUBKEY well-formed", pk_spec,
+           f"{_hex(pk_raw)[:20]}… ({len(pk_raw)} bytes, {pk_form})")
+    try:
+        pk = bip340.compress(pk_raw)
+    except ValueError:
+        pk = None
+
+    def verify(message: bytes, signature: bytes) -> bool:
+        # An encoding compress() does not know must read as a failed check,
+        # not as a crash: the card returning *something* is not a pass.
+        return pk is not None and check_signature(pk, message, signature)
 
     card.get_balance()
     record("GET_BALANCE", True, str(card.get_balance()))
@@ -1002,7 +1033,7 @@ def cmd_selftest(args) -> int:
     for i in range(args.rounds):
         msg = secrets.token_bytes(32)
         sig = card.sign(msg)
-        ok = check_signature(pk, msg, sig)
+        ok = verify(msg, sig)
         all_sigs_ok &= ok
         record(f"SIGN_ARBITRARY + BIP-340 verify [{i + 1}/{args.rounds}]", ok,
                "" if ok else f"msg={_hex(msg)} sig={_hex(sig)}")

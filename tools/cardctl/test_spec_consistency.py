@@ -468,7 +468,8 @@ _PROOF_BODY = b"\x01" + bytes(8) + bytes(4) + bytes(32) + b"\x02" + bytes(32)
 # Lc or Le in the fixed `XX` form.
 _LENGTH_CASES = (
     ("GET_INFO", "get_info", (), bytes(8)),
-    ("GET_PUBKEY", "get_pubkey", (), bytes(33)),
+    # get_pubkey() validates the point encoding, so the canned reply must parse.
+    ("GET_PUBKEY", "get_pubkey", (), b"\x02" + bytes(32)),
     ("GET_BALANCE", "get_balance", (), bytes(4)),
     ("GET_PROOF_COUNT", "get_proof_count", (), b"\x00"),
     ("GET_PROOF", "get_proof", (0,), _PROOF_BODY),

@@ -12,15 +12,19 @@ Five components across four repositories plus a running mint:
 
 | Component | Repo | Language | Status |
 |---|---|---|---|
-| **Applet** — the card firmware | [`cashu-javacard`](https://github.com/lnflash/cashu-javacard) `applet/` | JavaCard | Builds, CI green, **never run on hardware** |
-| **cardctl** — host driver | [`cashu-javacard`](https://github.com/lnflash/cashu-javacard) `tools/cardctl/` | Python | Works; untested against a real card |
-| **cashu-client** — mint protocol | [`cashu-client`](https://github.com/lnflash/cashu-client) | TypeScript | Load + redeem implemented |
+| **Applet** — the card firmware | [`cashu-javacard`](https://github.com/lnflash/cashu-javacard) `applet/` | JavaCard | **Hardware-proven** — selftest 10/10; load/spend/melt/PIN all run on silicon (see the [test report](HARDWARE_TEST_REPORT_2026-09-22.j3r180.md)) |
+| **cardctl** — host driver | [`cashu-javacard`](https://github.com/lnflash/cashu-javacard) `tools/cardctl/` | Python | Proven against a real card (ACR122U) |
+| **cashu-client** — mint protocol | [`cashu-client`](https://github.com/lnflash/cashu-client) | TypeScript | Load + redeem implemented; both proven end-to-end on hardware via `tools/e2e-*.cjs` |
 | **Card artwork** — physical design | [`flash-card-assets`](https://github.com/lnflash/flash-card-assets) | SVG/PDF | Draft v1, not released to plate |
 | **Flash Forge** — the mint | `forge.flashapp.me` | Nutshell (Python) | **Live, solvent, in production** |
-| **Merchant terminal** | — | — | ❌ **Does not exist** |
+| **Merchant terminal** | [`flash-pos`](https://github.com/lnflash/flash-pos) | React Native | Read path (`SELECT/GET_INFO/GET_PUBKEY/GET_BALANCE`) **hardware-validated on iOS**; spend wiring pending — the offline settlement queue (#68) is merged and waiting for it |
 
-That last row is the honest gap. `flash-pos` contains no Cashu code. Until a
-terminal exists, the card can be loaded and read but not spent in the field.
+The terminal gap is closing. flash-pos carries the Cashu card spike (#67:
+IsoDep APDU transport) and the offline settlement queue for card payments
+(#68); on 2026-09-23 its read path ran against a real card from an iPhone —
+see the test report. What remains before a card can be *spent in the field* is
+the spend wiring: the mint round-trip from `cashu-client` behind the
+settlement queue, plus the top-up (PIN) path.
 
 ## Trust boundaries
 

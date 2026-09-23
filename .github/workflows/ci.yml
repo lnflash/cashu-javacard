@@ -80,6 +80,23 @@ jobs:
           pip install -r tools/cardctl/requirements.txt
           python -c "import smartcard.scard; print('pyscard import OK')"
 
+  e2e-tools:
+    name: e2e tool tests (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Argument parsing for tools/e2e-melt.cjs. Needs no card and no
+      # cashu-client build: the test only loads parseArgs/recoveredPath.
+      # The glob is quoted so node, not the shell, expands it (Node 21+ treats
+      # positional args as file paths, so a bare directory does not work).
+      - name: Run tests
+        run: node --test 'tools/**/*.test.cjs'
+
   cap:
     name: CAP conversion
     runs-on: ubuntu-latest
