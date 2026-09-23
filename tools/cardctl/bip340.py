@@ -88,12 +88,9 @@ def verify(pubkey_x: bytes, msg: bytes, sig: bytes) -> bool:
     if r >= P or s >= N:
         return False
 
-    e = (
-        int.from_bytes(
-            tagged_hash("BIP0340/challenge", sig[:32] + pubkey_x + msg), "big"
-        )
-        % N
-    )
+    e = int.from_bytes(
+        tagged_hash("BIP0340/challenge", sig[:32] + pubkey_x + msg), "big"
+    ) % N
 
     # R = s*G - e*P
     big_r = _point_add(_point_mul(G, s), _point_mul(point, N - e))

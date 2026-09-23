@@ -1,4 +1,4 @@
-// node --test tools/
+// node --test tools/e2e-melt.test.cjs
 //
 // Argument handling for e2e-melt.cjs. The script itself needs a card and a
 // cashu-client build; this only loads parseArgs/recoveredPath, which is why

@@ -81,6 +81,13 @@ Returns the card's secp256k1 public key (compressed, 33 bytes). This key is gene
 | Le | 21 |
 | Response | 33-byte compressed public key |
 
+**Errors:**
+
+| SW | Meaning |
+|----|---------|
+| 9000 | OK |
+| 6F00 | Key encoding not recognised (hardware error) |
+
 ---
 
 ### GET_BALANCE (0x11)
