@@ -8,14 +8,17 @@ account, and no internet at the point of sale.
 Reference implementation of **NUT-XX: Cashu NFC Card Protocol**, Profile B
 (Bearer/Offline).
 
-> ### Status: R&D — no card has run this yet
+> ### Status: hardware-proven, single-card R&D
 >
-> The applet builds into a verified CAP and its cryptography is correct **in
-> simulation**. It has never executed on physical silicon, and there is **no
-> merchant terminal software** — `flash-pos` contains no Cashu code today.
-> Two bugs found in review were invisible to the simulator and would each have
-> been fatal in the field. Read [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md)
-> before trusting anything here with money.
+> The applet has run on physical silicon end to end: selftest 10/10, and the
+> full money loop — fund → load → tap-to-spend on an iPhone → NUT-03
+> settlement at the mint → NUT-05 Lightning melt — executed on an NXP JCOP4
+> J3R180 against `forge.flashapp.me`. The merchant terminal
+> (`flash-pos`) carries the same protocol and has spent a real card over NFC.
+> See the [hardware test report](docs/HARDWARE_TEST_REPORT_2026-09-22.j3r180.md)
+> for evidence, and [`docs/SECURITY-MODEL.md`](docs/SECURITY-MODEL.md) before
+> trusting anything here with real money at scale — fleet provisioning, key
+> rotation and the payout sweep to merchant accounts are still ahead.
 
 ## Start here
 

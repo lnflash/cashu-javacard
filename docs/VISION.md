@@ -137,21 +137,30 @@ Related internal proposals for the surrounding context:
 **FIP-05** (MonCash cross-border), **FIP-06** (phone-number Bitcoin sends) —
 both are about reaching people the app cannot, which is the same motivation.
 
-## Status: this is R&D
+## Status: the milestone is behind us — scale is ahead
 
-Be clear-eyed about maturity. As of this writing:
+The milestone this document set — *the first real signature off a JavaCard
+3.0.5 chip* — has happened, and then some. As of this writing:
 
-- The applet **builds and its crypto is correct in simulation** — but has never
-  run on a physical card. Two bugs found in review (a modular-reduction carry
-  error and an EEPROM leak) were both invisible to the simulator and would each
-  have been fatal in the field.
-- There is **no merchant terminal software**. `flash-pos` contains no Cashu code.
-  Any document describing an end-to-end tap-to-pay flow is describing intent.
-- The `cardctl` tool can drive a card over PC/SC once one exists.
-- `cashu-client` can now load *and* redeem, which it could not before.
+- The applet **runs on physical silicon** (NXP JCOP4 J3R180): selftest 10/10,
+  and every command the applet advertises except `LOCK_CARD` has executed on
+  hardware. Three bugs the simulator could not show were found and fixed on
+  silicon — including a 65-byte `GET_PUBKEY` that would have failed every
+  merchant reader in the field.
+- **The whole money loop has run end to end**: fund → load → tap-to-spend →
+  NUT-03 redemption → NUT-05 Lightning melt, twice over, against a live mint —
+  and then again from the merchant terminal: `flash-pos` spent a real card
+  over phone NFC and settled it at the mint (see the
+  [hardware test report](HARDWARE_TEST_REPORT_2026-09-22.j3r180.md)).
+- The settlement queue, spend orchestrator, and payout melt are implemented in
+  `flash-pos` against the production mint.
+- What is **still ahead**: the backend sweep that credits merchant balances
+  from settled proofs, fleet provisioning, key-rotation policy, and the
+  remaining PIN/top-up surface in the terminal.
 
-The first real signature off a JavaCard 3.0.5 chip is the milestone that turns
-this from a design into a product. It has not happened yet.
+The milestone that turns this from a validated design into a product is no
+longer a signature — it is **the second card**. Everything above was proven
+with one card, one reader and one phone.
 
 ## What would make this project fail
 
