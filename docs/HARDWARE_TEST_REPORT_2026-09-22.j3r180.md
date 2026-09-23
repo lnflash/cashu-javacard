@@ -166,6 +166,45 @@ followed by `NFDriverNotifyDiscovery … tag removed` brackets the session; iOS
 masks APDU payloads (`<private>`), so the on-screen values are the evidence of
 record. Android remains unexercised.
 
+## Merchant-terminal spend, settled from a phone (2026-09-23)
+
+The Flash POS spend path (`lnflash/flash-pos`, settlement-queue branch) spent
+this card's last unspent slot from an iPhone and settled it at the mint — the
+full merchant flow, not a dev harness:
+
+```
+tap      : SELECT → GET_INFO → GET_SLOT_STATUS → GET_PROOF(slot 3)
+           → secret rebuilt from nonce + card pubkey
+           → SPEND_PROOF : slot burned, BIP-340 witness returned
+record   : settlement entry persisted (Keychain-backed queue) — "paid"
+settle   : NUT-03 swap at forge with the card's witness attached
+proof    : mint checkstate of that exact proof: UNSPENT (before, 21:40Z)
+           → SPENT (after) — observed from the reference toolchain,
+           independent of the phone
+```
+
+The spend ran with the card's PIN set — `SPEND_PROOF` is category 0x2x and
+correctly PIN-free — so this doubles as the first PIN-set spend-path
+validation. The terminal runs the same production queue (`recordSpend` →
+`drainQueue`), not a parallel test flow.
+
+Three on-device integration failures were hit and fixed at the root during
+this run, each invisible to every simulator and unit suite:
+
+| Failure | Root cause | Fix |
+|---|---|---|
+| `TextDecoder` undefined at boot | Hermes has no TextEncoder/Decoder; cashu-ts instantiates decoders at module top level | polyfill import ahead of the cashu stack |
+| `crypto.getRandomValues must be defined` | noble's `randomBytes` needs webcrypto; swap outputs need randomness | `react-native-get-random-values` (the old package name 404s on npm) |
+| `URL.protocol is not implemented` | RN's built-in URL stub is incomplete; cashu-ts parses mint URLs | global `react-native-url-polyfill/auto` |
+
+Plus one adapter bug found in the field and regression-guarded: a rate-limited
+`loadMint` used to cache its rejected wallet promise, so the entry sat
+`pending` across retries while the adapter never reached the network — failed
+wallet promises are now evicted. `Metro` needed
+`unstable_enablePackageExports` (cashu-ts v4 is ESM-only, no `main`) with
+`unstable_conditionNames: ['require', 'react-native']` for the tslib/Apollo
+interaction. See flash-pos `856713b` for the full change.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding
