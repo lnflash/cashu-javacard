@@ -135,6 +135,37 @@ a slot write. Spends stay PIN-free by design — `SPEND_PROOF` sits in category
 
 Card left personalised: PIN `1234`, slots 0–2 reclaimed, slot 3 unspent (16 sat).
 
+## First contact from the merchant terminal (2026-09-23)
+
+The Flash POS spike (`lnflash/flash-pos` #67) — an *independent* implementation
+of this spec's read path in TypeScript (`src/services/cashuCard.ts`) — ran
+against this card over phone NFC: dev build on an iPhone 13 Pro Max (iOS 26.5),
+IsoDep transport, entitlement `com.apple.developer.nfc.readersession.formats`
+carrying `TAG`, AIDs `D2760000850102`/`D276000085010201` declared in
+`Info.plist`.
+
+`SELECT → GET_INFO → GET_PUBKEY → GET_BALANCE` all succeeded on the **first
+hardware session**: applet version 0.1, balance 16 sat, public key
+`03858498d50d2545…4d` — byte-identical to the key `cardctl` reads over the
+ACR122U reference reader, on the same card, minutes apart.
+
+Two things this proves:
+
+- **The 33-byte fix held across implementations.** flash-pos's parser
+  *requires* 33 bytes and was written against the spec without ever touching
+  silicon; its fake-card tests could never have caught the old behaviour. The
+  fixed applet is what made this first contact pass — the pre-fix applet
+  (65-byte `getW()`) would have failed it, again.
+- **Two independent implementations of one spec now agree on real hardware**
+  (`cardctl`/Python over PC-SC; `cashuCard.ts`/TypeScript over CoreNFC). That
+  is the differential check this project's docs ask for, done where drift
+  costs money.
+
+nfcd corroboration from the USB syslog: `_NFHardwareManager … startNextSession`
+followed by `NFDriverNotifyDiscovery … tag removed` brackets the session; iOS
+masks APDU payloads (`<private>`), so the on-screen values are the evidence of
+record. Android remains unexercised.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding
