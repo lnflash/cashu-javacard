@@ -68,6 +68,7 @@ jobs:
           python test_apdu.py
           python test_spec_consistency.py
           python test_card_file.py
+          python test_hwtest_65byte_pubkey.py
 
       # Prove requirements.txt is actually installable. pyscard ships a native
       # _scard module and is the one dependency that can install "successfully"

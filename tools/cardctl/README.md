@@ -170,10 +170,23 @@ python3 test_bip340.py            # verifier: spec vectors, reference round-trip
 python3 test_apdu.py              # every command's bytes, against spec/APDU.md
 python3 test_spec_consistency.py  # cardctl vs spec/APDU.md, parsed from the doc
 python3 test_card_file.py         # card file read/write, against spec/CARD-FILE.md
+python3 test_hwtest_65byte_pubkey.py  # host-side pubkey normalisation used by hwtest_65byte_pubkey.py
 ```
 
-All four run without a reader or a card. The BIP-340 tests matter more than they
+All five run without a reader or a card. The BIP-340 tests matter more than they
 look: `selftest`'s verdict is only as trustworthy as the verifier behind it, so
 that verifier is checked against the specification's own vectors, round-tripped
 against an independent reference signer, and mutation-tested to prove it can
 say *no*.
+
+`hwtest_65byte_pubkey.py` is the one script here that *does* need a card. It is
+the check behind section 8 of
+[`docs/HARDWARE_TEST_REPORT_2026-09-01.j3r452.md`](../../docs/HARDWARE_TEST_REPORT_2026-09-01.j3r452.md):
+on a card whose `GET_PUBKEY` returns a 65-byte uncompressed point (the applet
+before #23) it normalises the key on the host, confirms the point is on
+secp256k1, and then runs the same sign/verify and nonce-freshness rounds as
+`selftest`. It sends only SELECT, GET_PUBKEY and SIGN_ARBITRARY.
+
+```bash
+python3 hwtest_65byte_pubkey.py -r 1   # reader index, as for cardctl
+```

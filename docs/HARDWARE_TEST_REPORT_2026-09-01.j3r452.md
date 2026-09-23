@@ -4,6 +4,7 @@
 - **Repository commit:** `afe1081220663f66b8fc9e8445800e599672e849`
 - **Scope:** Host-side tests, reader discovery, physical-card `selftest`, and safe read/sign commands documented in `tools/cardctl/README.md`
 - **Overall result:** The applet's core physical-hardware functionality passed. The unmodified `cardctl selftest` and `cardctl sign` commands terminate with an exception because the physical card returns a 65-byte uncompressed public key, exposing a public-key encoding incompatibility between the applet, specification, and host tool.
+- **Status:** defect fixed in #23; this report documents the pre-fix behaviour at afe1081.
 
 ## 1. Executive summary
 
@@ -52,8 +53,8 @@ Build command:
 
 ```powershell
 docker run --rm `
-  -v "C:\Users\richa\Documents\github\cashu-javacard:/workspace/cashu-javacard" `
-  -v "C:\Users\richa\Documents\github\SatochipApplet\sdks\jc305u4_kit:/opt/jc305u4_kit:ro" `
+  -v "<path-to>/cashu-javacard:/workspace/cashu-javacard" `
+  -v "<path-to>/jc305u4_kit:/opt/jc305u4_kit:ro" `
   cirne/javacard-great-again:latest `
   sh -lc "cd /workspace/cashu-javacard/applet; ant cap -Djc.sdk=/opt/jc305u4_kit"
 ```
@@ -245,7 +246,13 @@ Result: **PASS**
 
 ## 8. Compatibility verification for the 65-byte key
 
-To confirm that the observed failure was only a host-format limitation, an additional compatibility test performed the following steps:
+To confirm that the observed failure was only a host-format limitation, an additional compatibility test performed the following steps. The test is `tools/cardctl/hwtest_65byte_pubkey.py` in this repository; it was run from `tools/cardctl` with the same virtual environment and reader index as the commands above:
+
+```powershell
+.\.venv\Scripts\python.exe .\hwtest_65byte_pubkey.py -r 1
+```
+
+The script sends only `SELECT`, `GET_PUBKEY`, and `SIGN_ARBITRARY`, and its pure host-side part (curve check and compression) is covered without a card by `tools/cardctl/test_hwtest_65byte_pubkey.py`, which pins the exact 65-byte key recorded in section 6.1. It performed the following steps:
 
 1. accepted the 65-byte `0x04 || X || Y` public key;
 2. checked that `(X, Y)` satisfies the secp256k1 curve equation;
@@ -301,7 +308,7 @@ The tested physical card returns a 65-byte uncompressed public key. The current 
 
 ### 9.4 Recommended fix
 
-Preferred specification-conforming fix:
+Implemented in #23. Preferred specification-conforming fix:
 
 1. in the applet's `processGetPubkey()`, compress `0x04 || X || Y` returned by `getW()` into `0x02/0x03 || X`;
 2. always return exactly 33 bytes;

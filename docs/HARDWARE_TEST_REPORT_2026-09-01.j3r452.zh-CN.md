@@ -4,6 +4,7 @@
 - **仓库提交：** `afe1081220663f66b8fc9e8445800e599672e849`
 - **测试范围：** `tools/cardctl/README.md` 中定义的主机端测试、读卡器发现、实体卡 `selftest` 及安全的只读/签名命令
 - **总体结论：** Applet 的实体硬件核心功能通过测试；未修改的 `cardctl selftest` 和 `cardctl sign` 因实体卡返回 65 字节非压缩公钥而异常退出，暴露出 Applet、规范和主机工具之间的公钥编码兼容性问题。
+- **状态：** 缺陷已在 #23 中修复；本报告记录的是 afe1081 修复前的行为。
 
 ## 1. 摘要
 
@@ -52,8 +53,8 @@
 
 ```powershell
 docker run --rm `
-  -v "C:\Users\richa\Documents\github\cashu-javacard:/workspace/cashu-javacard" `
-  -v "C:\Users\richa\Documents\github\SatochipApplet\sdks\jc305u4_kit:/opt/jc305u4_kit:ro" `
+  -v "<path-to>/cashu-javacard:/workspace/cashu-javacard" `
+  -v "<path-to>/jc305u4_kit:/opt/jc305u4_kit:ro" `
   cirne/javacard-great-again:latest `
   sh -lc "cd /workspace/cashu-javacard/applet; ant cap -Djc.sdk=/opt/jc305u4_kit"
 ```
@@ -243,7 +244,13 @@ balance          : 0
 
 ## 8. 65 字节公钥兼容验证
 
-为确认错误仅来自主机工具格式限制，补充执行了以下兼容测试：
+为确认错误仅来自主机工具格式限制，补充执行了以下兼容测试。测试脚本为本仓库的 `tools/cardctl/hwtest_65byte_pubkey.py`，在 `tools/cardctl` 目录下使用与上述命令相同的虚拟环境和 reader index 运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\hwtest_65byte_pubkey.py -r 1
+```
+
+该脚本仅发送 `SELECT`、`GET_PUBKEY` 和 `SIGN_ARBITRARY`；其纯主机端部分（曲线校验与压缩）由 `tools/cardctl/test_hwtest_65byte_pubkey.py` 在无卡情况下覆盖，该测试固定使用第 6.1 节记录的 65 字节公钥。测试步骤如下：
 
 1. 接受 `0x04 || X || Y` 形式的 65 字节公钥；
 2. 验证 `(X, Y)` 满足 secp256k1 曲线方程；
@@ -299,7 +306,7 @@ MANUAL HARDWARE SELFTEST: PASS
 
 ### 9.4 建议修复
 
-首选规范一致性修复：
+已在 #23 中实现。首选规范一致性修复：
 
 1. 在 Applet 的 `processGetPubkey()` 中将 `getW()` 返回的 `0x04 || X || Y` 压缩为 `0x02/0x03 || X`；
 2. 始终返回恰好 33 字节；
