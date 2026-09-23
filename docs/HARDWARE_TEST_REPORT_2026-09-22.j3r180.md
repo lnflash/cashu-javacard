@@ -82,8 +82,36 @@ This exercises `LOAD_PROOF`, `SPEND_PROOF` (spend-before-sign ordering), the
 NUT-10 secret reconstruction, NUT-11 witness, and NUT-03/DLEQ on real silicon —
 the applet, the card file, and the host client together.
 
+## NUT-05 melt on a Lightning invoice (2026-09-22)
+
+The redeem path above settles through a NUT-03 swap. The real terminal settle is
+a **melt**: hand the mint the card's proof and have its Lightning node pay an
+invoice. Run with `tools/e2e-melt.cjs`:
+
+```text
+quotes      : invoice 16 sat + reserve 0 = needs 16 of 16
+  card>     slot 2 before : unspent, amount 16
+  card>     BIP-340   : VALID ✅
+  card>     slot 2 after  : spent
+melt        : quote 01a0cf72-… — 16 in, 0 back as change [none]
+melt state  : PAID
+recovered   : 1 minted + 0 change = 16 sat (net Lightning cost 0)
+```
+
+The invoice melted was a fresh mint quote at the same mint, so the payment is
+verifiable in both directions: the melt returned `PAID` with a preimage, the
+quote flipped `PAID` on the mint side, the paid value was minted back out,
+relocked to the card key, and reloaded (`slot 3: 16 sat`). Card value moved
+card → Lightning → card with zero loss — the mint charged no fee reserve on a
+16-sat invoice.
+
+This exercises NUT-05 quote + execute with a P2PK-locked input and witness, the
+melt-amount-required check (the card burns its slot before the mint sees
+anything, so an underfunded melt must be refused host-side), and quote-state
+reconciliation after a non-idempotent payment.
+
 ## Not exercised
 
 `clear-spent`, `set-pin`, `change-pin`, `lock` were not run (state-changing /
-irreversible). The change proof was relocked to the card and reloaded rather
-than melted, so a bolt11 melt (NUT-05) is also still unrun on silicon.
+irreversible). Melting an *external* merchant invoice (rather than the
+self-referential mint quote used here) differs only in the bolt11 supplied.
