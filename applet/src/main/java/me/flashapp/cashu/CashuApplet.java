@@ -40,7 +40,7 @@ public class CashuApplet extends Applet {
     // Applet version
     // -------------------------------------------------------------------------
     static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x01;
+    static final byte VERSION_MINOR = (byte) 0x02;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
