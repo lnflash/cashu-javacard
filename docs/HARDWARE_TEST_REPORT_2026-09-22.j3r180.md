@@ -245,6 +245,31 @@ reinstall — applet surgery lesson: dump + sweep before surgery).
 Gate ordering proven live: the PIN check precedes slot validation and the
 burn, so an unverified session learns nothing and consumes nothing.
 
+## Field-hardening ledger — POS integration (2026-09-23/24)
+
+The terminal integration surfaced one failure mode per layer, each fixed at
+the root in flash-pos with a regression test, each invisible to the layer
+below it:
+
+| # | Failure (field symptom) | Root cause | Fix |
+|---|---|---|---|
+| 1 | `TextDecoder` undefined at boot | Hermes lacks TextEncoder/Decoder; cashu-ts instantiates decoders at module top level | polyfill chain ahead of the cashu stack |
+| 2 | `crypto.getRandomValues must be defined` | noble's randomBytes needs webcrypto (swap outputs need randomness) | `react-native-get-random-values` |
+| 3 | `URL.protocol is not implemented` | RN's URL stub is incomplete; cashu-ts parses mint URLs | global `react-native-url-polyfill/auto` |
+| 4 | `Metro cannot resolve @cashu/cashu-ts` | v4 is ESM-only, no `main` fallback | `unstable_enablePackageExports` + require/react-native conditions (tslib/Apollo interplay) |
+| 5 | 65-byte `GET_PUBKEY` (this report, above) | `ECPublicKey.getW()` uncompressed on silicon | applet v0.2 normalises to 33 |
+| 6 | `payment recorded, but change could not be written` | greedy largest-first coin selection burned the 256 for a 14-sat bill (change 242 from a 16-sat till) | ranked coin selection: exact DP → smallest covering proof → ascending |
+| 7 | `proofs already spent` after a CoreNFC framing error | the multi-slot charge lacked the mid-burn recovery guard | shared `burnPlannedSlot` (re-read → needs-card) |
+| 8 | `[making change] proofs already spent` | a till proof consumed by an earlier swap but still listed | 11001 reconcile: checkstate, drop stale listings |
+| 9 | `the till cannot make N exact change` while ONLINE | the pre-burn till gate blocked change the mint could fund | **atomic charge swap**: burned proofs in → P2PK change + merchant take out; the till never gates |
+| 10 | `Cashu payout pending: Proofs already spent` on every foreground | till drift: a consumed proof still listed broke every sweep | `reconcileTill` before every sweep |
+| 11 | `Bitcoin price is still loading` blocked every charge | the price rode a websocket the backend does not expose; a cold start cost a tap | HTTP polling + one on-demand fetch before the bounce |
+| 12 | the rate-limited rebalance refused a fundable change | a charge is a network burst; forge throttles bursts | `withRateLimitRetry` on the rebalance and change legs |
+
+Also proven: the PIN round-trip (D13) — a POS-minted P2PK change written onto
+the card was re-signed by the reference driver from the stored nonce alone
+(`BIP-340 VALID`), closing the loop on terminal-issued change.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding
