@@ -207,7 +207,7 @@ unlinkability.
 
 ---
 
-## <a id="d12"></a>D12 — No PIN on spending, in the base profile
+## <a id="d12"></a>D12 — No PIN on spending, in the base profile (SUPERSEDED by D13)
 
 `SPEND_PROOF` requires no authentication. `LOAD_PROOF`, `CLEAR_SPENT` and
 `LOCK_CARD` are PIN-gated; spending is not.
@@ -217,14 +217,46 @@ is also the design's sharpest edge — **a hostile reader in range can drain a
 card**, and the spec's Profile B+ (PIN-gated spending) is written but not
 implemented.
 
-This is a genuine open product decision, not a settled one. It is tracked
-against the same fraud finding that covers the current Flashcard's re-link gap
-(ENG-209), and it should be resolved before any volume issuance. See
-[`SECURITY-MODEL.md`](SECURITY-MODEL.md).
+This was a genuine open product decision, tracked against the same fraud
+finding that covers the current Flashcard's re-link gap (ENG-209).
+**Resolved by [`D13`](#d13): spending is PIN-gated when a PIN is set.**
 
 ---
 
-## How to propose a change to one of these
+## <a id="d13"></a>D13 — PIN-gated spending on personalised cards (supersedes D12)
+
+`SPEND_PROOF` and `SIGN_ARBITRARY` are PIN-gated **when a PIN is set**;
+`VERIFY_PIN` in the same NFC session authorises both. `LOAD_PROOF`,
+`CLEAR_SPENT` and `LOCK_CARD` keep their existing gate. Cards provisioned
+without a PIN keep the D12 tap-and-go behaviour.
+
+This resolves the open decision D12 deferred (Profile B+; ENG-209): the pilot
+chose Visa-style authorisation — possession **and** knowledge authorise
+payment — because a hostile reader in the D12 model could drain a card it was
+presented, and because POS cards now ship PIN-set by default.
+
+Why `SIGN_ARBITRARY` is gated with it: the signature is a spend authorisation
+under the card's key (it is the recovery path's witness material), so an
+unverified session must not be able to mint one — otherwise the spend gate is
+theatre.
+
+Burn ordering is unaffected: the gate is the first statement of the spend
+handler, so a wrong or missing PIN throws `6982` **before** the slot burn —
+no proof is consumed on a failed authorisation.
+
+**Lockout semantics (pilot):** `PIN_MAX_TRIES` (3) exhausted → `6983`, the
+card's PIN-verified operations are dead, and there is **no unblock path** in
+this profile — a blocked card is replaced at re-provisioning. An
+`UNBLOCK_PIN` command gated by a provisioning PUK is the designated follow-up
+**before volume issuance**; do not ship consumer cards at scale without it.
+
+Provisioning: POS cards are personalised with a PIN by default
+(`cardctl set-pin` during personalisation; `fund-card --pin` when the funding
+tool gains it). The merchant terminal prompts for the PIN only when
+`GET_INFO.pinState` reports `set`.
+
+---
+
 
 Small changes: open a PR and reference the decision id (e.g. "revisits D5").
 

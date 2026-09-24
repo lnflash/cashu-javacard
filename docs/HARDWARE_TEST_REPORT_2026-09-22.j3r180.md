@@ -228,6 +228,23 @@ That is the complete product loop — a physical card, a phone, an offline
 settlement queue, a mint, and a merchant wallet — with every hop on real
 hardware and real Lightning.
 
+## Applet v0.2 — PIN-gated spending on silicon (2026-09-23, D13)
+
+The v0.2 CAP (`sha256 939cf24a…`, applet version 0.2) implements D13:
+`SPEND_PROOF` and `SIGN_ARBITRARY` are PIN-gated when a PIN is set. Fresh
+install (keypair regenerated — the card is now `03ae9d74…`; the previous
+5 sat of on-card proofs were locked to the old key and stranded by the
+reinstall — applet surgery lesson: dump + sweep before surgery).
+
+| Probe | Result |
+|---|---|
+| `selftest --pin 1234` | **11/11 PASS** — v0.2, `VERIFY_PIN` session-verified, gated `SIGN_ARBITRARY` × 3 with fresh nonces |
+| `spend` without `--pin` (loaded slot) | `6982 security condition not satisfied (PIN required but not verified)` — **slot left unspent** |
+| `spend --pin 1234` | `BIP-340 VALID ✅`, slot `spent` |
+
+Gate ordering proven live: the PIN check precedes slot validation and the
+burn, so an unverified session learns nothing and consumes nothing.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding

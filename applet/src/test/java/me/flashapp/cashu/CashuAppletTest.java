@@ -100,7 +100,7 @@ class CashuAppletTest {
         byte[] data = resp.getData();
         assertEquals(2, data.length, "Version response must be 2 bytes");
         assertEquals(0x00, data[0], "Major version = 0");
-        assertEquals(0x01, data[1], "Minor version = 1");
+        assertEquals(0x02, data[1], "Minor version = 2 (D13 PIN-gated spend)");
     }
 
     // =========================================================================
@@ -115,7 +115,7 @@ class CashuAppletTest {
         byte[] d = resp.getData();
         assertEquals(8, d.length, "GET_INFO must return 8 bytes");
         assertEquals(0x00, d[0] & 0xFF, "major version");
-        assertEquals(0x01, d[1] & 0xFF, "minor version");
+        assertEquals(0x02, d[1] & 0xFF, "minor version");
         assertEquals(MAX_PROOFS, d[2] & 0xFF, "max slots = 32");
         assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
         assertEquals(0, d[4] & 0xFF, "spent = 0 initially");
@@ -1144,5 +1144,84 @@ class CashuAppletTest {
     // Expose ISO7816 constants for tests
     static class ISO7816 {
         static final int SW_COMMAND_NOT_ALLOWED = 0x6986;
+
+}
+
+    // =========================================================================
+    // D13 — PIN-gated spend/sign
+    // =========================================================================
+
+    private void personalise() {
+        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
+    }
+
+    private ResponseAPDU loadProof1() {
+        return transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
+    }
+
+    private byte[] spendMessage() {
+        byte[] msg = new byte[32];
+        for (int i = 0; i < 32; i++) msg[i] = (byte) (0xA0 + i);
+        return msg;
+    }
+
+    private ResponseAPDU verifyPin(String pin) {
+        byte[] b = pin.getBytes();
+        return transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, b, 0, b.length));
+    }
+
+    @Test @Order(20)
+    @DisplayName("SPEND_PROOF without a verified session is 6982 when a PIN is set (D13)")
+    void testSpendRequiresPinWhenSet() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
+        assertEquals(0x6982, resp.getSW(), "unverified session must not spend");
+
+        // The gate runs before the burn: the slot is intact.
+        ResponseAPDU proof = transmit(new CommandAPDU(CLA, 0x13, 0, 0, 78));
+        assertEquals(0x01, proof.getData()[0] & 0xFF, "slot must still be unspent");
+    }
+
+    @Test @Order(21)
+    @DisplayName("SPEND_PROOF after VERIFY_PIN in the same session works")
+    void testSpendWithVerifiedPin() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
+        assertEquals(SW_OK, resp.getSW());
+        assertEquals(64, resp.getData().length, "BIP-340 signature expected");
+    }
+
+    @Test @Order(22)
+    @DisplayName("a wrong PIN burns nothing and decrements the retry counter")
+    void testSpendWrongPinLeavesSlotIntact() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        byte[] wrong = "9999".getBytes();
+        ResponseAPDU wrongResp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, wrong, 0, wrong.length));
+        assertEquals(0x63C2, wrongResp.getSW(), "63CX with 2 tries remaining");
+
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
+        assertEquals(0x6982, resp.getSW());
+        ResponseAPDU proof = transmit(new CommandAPDU(CLA, 0x13, 0, 0, 1));
+        assertEquals(0x01, proof.getData()[0] & 0xFF, "slot unspent after failed verify");
+    }
+
+    @Test @Order(23)
+    @DisplayName("SIGN_ARBITRARY is gated like SPEND_PROOF (D13)")
+    void testSignArbitraryGatedWhenPinSet() {
+        personalise();
+        ResponseAPDU gated = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64));
+        assertEquals(0x6982, gated.getSW());
+
+        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
+        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64));
+        assertEquals(SW_OK, resp.getSW());
+        assertEquals(64, resp.getData().length);
     }
 }
+
