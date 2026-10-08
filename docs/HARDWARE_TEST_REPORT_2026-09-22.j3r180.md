@@ -287,6 +287,83 @@ Also proven: the PIN round-trip (D13) — a POS-minted P2PK change written onto
 the card was re-signed by the reference driver from the stored nonce alone
 (`BIP-340 VALID`), closing the loop on terminal-issued change.
 
+## First timings — applet 0.4 over RF (2026-10-08)
+
+`cardctl --timing selftest --rounds 10 --pin …` on the same J3R180, applet
+0.4, through the ACR122U (contactless). Each figure is the PC/SC round trip,
+reader included; 18/18 checks passed on the same run.
+
+| Command | n | min | median | max |
+|---|---|---|---|---|
+| `SIGN_ARBITRARY` (BIP-340, on-card) | 12 | 801.0 | **813.7** | 822.7 |
+| `GET_BALANCE` | 2 | 36.9 | 36.9 | 36.9 |
+| `GET_SLOT_STATUS` | 1 | | 30.2 | |
+| `GET_PUBKEY` | 1 | | 28.0 | |
+| `VERIFY_PIN` | 1 | | 24.7 | |
+| `SELECT` | 1 | | 21.6 | |
+| `GET_INFO` | 1 | | 20.4 | |
+
+All figures ms. 19 APDUs, 9947 ms on the wire; the twelve signatures are 98%
+of it. A `SPEND_PROOF` is a `SIGN_ARBITRARY` plus one slot write, so treat
+the signature row as the per-proof cost.
+
+What the numbers say:
+
+- **The signature is the whole story.** Every read is 20–37 ms; the signature
+  is 40× that. A one-proof payment at the card is roughly four reads plus one
+  signature, ≈ 0.95 s; a nine-proof payment is ≈ 7.5 s of signing alone.
+- **Where the 800 ms goes.** `SchnorrHW` already computes R = k·G on the
+  coprocessor (`ALG_EC_SVDP_DH_PLAIN_XY`), and the three tagged hashes are
+  native SHA-256. The interpreted work is `mulModN` — a schoolbook 256×256
+  multiply plus the depth-2 delta reduction — for s = k + e·d, and that is
+  what the 800 ms is. The 22 ms spread across twelve signatures is consistent
+  with a fixed-cost loop, not with anything data-dependent.
+- **RF vs contact.** A peer measurement of one J3R180 through a *contact*
+  reader, same signer, reports ≈ 740 ms per signature and ≈ 60 ms per plain
+  command. Our signature is ≈ 10% slower on field power; our plain commands
+  are 2–3× faster, which is reader stack, not card.
+
+### Over phone NFC, same day (flash-pos from main, after its PR #77)
+
+Same card, same applet, read from the terminal's Metro log
+(`[card-session] timing:`). "Wire" is the sum of APDU round trips as CoreNFC /
+Android IsoDep report them; "session" is tag connected → session closed.
+
+| Phone | Flow | SPEND_PROOF (n=2) | Plain commands | Wire | Session |
+|---|---|---|---|---|---|
+| iPhone (CoreNFC) | spend | **758 ms** median (755–760) | 13–24 ms | 1569 ms / 5 APDUs | 2280 ms |
+| Pixel 8 Pro | spend | **1460 ms** median (1452–1468) | 40–72 ms | 3086 ms / 5 APDUs | 9343 ms |
+| Pixel 8 Pro | read | — | 15–44 ms (23 × `GET_PROOF` med 19 ms) | 554 ms / 27 APDUs | 673 ms |
+
+Per signature, then, across four transports on one card: contact reader
+≈ 740 ms (peer), iPhone 758 ms, ACR122U 814 ms, Pixel 1460 ms. The iPhone
+matches contact; the Pixel is almost 2× — the card is running on less field
+power there, which is also why Android's default 618 ms transceive budget had
+to be raised. Any arithmetic win in the signer pays off nearly double on that
+phone.
+
+CoreNFC per-command latency is 13–24 ms for the short commands here, which is
+a lower figure than either PC/SC reader. Whether iOS negotiates above 106
+kbit/s is not something these commands can show: they are too short for the
+baud rate to be visible beside the per-command overhead.
+
+One finding that is not the card: the Pixel's spend session held the card for
+9.3 s against 3.1 s of APDU time, while the iPhone's held it for 2.3 s against
+1.6 s. Six seconds of the Android spend is terminal-side work inside the
+session, and is the next thing to look at in flash-pos.
+
+Untried ways to cut the signature, in order of expected payoff:
+
+1. **NUT-11 `sigflag: SIG_ALL`** — one signature per payment over all input
+   secrets and output blinded messages, carried on the first proof's witness.
+   Nine proofs becomes nine slot burns and one signature. Needs the mint to
+   accept SIG_ALL and the applet to burn every slot before the single sign.
+2. **RSA-coprocessor modular multiply** (the JCMathLib trick): `Cipher`
+   `ALG_RSA_NOPAD`, public exponent 2, modulus n, gives x² mod n natively;
+   2ab = (a+b)² − a² − b², then halve mod n by shift. Three RSA ops and a few
+   adds replace the schoolbook loop. Caveat: JCOP wants RSA moduli of 512 bits
+   or more and may reject one with leading zero bytes.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding
