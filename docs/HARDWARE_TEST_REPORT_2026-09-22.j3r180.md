@@ -323,9 +323,34 @@ What the numbers say:
   command. Our signature is ≈ 10% slower on field power; our plain commands
   are 2–3× faster, which is reader stack, not card.
 
-Not measured yet: the same card over phone NFC (flash-pos logs it per
-session as of its PR #77), per-command latency on CoreNFC, and whether iOS
-negotiates above 106 kbit/s with this card.
+### Over phone NFC, same day (flash-pos from main, after its PR #77)
+
+Same card, same applet, read from the terminal's Metro log
+(`[card-session] timing:`). "Wire" is the sum of APDU round trips as CoreNFC /
+Android IsoDep report them; "session" is tag connected → session closed.
+
+| Phone | Flow | SPEND_PROOF (n=2) | Plain commands | Wire | Session |
+|---|---|---|---|---|---|
+| iPhone (CoreNFC) | spend | **758 ms** median (755–760) | 13–24 ms | 1569 ms / 5 APDUs | 2280 ms |
+| Pixel 8 Pro | spend | **1460 ms** median (1452–1468) | 40–72 ms | 3086 ms / 5 APDUs | 9343 ms |
+| Pixel 8 Pro | read | — | 15–44 ms (23 × `GET_PROOF` med 19 ms) | 554 ms / 27 APDUs | 673 ms |
+
+Per signature, then, across four transports on one card: contact reader
+≈ 740 ms (peer), iPhone 758 ms, ACR122U 814 ms, Pixel 1460 ms. The iPhone
+matches contact; the Pixel is almost 2× — the card is running on less field
+power there, which is also why Android's default 618 ms transceive budget had
+to be raised. Any arithmetic win in the signer pays off nearly double on that
+phone.
+
+CoreNFC per-command latency is 13–24 ms for the short commands here, which is
+a lower figure than either PC/SC reader. Whether iOS negotiates above 106
+kbit/s is not something these commands can show: they are too short for the
+baud rate to be visible beside the per-command overhead.
+
+One finding that is not the card: the Pixel's spend session held the card for
+9.3 s against 3.1 s of APDU time, while the iPhone's held it for 2.3 s against
+1.6 s. Six seconds of the Android spend is terminal-side work inside the
+session, and is the next thing to look at in flash-pos.
 
 Untried ways to cut the signature, in order of expected payoff:
 
