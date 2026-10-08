@@ -28,7 +28,9 @@ import json
 import hashlib
 import os
 import secrets
+import statistics
 import sys
+import time
 from typing import List, Optional, Tuple
 
 import bip340
@@ -101,6 +103,46 @@ class CardError(Exception):
         self.sw = sw
         where = f" during {context}" if context else ""
         super().__init__(f"card returned {sw:04X}{where}: {describe_sw(sw)}")
+
+
+# ── APDU timing ───────────────────────────────────────────────────────────────
+# One (context, milliseconds) row per APDU, measured around the PC/SC transmit
+# call — so the figure is the full reader round trip the card sees, not just
+# the applet's own work. `--timing` prints each row as it happens and a
+# per-command summary at exit. Always collected; printing is what the flag
+# gates, and collecting a float per APDU costs nothing against a 60 ms tap.
+TIMING_ENABLED = False
+TIMINGS: List[Tuple[str, float]] = []
+
+
+def record_timing(context: str, ms: float) -> None:
+    TIMINGS.append((context, ms))
+    if TIMING_ENABLED:
+        print(f"  ⏱ {context:<16} {ms:8.1f} ms", file=sys.stderr)
+
+
+def summarize_timings(rows: List[Tuple[str, float]]) -> str:
+    """
+    Per-command table in first-seen order, then the whole session.
+
+    Median rather than mean: a single retried or torn APDU should not drag
+    the figure for every other SPEND_PROOF with it.
+    """
+    if not rows:
+        return "no APDUs sent"
+    by_ctx: dict = {}
+    for ctx, ms in rows:
+        by_ctx.setdefault(ctx, []).append(ms)
+    width = max(len(ctx) for ctx in by_ctx)
+    lines = [f"{'command':<{width}}  {'n':>3}  {'min':>8}  {'median':>8}  {'max':>8}  {'total':>9}"]
+    for ctx, xs in by_ctx.items():
+        lines.append(
+            f"{ctx:<{width}}  {len(xs):>3}  {min(xs):8.1f}  {statistics.median(xs):8.1f}"
+            f"  {max(xs):8.1f}  {sum(xs):9.1f}"
+        )
+    total = sum(ms for _, ms in rows)
+    lines.append(f"{len(rows)} APDU(s), {total:.1f} ms on the wire (all figures ms)")
+    return "\n".join(lines)
 
 
 def _hex(b: bytes) -> str:
@@ -193,7 +235,9 @@ class Card:
     def transmit(self, apdu: bytes, context: str = "") -> bytes:
         if self.verbose:
             print(f"  > {_hex(apdu)}", file=sys.stderr)
+        started = time.perf_counter()
         data, sw1, sw2 = self.connection.transmit(list(apdu))
+        record_timing(context or "APDU", (time.perf_counter() - started) * 1000.0)
         sw = (sw1 << 8) | sw2
         body = bytes(data)
         if self.verbose:
@@ -1203,6 +1247,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-r", "--reader", type=int, default=0, help="reader index (default 0)")
     p.add_argument("-v", "--verbose", action="store_true", help="log APDUs to stderr")
+    p.add_argument("-t", "--timing", action="store_true",
+                   help="time every APDU (reader round trip) to stderr, with a summary at exit")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("readers", help="list PC/SC readers").set_defaults(func=cmd_readers)
@@ -1288,7 +1334,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    global TIMING_ENABLED
     args = build_parser().parse_args()
+    TIMING_ENABLED = bool(getattr(args, "timing", False))
     try:
         return args.func(args)
     except CardError as exc:
@@ -1296,6 +1344,13 @@ def main() -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    finally:
+        # Summarise even on a CardError: the APDUs before the failure are the
+        # ones worth knowing about, and a timing run that dies at SPEND_PROOF
+        # still tells you what SELECT..GET_PROOF cost.
+        if TIMING_ENABLED and TIMINGS:
+            print("\napdu timing (reader round trip):", file=sys.stderr)
+            print(summarize_timings(TIMINGS), file=sys.stderr)
 
 
 if __name__ == "__main__":

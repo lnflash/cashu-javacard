@@ -101,6 +101,7 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | Command | What it does |
 |---|---|
 | `readers` | list PC/SC readers |
+| `-t`/`--timing` (any command) | time every APDU to stderr, summary table at exit |
 | `selftest [--rounds N] [--pin P]` | full hardware check incl. BIP-340 verification |
 | `info` | version, slot counts, capabilities, PIN state, balance |
 | `pubkey` | 33-byte compressed public key |
@@ -130,6 +131,23 @@ earlier revision, all three fail loudly rather than silently):
 Global flags: `-r/--reader N` to pick a reader, `-v/--verbose` to log every APDU
 to stderr — use `-v` when a command misbehaves, since the raw exchange usually
 makes it obvious whether the card rejected the command or never saw it.
+
+## Timing a card
+
+`--timing` goes before the command and times every APDU around the PC/SC
+transmit call, so each figure is the full reader round trip, not just the
+applet's own work. Per-APDU lines go to stderr as they happen and a per-command
+table (count, min, median, max, total) follows at exit, even when the command
+fails partway.
+
+```bash
+python3 cardctl.py --timing selftest --rounds 10    # 12 signatures, 1 table
+python3 cardctl.py -t spend 0                        # one SPEND_PROOF, timed
+```
+
+Compare like with like: a contact reader, the ACR122U over RF and a phone over
+NFC all give different numbers for the same card, and the phone adds field
+discovery that none of these capture. The median is the figure to quote.
 
 ## A warning about `spend`
 
