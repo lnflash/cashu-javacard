@@ -287,6 +287,58 @@ Also proven: the PIN round-trip (D13) — a POS-minted P2PK change written onto
 the card was re-signed by the reference driver from the stored nonce alone
 (`BIP-340 VALID`), closing the loop on terminal-issued change.
 
+## First timings — applet 0.4 over RF (2026-10-08)
+
+`cardctl --timing selftest --rounds 10 --pin …` on the same J3R180, applet
+0.4, through the ACR122U (contactless). Each figure is the PC/SC round trip,
+reader included; 18/18 checks passed on the same run.
+
+| Command | n | min | median | max |
+|---|---|---|---|---|
+| `SIGN_ARBITRARY` (BIP-340, on-card) | 12 | 801.0 | **813.7** | 822.7 |
+| `GET_BALANCE` | 2 | 36.9 | 36.9 | 36.9 |
+| `GET_SLOT_STATUS` | 1 | | 30.2 | |
+| `GET_PUBKEY` | 1 | | 28.0 | |
+| `VERIFY_PIN` | 1 | | 24.7 | |
+| `SELECT` | 1 | | 21.6 | |
+| `GET_INFO` | 1 | | 20.4 | |
+
+All figures ms. 19 APDUs, 9947 ms on the wire; the twelve signatures are 98%
+of it. A `SPEND_PROOF` is a `SIGN_ARBITRARY` plus one slot write, so treat
+the signature row as the per-proof cost.
+
+What the numbers say:
+
+- **The signature is the whole story.** Every read is 20–37 ms; the signature
+  is 40× that. A one-proof payment at the card is roughly four reads plus one
+  signature, ≈ 0.95 s; a nine-proof payment is ≈ 7.5 s of signing alone.
+- **Where the 800 ms goes.** `SchnorrHW` already computes R = k·G on the
+  coprocessor (`ALG_EC_SVDP_DH_PLAIN_XY`), and the three tagged hashes are
+  native SHA-256. The interpreted work is `mulModN` — a schoolbook 256×256
+  multiply plus the depth-2 delta reduction — for s = k + e·d, and that is
+  what the 800 ms is. The 22 ms spread across twelve signatures is consistent
+  with a fixed-cost loop, not with anything data-dependent.
+- **RF vs contact.** A peer measurement of one J3R180 through a *contact*
+  reader, same signer, reports ≈ 740 ms per signature and ≈ 60 ms per plain
+  command. Our signature is ≈ 10% slower on field power; our plain commands
+  are 2–3× faster, which is reader stack, not card.
+
+Not measured yet: the same card over phone NFC (flash-pos logs it per
+session as of its PR #77), per-command latency on CoreNFC, and whether iOS
+negotiates above 106 kbit/s with this card.
+
+Untried ways to cut the signature, in order of expected payoff:
+
+1. **NUT-11 `sigflag: SIG_ALL`** — one signature per payment over all input
+   secrets and output blinded messages, carried on the first proof's witness.
+   Nine proofs becomes nine slot burns and one signature. Needs the mint to
+   accept SIG_ALL and the applet to burn every slot before the single sign.
+2. **RSA-coprocessor modular multiply** (the JCMathLib trick): `Cipher`
+   `ALG_RSA_NOPAD`, public exponent 2, modulus n, gives x² mod n natively;
+   2ab = (a+b)² − a² − b², then halve mod n by shift. Three RSA ops and a few
+   adds replace the schoolbook loop. Caveat: JCOP wants RSA moduli of 512 bits
+   or more and may reject one with leading zero bytes.
+
 ## Not exercised
 
 `lock` (permanently disables writes — deliberately not run on a card holding
