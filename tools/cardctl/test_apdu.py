@@ -734,6 +734,70 @@ def test_non_9000_raises_carderror_with_context():
         raise AssertionError("expected CardError")
 
 
+
+# ── APDU timing (--timing) ───────────────────────────────────────────────────
+def test_transmit_records_one_timing_row_per_apdu_named_by_context():
+    cardctl.TIMINGS.clear()
+    card = make_card([(b"\x00\x04", 0x9000), (b"\x00" * 8, 0x9000)])
+    card.select()
+    card.get_info()
+    contexts = [ctx for ctx, _ in cardctl.TIMINGS]
+    assert contexts == ["SELECT", "GET_INFO"], contexts
+    assert all(ms >= 0.0 for _, ms in cardctl.TIMINGS)
+
+
+def test_a_failed_apdu_is_still_timed():
+    # The row lands before the status word is judged: a 6982 that took 700 ms
+    # is exactly the kind of number a timing run exists to show.
+    cardctl.TIMINGS.clear()
+    card = make_card([(b"", 0x6982)])
+    try:
+        card.send(cardctl.INS_SIGN_ARBITRARY, data=b"\x00" * 32, le=0x40, context="SIGN_ARBITRARY")
+    except cardctl.CardError:
+        pass
+    assert [ctx for ctx, _ in cardctl.TIMINGS] == ["SIGN_ARBITRARY"]
+
+
+def test_timing_flag_prints_each_apdu_only_when_enabled():
+    cardctl.TIMINGS.clear()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        make_card([(b"\x00\x04", 0x9000)]).select()
+    assert "⏱" not in err.getvalue()
+
+    cardctl.TIMING_ENABLED = True
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            make_card([(b"\x00\x04", 0x9000)]).select()
+    finally:
+        cardctl.TIMING_ENABLED = False
+    assert "⏱ SELECT" in err.getvalue(), err.getvalue()
+    assert err.getvalue().rstrip().endswith("ms")
+
+
+def test_summarize_timings_groups_by_command_with_median_not_mean():
+    rows = [("SELECT", 60.0),
+            ("SPEND_PROOF", 700.0), ("SPEND_PROOF", 740.0), ("SPEND_PROOF", 3000.0)]
+    text = cardctl.summarize_timings(rows)
+    lines = text.splitlines()
+    assert lines[0].split() == ["command", "n", "min", "median", "max", "total"]
+    spend = next(l for l in lines if l.startswith("SPEND_PROOF")).split()
+    # n=3, min 700, median 740 (a mean would say 1480), max 3000, total 4440
+    assert spend[1:] == ["3", "700.0", "740.0", "3000.0", "4440.0"], spend
+    assert lines[-1].startswith("4 APDU(s), 4500.0 ms")
+
+
+def test_summarize_timings_with_no_rows_does_not_crash():
+    assert cardctl.summarize_timings([]) == "no APDUs sent"
+
+
+def test_timing_flag_is_global_and_off_by_default():
+    parser = cardctl.build_parser()
+    assert parser.parse_args(["info"]).timing is False
+    assert parser.parse_args(["--timing", "selftest", "--rounds", "5"]).timing is True
+    assert parser.parse_args(["-t", "spend", "0"]).timing is True
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
@@ -755,3 +819,4 @@ if __name__ == "__main__":
                     traceback.print_exc()
     print(f"\n{'all tests passed' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)
+
