@@ -362,9 +362,12 @@ INFO_06_PIN_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 1, 1])
 INFO_06_BLOCKED_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 2, 1])
 INFO_06_BLOCKED_NO_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 2, 0])
 INFO_06_PIN_PUK_EXHAUSTED = bytes([0, 6, 32, 0, 0, 32, 0x1F, 1, 2])
-# A PUK with no PIN: not a personalisation state, since the order is SET_PUK
-# then SET_PIN with nothing issued between — a card that reports this to a
-# personaliser was armed by someone else (SECURITY-MODEL #16).
+# A PUK with no PIN. Two things produce it: a holder's own `clear-pin`, since
+# CLEAR_PIN leaves the PUK alone (CashuApplet.java, PukTest "CLEAR_PIN then
+# SET_PIN then the original PUK"), and someone else's SET_PUK on a fresh card.
+# It is never a personalisation state, since the order there is SET_PUK then
+# SET_PIN with nothing issued between — so a personaliser who sees it on a
+# fresh card is holding one armed by someone else (SECURITY-MODEL #16).
 INFO_06_NO_PIN_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 0, 1])
 INFO_05_PIN = bytes([0, 5, 32, 0, 0, 32, 0x0F, 1])
 
@@ -463,14 +466,27 @@ def test_cmd_set_puk_names_a_foreign_puk_on_a_card_with_no_pin():
     is free at pinState 0, so anyone who touched the card pre-issuance could
     have armed it, and would then own the PIN via UNBLOCK_PIN after three wrong
     PINs (SECURITY-MODEL #16). "Already set" reads as a benign re-run; this
-    must read as a card not to issue."""
+    must read as a card not to issue.
+
+    The same GET_INFO is also what a holder's own card reports after
+    `clear-pin`, since CLEAR_PIN leaves the PUK alone. That holder's PUK is
+    theirs and still works, and a reinstall on their card would regenerate
+    the key and strand the balance (SECURITY-MODEL #14) — so the message
+    must address both audiences and send the holder to set-pin, not to a
+    reinstall."""
     for argv in (("set-puk", "--puk", "12345678"),
                  ("set-puk", "--puk", "12345678", "--pin", "1234")):
         card = make_card([(INFO_06_NO_PIN_PUK, 0x9000)])
         msg = _refuses(card, *argv)
         assert "reports a PUK but has no PIN" in msg, msg
-        assert "someone else did" in msg and "do not issue this card" in msg, msg
+        # The personaliser's half: a fresh card nobody should issue.
+        assert "personalising a fresh card" in msg and "someone else armed it" in msg, msg
+        assert "do not issue it" in msg and "sweep nothing" in msg, msg
         assert "reinstall the CAP" in msg and "cannot be replaced" in msg, msg
+        # The holder's half: their own card after clear-pin keeps its PUK.
+        assert "clear-pin" in msg, "must name clear-pin as the legitimate producer: " + msg
+        assert "the PUK is yours" in msg and "run set-pin" in msg, msg
+        assert "no second PUK" in msg, msg
         assert "already set" not in msg, "must not read as a duplicate run: " + msg
         assert [a[1] for a in card.connection.sent] == [cardctl.INS_GET_INFO], "nothing was sent"
     # A PUK on a card that has a PIN is the ordinary duplicate-run case and
@@ -1084,7 +1100,14 @@ def test_status_words_are_translated():
     assert "slot is empty" in cardctl.describe_sw(0x6A88)
     assert "PUK not set" in cardctl.describe_sw(0x6A82)
     assert "PUK already set" in cardctl.describe_sw(0x6A89)
-    assert "PUK is exhausted" in cardctl.describe_sw(0x6983)
+    # 6983 names the credential the command counts, like 63CX: the PIN
+    # everywhere but UNBLOCK_PIN. Without context (or on a PIN command) the
+    # text must not mention the PUK at all — naming the PUK on a VERIFY_PIN
+    # 6983 sends a holder to --puk when it is the PIN that is blocked.
+    assert "PUK exhausted" in cardctl.describe_sw(0x6983, "UNBLOCK_PIN")
+    assert "PIN blocked" in cardctl.describe_sw(0x6983)
+    for ctx in ("", "VERIFY_PIN", "CHANGE_PIN", "CLEAR_PIN"):
+        assert "PUK" not in cardctl.describe_sw(0x6983, ctx), (ctx, cardctl.describe_sw(0x6983, ctx))
     assert "2 retries remaining" in cardctl.describe_sw(0x63C2)
     assert "0 retries remaining" in cardctl.describe_sw(0x63C0)
     # 63CX names the credential the command counts: the PIN everywhere but

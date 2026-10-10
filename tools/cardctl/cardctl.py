@@ -103,7 +103,7 @@ SW_MEANINGS = {
     0x9000: "success",
     0x6700: "wrong length",
     0x6982: "security condition not satisfied (PIN set or blocked, and not verified in this session)",
-    0x6983: "PIN blocked — retries exhausted (from UNBLOCK_PIN: the PUK is exhausted, for good)",
+    0x6983: "PIN blocked — retries exhausted",
     0x6984: "PIN not set",
     0x6985: "conditions not satisfied (already spent / PIN already set or blocked / card already locked)",
     0x6986: "card locked by LOCK_CARD — writes disabled",
@@ -1172,15 +1172,24 @@ def cmd_set_puk(args) -> int:
     # Every refusal the card would give is known from GET_INFO, so say it
     # here, before a VERIFY_PIN is spent on a card that will refuse anyway.
     if info["puk_state"] == "set" and info["pin_state"] == "unset":
-        # SET_PUK is free on a card with no PIN, so a PUK on a card that has
-        # no PIN is one somebody attached pre-issuance. The 6A89 the card
-        # would give is correct; what it means is that the card is armed for
-        # whoever holds that PUK — three wrong PINs and an UNBLOCK_PIN later,
-        # the balance is theirs (SECURITY-MODEL #16). Not a duplicate run.
+        # Two audiences see this state and need opposite advice. A
+        # personaliser with a fresh card: SET_PUK is free on a card with no
+        # PIN, so a PUK on one is something somebody attached pre-issuance,
+        # and the card is armed for whoever holds it — three wrong PINs and
+        # an UNBLOCK_PIN later, the balance is theirs (SECURITY-MODEL #16).
+        # A holder after `clear-pin`: CLEAR_PIN leaves the PUK alone, so
+        # their own card reports exactly this, and the PUK is still theirs.
+        # The wording must not send that holder to a reinstall — a reinstall
+        # on a card with a balance regenerates the key and strands it
+        # (SECURITY-MODEL #14). Either way the card's 6A89 is correct and
+        # this is not a duplicate run.
         raise SystemExit(
-            "this card reports a PUK but has no PIN — if you did not set it, someone "
-            "else did: do not issue this card, reinstall the CAP (the PUK cannot be "
-            "replaced). See spec/APDU.md, Personalisation, and SECURITY-MODEL #16"
+            "this card reports a PUK but has no PIN. If you are personalising a fresh "
+            "card, someone else armed it: do not issue it, sweep nothing (it is empty) "
+            "and reinstall the CAP — the PUK cannot be replaced (spec/APDU.md, "
+            "Personalisation; SECURITY-MODEL #16). If this is your own card after "
+            "clear-pin, the PUK is yours and still works: run set-pin, no second PUK "
+            "is needed"
         )
     if info["puk_state"] != "unset":
         raise SystemExit(
