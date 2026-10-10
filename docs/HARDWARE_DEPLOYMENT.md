@@ -80,8 +80,8 @@ gp --list
 
 ## Install
 
-The CAP tracked in this repo is **applet version 0.5**, sha256
-`7b02ad469fe521926c9009819bc6a45aa35a7cf33feb9004479d5b2aa1edcad2`. A CAP you
+The CAP tracked in this repo is **applet version 0.6**, sha256
+`e3a2e58b8a1e178272a442545bc512e82b7f4750ab76c494edbafe5fc865937b`. A CAP you
 build yourself hashes differently even from identical source, because the
 converter writes a creation timestamp into `META-INF/MANIFEST.MF`. Every other
 entry is byte-identical when built with JDK 17 and the kit CI pins
@@ -99,9 +99,9 @@ diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the 
 ```
 
 Any output from `diff` means the two CAPs differ; do not install. After
-installing, `SELECT` must answer `00 05` (below).
+installing, `SELECT` must answer `00 06` (below).
 
-**Install only a CAP that matches the tracked one** (sha256 `7b02ad46…`, or the
+**Install only a CAP that matches the tracked one** (sha256 `e3a2e58b…`, or the
 entry comparison above). The file name and the CAP's package version read 0.1
 on every build (`applet/build.xml` pins the package version), so neither can
 tell a fixed build from a vulnerable one; only the applet version `SELECT`
@@ -121,14 +121,26 @@ release carries it. Nothing on an installed card tells it apart from a 0.3
 build with the fix, which is why the fix moved the applet version to 0.4.
 Don't install `958a8baa…` or any other 0.3 CAP.
 
-A card answering `00 04` is sound: 0.4 fixed ENG-620 and 0.5 fixes nothing,
-it adds `CLEAR_PIN` ([D15](DECISIONS.md#d15)), which a 0.4 card answers with
-`6D00`. The last tracked 0.4 CAP was sha256 `d2947b9f…`. Reinstall a 0.4 card
-only if its holder wants `CLEAR_PIN`, and like every version change that is a
-fresh install — delete, then install — with the balance swept first, because
-there is no in-place upgrade and the reinstall regenerates the card key (see
-[Upgrade](#upgrade--re-personalise)). `cardctl selftest` passes a 0.4 card and
-says it lacks `CLEAR_PIN`.
+A card answering `00 04` is sound: 0.4 fixed ENG-620, and nothing since is a
+fix. 0.5 added `CLEAR_PIN` ([D15](DECISIONS.md#d15)), which a 0.4 card answers
+with `6D00`; the last tracked 0.4 CAP was sha256 `d2947b9f…`. 0.6 added the
+PUK — `SET_PUK` and `UNBLOCK_PIN` ([D16](DECISIONS.md#d16)), which a 0.4 or
+0.5 card answers with `6D00`, and a ninth `GET_INFO` byte; the last tracked
+0.5 CAP was sha256 `7b02ad46…`. A card answering `00 05` is sound and lacks
+the PUK, so three wrong PINs still strand it (SECURITY-MODEL #14). Reinstall
+a 0.4 or 0.5 card only if its holder wants what it lacks, and like every
+version change that is a fresh install — delete, then install — with the
+balance swept first, because there is no in-place upgrade and the reinstall
+regenerates the card key (see [Upgrade](#upgrade--re-personalise)). There is
+no other way to give a card in the field a PUK. `cardctl selftest` passes a
+0.4 or 0.5 card and says which commands it lacks.
+
+**Personalising a 0.6 card:** `cardctl set-puk --puk <8–12 digits>` first,
+then `cardctl set-pin <pin>`, and record the PUK off the card at once — the
+card never reveals it, and a 0.6 card whose PUK was recorded nowhere is a
+0.5 card when its PIN is blocked. See the
+[Personalisation](../spec/APDU.md#personalisation) section of the APDU spec
+and [D16](DECISIONS.md#d16) for custody (ENG-618).
 
 ```bash
 # Install CashuApplet.cap onto the card
@@ -148,15 +160,15 @@ gp --list
 # SELECT the applet (sends SELECT APDU with our AID)
 gp --apdu 00A4040007D2760000850102
 
-# Response: 0005 9000  (applet version 0.5 + SW_OK = applet responding)
+# Response: 0006 9000  (applet version 0.6 + SW_OK = applet responding)
 # Anything below 0004 (0001, 0002 or 0003) may carry ENG-615 or ENG-620: sweep the card, then reinstall.
-# 0004 is sound but has no CLEAR_PIN; reinstall only if wanted (sweep first).
+# 0004 is sound but has no CLEAR_PIN and no PUK; 0005 has no PUK. Reinstall only if wanted (sweep first).
 
 # GET_INFO (INS 0x01)
 gp --apdu B0010000
 
-# Response: 00 05 20 00 00 20 0F 00
-#   v0.5 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x0F (bit 3 = CLEAR_PIN) | PIN unset
+# Response: 00 06 20 00 00 20 1F 00 00
+#   v0.6 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x1F (bit 3 = CLEAR_PIN, bit 4 = PUK) | PIN unset | PUK unset
 # SW: 9000
 
 # GET_PUBKEY (INS 0x10)
@@ -183,8 +195,10 @@ gp --install target/cashu-javacard-0.1.0.cap
 ## Upgrade / re-personalise
 
 The applet has no OTA upgrade path — delete and reinstall to upgrade. That
-includes 0.4 → 0.5 (`CLEAR_PIN`): there is no in-place upgrade, so a card
-that should answer `0x43` is deleted and installed from the 0.5 CAP.
+includes 0.4 → 0.5 (`CLEAR_PIN`) and 0.5 → 0.6 (the PUK): there is no
+in-place upgrade, so a card that should answer `0x43`, `0x44` or `0x45` is
+deleted and installed from the 0.6 CAP, then personalised again with a PUK
+and a PIN.
 All proof data and the card keypair are wiped on delete, and the proofs are
 P2PK-locked to that keypair, so **sweep the balance before deleting**. The
 v0.2 reinstall on the J3R180 stranded 5 sat this way (see the
