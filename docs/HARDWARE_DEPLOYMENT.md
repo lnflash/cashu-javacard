@@ -135,10 +135,14 @@ regenerates the card key (see [Upgrade](#upgrade--re-personalise)). There is
 no other way to give a card in the field a PUK. `cardctl selftest` passes a
 0.4 or 0.5 card and says which commands it lacks.
 
-**Personalising a 0.6 card:** `cardctl set-puk --puk <8–12 digits>` first,
-then `cardctl set-pin <pin>`, and record the PUK off the card at once — the
-card never reveals it, and a 0.6 card whose PUK was recorded nowhere is a
-0.5 card when its PIN is blocked. See the
+**Personalising a 0.6 card:** `cardctl info` first and confirm `PIN : unset`
+and `PUK : unset` — a card that already reports a PUK and no PIN was armed by
+someone else before it reached you, and is not yours to issue: reinstall the
+CAP, the PUK cannot be replaced (`set-puk` refuses that state and says so;
+[SECURITY-MODEL #16](SECURITY-MODEL.md)). Then `cardctl set-puk --puk <8–12
+digits>`, then `cardctl set-pin <pin>`, and record the PUK off the card at
+once — the card never reveals it, and a 0.6 card whose PUK was recorded
+nowhere is a 0.5 card when its PIN is blocked. See the
 [Personalisation](../spec/APDU.md#personalisation) section of the APDU spec
 and [D16](DECISIONS.md#d16) for custody (ENG-618).
 

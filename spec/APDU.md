@@ -693,11 +693,24 @@ a PIN it cannot recover. The other order works too — `SET_PIN`, `VERIFY_PIN`,
 `SET_PUK` — and is the one for a card personalised before 0.6 existed, whose
 holder adds a PUK in their own session.
 
+**Verify bytes 7 and 8 are both `0` before `SET_PUK`; a card that is not is
+not yours to issue.** `SET_PUK` is free on a card with no PIN, so a card that
+already reports a PUK (byte 8 = `1`) and no PIN (byte 7 = `0`) is one that
+somebody else armed between the factory and your reader — one APDU in NFC
+range is enough. The `6A89` your own `SET_PUK` then gets is not a duplicate
+run: whoever holds that PUK can block the issued card's PIN with three wrong
+tries and `UNBLOCK_PIN` it to a PIN of their choosing, and the balance is
+theirs ([SECURITY-MODEL #16](../docs/SECURITY-MODEL.md)). The PUK cannot be
+replaced; do not issue the card, reinstall the CAP (which regenerates the key
+and clears both states) and personalise again.
+
 ```
 Personaliser                    Card
   |                              |
   |--- SELECT APPLICATION -----> |
   |<-- 00 06 90 00 -------------|
+  |--- GET_INFO (0x01) --------> |
+  |<-- … 1F 00 00 + 90 00 ------|  (caps, PIN unset, PUK unset: yours to issue)
   |--- SET_PUK (0x44) ---------> |  (8–12 digits; generated, not chosen)
   |<-- 90 00 -------------------|
   |--- SET_PIN (0x41) ---------> |  (the holder's PIN)

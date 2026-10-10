@@ -118,7 +118,16 @@ SW_MEANINGS = {
 }
 
 
-def describe_sw(sw: int) -> str:
+def describe_sw(sw: int, context: str = "") -> str:
+    # UNBLOCK_PIN is the one command whose 63CX and 6983 count the PUK, not
+    # the PIN (spec/APDU.md, UNBLOCK_PIN). Naming the wrong credential there
+    # sends an operator back to --new-pin when it is --puk that was mistyped,
+    # and every retry spends a PUK try that is terminal at zero (#15).
+    if context == "UNBLOCK_PIN":
+        if (sw & 0xFFF0) == 0x63C0:
+            return f"wrong PUK — {sw & 0x0F} PUK tries remaining (0 = exhausted for good)"
+        if sw == 0x6983:
+            return "PUK exhausted — ten wrong PUKs; UNBLOCK_PIN answers 6983 for good"
     if sw in SW_MEANINGS:
         return SW_MEANINGS[sw]
     if (sw & 0xFFF0) == 0x63C0:
@@ -130,7 +139,7 @@ class CardError(Exception):
     def __init__(self, sw: int, context: str = ""):
         self.sw = sw
         where = f" during {context}" if context else ""
-        super().__init__(f"card returned {sw:04X}{where}: {describe_sw(sw)}")
+        super().__init__(f"card returned {sw:04X}{where}: {describe_sw(sw, context)}")
 
 
 # ── APDU timing ───────────────────────────────────────────────────────────────
@@ -1162,6 +1171,17 @@ def cmd_set_puk(args) -> int:
     _require_puk_capability(info, "SET_PUK")
     # Every refusal the card would give is known from GET_INFO, so say it
     # here, before a VERIFY_PIN is spent on a card that will refuse anyway.
+    if info["puk_state"] == "set" and info["pin_state"] == "unset":
+        # SET_PUK is free on a card with no PIN, so a PUK on a card that has
+        # no PIN is one somebody attached pre-issuance. The 6A89 the card
+        # would give is correct; what it means is that the card is armed for
+        # whoever holds that PUK — three wrong PINs and an UNBLOCK_PIN later,
+        # the balance is theirs (SECURITY-MODEL #16). Not a duplicate run.
+        raise SystemExit(
+            "this card reports a PUK but has no PIN — if you did not set it, someone "
+            "else did: do not issue this card, reinstall the CAP (the PUK cannot be "
+            "replaced). See spec/APDU.md, Personalisation, and SECURITY-MODEL #16"
+        )
     if info["puk_state"] != "unset":
         raise SystemExit(
             f"this card's PUK is already {info['puk_state']}: a PUK is set once, at "
@@ -1179,7 +1199,13 @@ def cmd_set_puk(args) -> int:
             "holder's verified session (D16)"
         )
     if args.pin:
-        card.verify_pin(args.pin.encode())
+        if info["pin_state"] == "set":
+            card.verify_pin(args.pin.encode())
+        else:
+            # A fresh card answers VERIFY_PIN with 6984, which would abort a
+            # SET_PUK the card was going to accept. A personalisation script
+            # that passes --pin uniformly must still work on every blank card.
+            print("note: --pin ignored, this card has no PIN (SET_PUK needs no session on it)")
     card.set_puk(args.puk.encode())
     print("PUK set — record it off the card now; the card never reveals it, and it is the "
           "only way to unblock or replace this card's PIN (D16)")

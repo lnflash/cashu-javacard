@@ -126,8 +126,8 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `clear-spent [--pin P]` | free spent slots |
 | `verify-pin` / `set-pin` / `change-pin` | PIN management |
 | `clear-pin --pin` | remove the PIN; the card is a bearer card again (applet 0.5, D15). Verifies the PIN first, refuses a card without the capability bit |
-| `set-puk --puk P [--pin Q]` | set the provisioning PUK, once (applet 0.6, D16). Needs `--pin` on a card that has a PIN (verified first); refuses a card without the capability bit, one whose PUK is already set or exhausted, and a blocked card with no PUK. Record the PUK off the card: it is never read back |
-| `unblock-pin --puk P --new-pin N` | replace a blocked or forgotten PIN with the PUK (applet 0.6, D16). Sends no `VERIFY_PIN`; refuses, before spending a PUK try, a card with no PUK, an exhausted PUK, no PIN, or no capability bit. The new PIN then needs `verify-pin` as usual |
+| `set-puk --puk P [--pin Q]` | set the provisioning PUK, once (applet 0.6, D16). Needs `--pin` on a card that has a PIN (verified first); on a card with no PIN `--pin` is ignored with a notice, so a script may pass it uniformly. Refuses a card without the capability bit, one whose PUK is already set or exhausted, and a blocked card with no PUK. A card that reports a PUK **and no PIN** is refused with a different message: nobody you trust set that PUK, do not issue the card, reinstall the CAP (spec/APDU.md, Personalisation; SECURITY-MODEL #16). Record the PUK off the card: it is never read back |
+| `unblock-pin --puk P --new-pin N` | replace a blocked or forgotten PIN with the PUK (applet 0.6, D16). Sends no `VERIFY_PIN`; refuses, before spending a PUK try, a card with no PUK, an exhausted PUK, no PIN, or no capability bit. A `63 CX` here is reported as a wrong **PUK** with X PUK tries left (terminal at 0), and `6983` as the PUK exhausted — re-check `--puk`, not `--new-pin`. The new PIN then needs `verify-pin` as usual |
 | `lock [--yes]` | **irreversibly** disable writes |
 | `apdu <hex>` | send a raw APDU |
 

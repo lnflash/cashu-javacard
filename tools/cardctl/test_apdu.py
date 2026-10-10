@@ -362,6 +362,10 @@ INFO_06_PIN_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 1, 1])
 INFO_06_BLOCKED_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 2, 1])
 INFO_06_BLOCKED_NO_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 2, 0])
 INFO_06_PIN_PUK_EXHAUSTED = bytes([0, 6, 32, 0, 0, 32, 0x1F, 1, 2])
+# A PUK with no PIN: not a personalisation state, since the order is SET_PUK
+# then SET_PIN with nothing issued between — a card that reports this to a
+# personaliser was armed by someone else (SECURITY-MODEL #16).
+INFO_06_NO_PIN_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 0, 1])
 INFO_05_PIN = bytes([0, 5, 32, 0, 0, 32, 0x0F, 1])
 
 
@@ -452,6 +456,79 @@ def test_cmd_set_puk_refuses_what_the_card_would_refuse_before_sending():
     msg = _refuses(card, "set-puk", "--puk", "12345678", "--pin", "1234")
     assert "no SET_PUK" in msg and "0.5" in msg and "0.6" in msg, msg
     assert [a[1] for a in card.connection.sent] == [cardctl.INS_GET_INFO]
+
+
+def test_cmd_set_puk_names_a_foreign_puk_on_a_card_with_no_pin():
+    """A PUK on a card with no PIN is one the personaliser did not set: SET_PUK
+    is free at pinState 0, so anyone who touched the card pre-issuance could
+    have armed it, and would then own the PIN via UNBLOCK_PIN after three wrong
+    PINs (SECURITY-MODEL #16). "Already set" reads as a benign re-run; this
+    must read as a card not to issue."""
+    for argv in (("set-puk", "--puk", "12345678"),
+                 ("set-puk", "--puk", "12345678", "--pin", "1234")):
+        card = make_card([(INFO_06_NO_PIN_PUK, 0x9000)])
+        msg = _refuses(card, *argv)
+        assert "reports a PUK but has no PIN" in msg, msg
+        assert "someone else did" in msg and "do not issue this card" in msg, msg
+        assert "reinstall the CAP" in msg and "cannot be replaced" in msg, msg
+        assert "already set" not in msg, "must not read as a duplicate run: " + msg
+        assert [a[1] for a in card.connection.sent] == [cardctl.INS_GET_INFO], "nothing was sent"
+    # A PUK on a card that has a PIN is the ordinary duplicate-run case and
+    # keeps its wording: the holder's session was needed to attach it.
+    card = make_card([(INFO_06_PIN_PUK, 0x9000)])
+    msg = _refuses(card, "set-puk", "--puk", "12345678", "--pin", "1234")
+    assert "already set" in msg and "someone else" not in msg, msg
+
+
+def test_cmd_set_puk_ignores_the_pin_flag_on_a_card_with_no_pin():
+    """A fresh card answers VERIFY_PIN with 6984, so sending it would abort a
+    SET_PUK the card was going to accept. A personalisation script that passes
+    --pin uniformly must still work on every blank card: GET_INFO, SET_PUK,
+    nothing between, and a notice that the flag went unused."""
+    card = make_card([(INFO_06_NO_PIN_NO_PUK, 0x9000), (b"", 0x9000)])
+    rc, out = _run(card, "set-puk", "--puk", "12345678", "--pin", "1234")
+    assert rc == 0, out
+    assert [a[1] for a in card.connection.sent] == [cardctl.INS_GET_INFO, cardctl.INS_SET_PUK]
+    assert card.connection.sent[1] == bytes.fromhex("B0440000") + bytes([9, 8]) + b"12345678"
+    assert "--pin ignored" in out and "no PIN" in out, out
+    assert "PUK set" in out, out
+    # And without --pin there is no notice to give.
+    card = make_card([(INFO_06_NO_PIN_NO_PUK, 0x9000), (b"", 0x9000)])
+    rc, out = _run(card, "set-puk", "--puk", "12345678")
+    assert rc == 0 and "ignored" not in out, out
+
+
+def test_cmd_unblock_pin_names_the_puk_and_its_counter_on_a_wrong_puk():
+    """63CX from UNBLOCK_PIN counts PUK tries, not PIN retries. An operator
+    who reads "wrong PIN — 9 retries remaining" re-checks --new-pin and burns
+    PUK tries that are terminal at zero (#15); the message must send them to
+    --puk."""
+    card = make_card([(INFO_06_PIN_PUK, 0x9000), (b"", 0x63C9)])
+    args = cardctl.build_parser().parse_args(
+        ["unblock-pin", "--puk", "12345678", "--new-pin", "5678"])
+    with stubbed_connect(card):
+        try:
+            args.func(args)
+        except cardctl.CardError as exc:
+            msg = str(exc)
+        else:
+            raise AssertionError("expected CardError on 63C9")
+    assert "63C9" in msg and "during UNBLOCK_PIN" in msg, msg
+    assert "wrong PUK" in msg and "9 PUK tries remaining" in msg, msg
+    assert "exhausted for good" in msg, msg
+    meaning = msg.split(": ", 1)[1]           # after "card returned 63C9 during UNBLOCK_PIN: "
+    assert "PIN" not in meaning, "the meaning must not name the PIN: " + msg
+    # Exhaustion from UNBLOCK_PIN is the PUK's, for good.
+    card = make_card([(INFO_06_PIN_PUK, 0x9000), (b"", 0x6983)])
+    with stubbed_connect(card):
+        try:
+            args.func(args)
+        except cardctl.CardError as exc:
+            msg = str(exc)
+        else:
+            raise AssertionError("expected CardError on 6983")
+    assert "PUK exhausted" in msg and "for good" in msg, msg
+    assert not msg.split(": ", 1)[1].startswith("PIN blocked"), msg
 
 
 def test_cmd_unblock_pin_sends_unblock_pin_alone_with_no_verify():
@@ -1010,6 +1087,17 @@ def test_status_words_are_translated():
     assert "PUK is exhausted" in cardctl.describe_sw(0x6983)
     assert "2 retries remaining" in cardctl.describe_sw(0x63C2)
     assert "0 retries remaining" in cardctl.describe_sw(0x63C0)
+    # 63CX names the credential the command counts: the PIN everywhere but
+    # UNBLOCK_PIN, where it is the PUK and the floor is terminal.
+    assert "wrong PIN" in cardctl.describe_sw(0x63C2, "VERIFY_PIN")
+    assert "2 retries remaining" in cardctl.describe_sw(0x63C2, "VERIFY_PIN")
+    assert "wrong PIN" in cardctl.describe_sw(0x63C2, "CHANGE_PIN")
+    assert "wrong PUK" in cardctl.describe_sw(0x63C9, "UNBLOCK_PIN")
+    assert "9 PUK tries remaining" in cardctl.describe_sw(0x63C9, "UNBLOCK_PIN")
+    assert "exhausted for good" in cardctl.describe_sw(0x63C0, "UNBLOCK_PIN")
+    assert "wrong PIN" not in cardctl.describe_sw(0x63C9, "UNBLOCK_PIN")
+    assert cardctl.describe_sw(0x6983, "UNBLOCK_PIN").startswith("PUK exhausted")
+    assert cardctl.describe_sw(0x6983, "VERIFY_PIN").startswith("PIN blocked")
     # A write to a card locked by LOCK_CARD (spec/APDU.md, LOAD_PROOF and the
     # error summary). It used to read "unknown status word".
     assert "LOCK_CARD" in cardctl.describe_sw(0x6986)
