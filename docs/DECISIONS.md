@@ -4,7 +4,7 @@ Each entry records a call that was made, what was rejected, and why. If you are
 about to change one of these, read the entry first — most were made against a
 real alternative, and several were made *after* getting it wrong once.
 
-Anchors are stable (`#d1` … `#d14`); other docs link to them.
+Anchors are stable (`#d1` … `#d15`); other docs link to them.
 
 ---
 
@@ -288,7 +288,8 @@ Provisioning: POS cards are personalised with a PIN by default
 (`cardctl set-pin` during personalisation; `fund-card --pin` when the funding
 tool gains it). The merchant terminal prompts for the PIN only when
 `GET_INFO.pinState` reports `set`, and refuses a card reporting `locked` (2)
-outright: nothing can spend from it.
+outright: nothing can spend from it. Since applet 0.5 a holder can take the
+PIN off again ([D15](#d15)), so the terminal reads `pinState` on every tap.
 
 ---
 
@@ -349,6 +350,90 @@ sha256 was rejected for that reason: the hash says which CAP to install, not
 which one a card already runs. A card whose `SELECT` answers anything below
 `00 04` needs the CAP reinstalled (sweep it first), and `cardctl selftest`
 fails it ([`HARDWARE_DEPLOYMENT.md`](HARDWARE_DEPLOYMENT.md#install)).
+
+---
+
+## <a id="d15"></a>D15 — A holder can take the PIN off a personalised card (qualifies D13)
+
+`CLEAR_PIN` (`0x43`, applet 0.5) removes the PIN from a card that has one.
+The card goes back to where `SET_PIN` found it: `pinState` 0, a fresh try
+counter, every gated command open with no PIN, `VERIFY_PIN` answering `6984`,
+and `SET_PIN` allowed again. D13 stays the default — POS cards still ship
+PIN-set, and nothing but this command, sent by someone who has verified the
+PIN in the same session and presents it again, takes a PIN off. This adds an
+explicit, PIN-authenticated way out; it does not reopen D12.
+
+Why a holder wants it: the card is cash ([D2](#d2)), and the PIN is the
+holder's choice of how much that cash should behave like a banknote. A card
+handed to someone else, a small-balance card for a tap-and-go merchant, a
+card whose holder decides the D13 prompt costs more than the D12 exposure
+it closes — each is the holder's call, on their own money, and before 0.5
+the only route was a reinstall, which regenerates the card key and strands
+the balance ([D5](#d5)). An owner who can set a PIN and cannot remove it is
+holding a card with a feature they cannot turn off.
+
+**Rejected:**
+
+- *`SET_PIN` re-callable, or `CHANGE_PIN` with an empty new PIN.* Both
+  overload a command that means something else; a reader that sends one
+  expects a PIN to exist afterwards. Clearing is its own instruction, with
+  its own capability bit (byte 6 bit 3), so a reader can tell from `GET_INFO`
+  whether the card answers it or `6D00`.
+- *Clearing on the verified session alone, without the PIN in the data
+  field.* The session flag is the card's own, but the command that removes
+  the one gate on the money asks for the PIN again, as `CHANGE_PIN` does
+  before it replaces it. A wrong PIN here costs a try through the same
+  helper (`failPinCheck`), so `CLEAR_PIN` is no cheaper to guess against than
+  `VERIFY_PIN`, and like `CHANGE_PIN` it cannot be the try that blocks the
+  card: the failure ends the session, and the `VERIFY_PIN` that reopens one
+  resets the counter.
+- *Clearing a blocked PIN.* This is the ENG-615 lesson, and the line this
+  command must not cross. State 2 is reached by three unauthenticated APDUs
+  from any reader in range; a `CLEAR_PIN` that took a blocked card to state
+  0 would be the unblock path D13 says does not exist, handed to whoever
+  blocked it — three wrong PINs, then a clear, then a spend. The gate is
+  `requirePinVerified`, which a blocked card can never pass, so state 2
+  answers `6982` with the right PIN, in this session and the next. The test
+  for it sends exactly that sequence. The stranded-balance problem ([D13](#d13),
+  [SECURITY-MODEL #14](SECURITY-MODEL.md)) is still `UNBLOCK_PIN` + PUK's
+  (ENG-617) to solve, not this command's.
+
+The write is one byte: `pinState` to 0, after the check — the byte `SET_PIN`
+writes last, the other way. The JCRE writes a byte atomically, so a card pulled
+mid-command is PIN-set or it is not; there is no state between. The try
+counter needs no write of its own: `OwnerPIN.check`'s contract is that a
+match sets the validated flag and resets the tries remaining, so the
+successful check `CLEAR_PIN` runs just before the write has already left
+the counter at its limit, and the card leaves as `SET_PIN` found it with
+`pinState` the only persistent byte the command touches.
+
+*Corrected before merge:* the first draft followed the byte with
+`OwnerPIN.resetAndUnblock()` inside a `JCSystem` transaction and described
+the order of the two as load-bearing, as [D14](#d14)'s is. It was not. The
+reset re-filled a counter the check had already filled, so neither tear it
+guarded against — state 0 over a stale counter, state 1 over a fresh one —
+could happen; the "fresh counter" is one the holder had already earned by
+verifying. A write order documented as a guarantee when it is not is worse
+than none, since the next change protects the wrong thing, so both calls
+went and `ClearPinTest` now scans for the opposite: the check precedes the
+write, and the state byte is the only persistent write. The test still sets
+`pinState` 0 over a partly spent counter and shows nothing reads it
+(`VERIFY_PIN` stops at `6984`; the next `SET_PIN`'s `OwnerPIN.update`
+starts its PIN at the full count), as a property of state 0 the applet must
+keep, not a state `CLEAR_PIN` can leave.
+
+Readers: `pinState` 1 is no longer a one-way state, so a terminal reads
+`GET_INFO` byte 7 on every tap rather than remembering a card as PIN-set.
+`cardctl clear-pin --pin` drives it (`VERIFY_PIN`, then `CLEAR_PIN`); `info`
+names the capability. flash-mobile's card screen is the follow-up: a
+"Remove PIN" action behind the PIN prompt, offered only when byte 6 bit 3 is
+set.
+
+The applet version moved to 0.5: a new instruction and a new capability bit
+are wire-visible, and a 0.4 card answers `0x43` with `6D00`. A 0.4 card is
+not vulnerable and need not be reinstalled; it lacks the feature. 0.5 is a
+fresh install (delete + install, sweep first), as every applet version is —
+there is no in-place upgrade.
 
 ---
 

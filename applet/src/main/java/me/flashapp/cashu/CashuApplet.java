@@ -28,6 +28,7 @@ import javacardx.crypto.*;
  *   0x40  VERIFY_PIN       — verify provisioning PIN
  *   0x41  SET_PIN          — set PIN (first-time, personalization only)
  *   0x42  CHANGE_PIN       — change PIN (current PIN session required)
+ *   0x43  CLEAR_PIN        — remove the PIN; bearer card again (current PIN session required, D15)
  *   0x50  LOCK_CARD        — permanently disable write operations
  *
  * @see <a href="https://github.com/lnflash/cashu-javacard">cashu-javacard</a>
@@ -47,10 +48,12 @@ public class CashuApplet extends Applet {
     // authentication. 0.4 is the ENG-620 fix (D14): every slot write commits
     // the status byte last. Nothing on the wire changes outside a torn write,
     // but main tracked a 0.3 CAP with the old order, and SELECT's version is
-    // all an installed card reports about its build.
+    // all an installed card reports about its build. 0.5 adds CLEAR_PIN (D15):
+    // a new instruction and a new capability bit, so a reader can tell from
+    // SELECT or GET_INFO whether 0x43 will answer or 6D00.
     // -------------------------------------------------------------------------
     static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x04;
+    static final byte VERSION_MINOR = (byte) 0x05;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
@@ -68,6 +71,7 @@ public class CashuApplet extends Applet {
     static final byte INS_VERIFY_PIN       = (byte) 0x40;
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
+    static final byte INS_CLEAR_PIN        = (byte) 0x43;
     static final byte INS_LOCK_CARD        = (byte) 0x50;
 
     // -------------------------------------------------------------------------
@@ -201,8 +205,9 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
 
     /**
-     * Set to 0x01 after a successful VERIFY_PIN. Cleared on deselect, and by
-     * any failed PIN check (see failPinCheck).
+     * Set to 0x01 after a successful VERIFY_PIN. Cleared on deselect, by any
+     * failed PIN check (see failPinCheck), and by CLEAR_PIN, whose success
+     * removes the PIN the session had verified.
      */
     private byte[] pinVerifiedFlag;
 
@@ -308,6 +313,7 @@ public class CashuApplet extends Applet {
             case INS_VERIFY_PIN:       processVerifyPin(apdu);      break;
             case INS_SET_PIN:          processSetPin(apdu);         break;
             case INS_CHANGE_PIN:       processChangePin(apdu);      break;
+            case INS_CLEAR_PIN:        processClearPin(apdu);       break;
             case INS_LOCK_CARD:        processLockCard(apdu);       break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
@@ -337,7 +343,9 @@ public class CashuApplet extends Applet {
         //   bit0 = secp256k1 native key generation (set — ENG-181 complete)
         //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
         //   bit2 = PIN supported (always set)
-        buf[6] = (byte) 0x07; // secp256k1 + Schnorr + PIN
+        //   bit3 = CLEAR_PIN supported (applet 0.5, D15): the PIN can go away
+        //          again, so byte 7 is read every tap, never cached
+        buf[6] = (byte) 0x0F; // secp256k1 + Schnorr + PIN + CLEAR_PIN
         buf[7] = pinState[0];
         apdu.setOutgoingAndSend((short) 0, (short) 8);
     }
@@ -558,8 +566,8 @@ public class CashuApplet extends Applet {
      * nothing and touches no EEPROM (D10).
      *
      * The blocked transition lives here and nowhere else so that every
-     * command that checks the PIN (VERIFY_PIN, CHANGE_PIN) blocks the card
-     * the same way. Before this helper CHANGE_PIN exhausted the OwnerPIN
+     * command that checks the PIN (VERIFY_PIN, CHANGE_PIN, CLEAR_PIN) blocks
+     * the card the same way. Before this helper CHANGE_PIN exhausted the OwnerPIN
      * without ever setting pinState, leaving GET_INFO reporting "set" on a
      * card that could no longer verify (ENG-615). With the session ending
      * here, CHANGE_PIN can no longer be the exhausting try at all: it needs a
@@ -608,6 +616,70 @@ public class CashuApplet extends Applet {
         if (!ok) failPinCheck();
         off += oldLen;
         pin.update(buf, off, (byte) newLen);
+    }
+
+    /**
+     * D15: the holder takes the PIN off the card and runs it as a bearer card
+     * (D12 semantics) by choice. Gated like CHANGE_PIN: the card is not
+     * locked, this session verified the PIN, and the PIN is presented again
+     * in the data field. requirePinVerified is what keeps this from being the
+     * unblock path D13 says does not exist: state 0 has nothing to clear and
+     * state 2 can never be verified (ENG-615), so neither reaches the write.
+     * A wrong PIN here costs a try through failPinCheck, exactly as
+     * CHANGE_PIN's does, so this command is no cheaper to guess against than
+     * VERIFY_PIN — and like CHANGE_PIN it cannot be the exhausting try, since
+     * the failure ends the session and the VERIFY_PIN that reopens one resets
+     * the counter.
+     *
+     * Data: [len][pin] — CHANGE_PIN's old-PIN framing with no new PIN after
+     * it. Lc must be exactly 1 + len, so a stray byte is 6700, never a PIN.
+     *
+     * The write is the one byte pinState, after the check — the byte SET_PIN
+     * writes last, the other way. The JCRE writes a byte atomically, so there is no half-done CLEAR_PIN
+     * for a pulled card to leave: the card is PIN-set or it is not. The try
+     * counter needs no write of its own, because the successful pin.check
+     * just above already reset it to its limit (OwnerPIN.check's contract:
+     * a match sets the validated flag and resets the tries remaining), so
+     * the card leaves here as SET_PIN found it, counter full, with pinState
+     * the only persistent byte this command touches. A pin.resetAndUnblock()
+     * after the check would reset a counter that is already full, and a
+     * JCSystem transaction would wrap a single atomic write; neither would
+     * add a guarantee, and an earlier draft that had both described a write
+     * order as load-bearing when it was not. ClearPinTest scans for the
+     * check preceding the write and for this being the only persistent
+     * write.
+     *
+     * pinState 0 is a gate the counter never sits behind: VERIFY_PIN,
+     * CHANGE_PIN and CLEAR_PIN all answer 6984 or 6982 before any check
+     * runs, and the next SET_PIN's OwnerPIN.update starts its PIN at the
+     * full count. ClearPinTest sets a no-PIN card over a partly spent
+     * counter directly and shows nothing reads it — a defensive property,
+     * not a state this command can leave.
+     *
+     * The old PIN value stays in the OwnerPIN until SET_PIN overwrites it.
+     * Nothing can check against it: VERIFY_PIN, CHANGE_PIN and CLEAR_PIN all
+     * stop at pinState 0 before any check runs.
+     */
+    private void processClearPin(APDU apdu) {
+        requireNotLocked();
+        requirePinVerified();
+
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen < (short) 1) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte[] buf = apdu.getBuffer();
+        short off = ISO7816.OFFSET_CDATA;
+
+        byte pinLen = buf[off++];
+        if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (dataLen != (short)(1 + pinLen)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+        boolean ok = pin.check(buf, off, pinLen);
+        if (!ok) failPinCheck();
+
+        pinState[0] = (byte) 0;
+        // The session verified a PIN that no longer exists. Transient, so it
+        // touches no EEPROM (D10).
+        pinVerifiedFlag[0] = (byte) 0;
     }
 
     // -------------------------------------------------------------------------

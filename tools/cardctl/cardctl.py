@@ -57,7 +57,22 @@ INS_CLEAR_SPENT = 0x31
 INS_VERIFY_PIN = 0x40
 INS_SET_PIN = 0x41
 INS_CHANGE_PIN = 0x42
+INS_CLEAR_PIN = 0x43
 INS_LOCK_CARD = 0x50
+
+# GET_INFO byte 6 (spec/APDU.md, GET_INFO). Bit 3 arrived with applet 0.5: a
+# card without it answers CLEAR_PIN with 6D00, so `clear-pin` reads the bit
+# before it sends the command, and `info` names it.
+CAP_SECP256K1_NATIVE = 0x01
+CAP_SCHNORR = 0x02
+CAP_PIN = 0x04
+CAP_CLEAR_PIN = 0x08
+
+# The lowest applet version selftest passes. Every build below it is one a card
+# is reinstalled from (ENG-615 below 0.3, ENG-620 below 0.4: D13, D14). 0.5
+# added CLEAR_PIN and fixed nothing, so the floor stayed at 0.4: a 0.4 card is
+# sound, it lacks a feature, and selftest says which.
+SELFTEST_MIN_VERSION = (0, 4)
 
 LOCK_CONFIRM_BYTE = 0xDE
 
@@ -283,8 +298,9 @@ class Card:
             "spent": b[4],
             "empty": b[5],
             "caps_raw": caps,
-            "secp256k1_native": bool(caps & 0x01),
-            "schnorr": bool(caps & 0x02),
+            "secp256k1_native": bool(caps & CAP_SECP256K1_NATIVE),
+            "schnorr": bool(caps & CAP_SCHNORR),
+            "clear_pin": bool(caps & CAP_CLEAR_PIN),
             "pin_state": {0: "unset", 1: "set", 2: "locked"}.get(b[7], f"unknown({b[7]})"),
         }
 
@@ -372,6 +388,15 @@ class Card:
     def change_pin(self, old: bytes, new: bytes) -> None:
         self.send(INS_CHANGE_PIN, data=bytes([len(old)]) + old + new, context="CHANGE_PIN")
 
+    def clear_pin(self, pin: bytes) -> None:
+        """CLEAR_PIN: [len][pin], CHANGE_PIN's old-PIN framing with nothing after it.
+
+        Needs VERIFY_PIN to have succeeded in this session first; the caller
+        sends that, as cmd_change_pin does, because the card counts a wrong PIN
+        here as a failed try (spec/APDU.md, CLEAR_PIN).
+        """
+        self.send(INS_CLEAR_PIN, data=bytes([len(pin)]) + pin, context="CLEAR_PIN")
+
     def lock_card(self) -> None:
         self.transmit(bytes([CLA, INS_LOCK_CARD, 0x00, LOCK_CONFIRM_BYTE]), "LOCK_CARD")
 
@@ -421,7 +446,8 @@ def cmd_info(args) -> int:
     print(f"slots            : {i['max_slots']} total — "
           f"{i['unspent']} unspent, {i['spent']} spent, {i['empty']} empty")
     print(f"capabilities     : 0x{i['caps_raw']:02X} "
-          f"(secp256k1 native={i['secp256k1_native']}, schnorr={i['schnorr']})")
+          f"(secp256k1 native={i['secp256k1_native']}, schnorr={i['schnorr']}, "
+          f"clear_pin={i['clear_pin']})")
     print(f"PIN              : {i['pin_state']}")
     print(f"balance          : {card.get_balance()}")
     return 0
@@ -1051,6 +1077,25 @@ def cmd_change_pin(args) -> int:
     return 0
 
 
+def cmd_clear_pin(args) -> int:
+    card = connect(args)
+    # A 0.4 card answers CLEAR_PIN with 6D00, which reads like a typo in the
+    # INS byte. The capability bit says so before anything is sent — and
+    # before VERIFY_PIN spends a session on a card that cannot use it.
+    info = card.get_info()
+    if not info["clear_pin"]:
+        raise SystemExit(
+            f"applet {info['version']} has no CLEAR_PIN (GET_INFO capability bit 3 clear): "
+            f"it arrived in applet 0.5. Reinstall the card to get it — sweep first "
+            f"(docs/HARDWARE_DEPLOYMENT.md)"
+        )
+    pin = args.pin.encode()
+    card.verify_pin(pin)
+    card.clear_pin(pin)
+    print("PIN cleared — the card is a bearer card again (no PIN on spend, load or clear-spent)")
+    return 0
+
+
 def cmd_lock(args) -> int:
     card = connect(args)
     if not args.yes:
@@ -1207,13 +1252,18 @@ def _select_verdict(version: bytes) -> Tuple[bool, str]:
     ver = tuple(version[:2])
     if ver < (0, 3):
         return False, (f"applet {ver[0]}.{ver[1]} is an ENG-615 build: sweep the "
-                       f"balance, then reinstall the 0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
-    if ver < (0, 4):
+                       f"balance, then reinstall the tracked CAP (docs/HARDWARE_DEPLOYMENT.md)")
+    if ver < SELFTEST_MIN_VERSION:
         return False, (f"applet {ver[0]}.{ver[1]} may carry ENG-620 (a card pulled "
                        f"mid-LOAD_PROOF can show a phantom proof), and SELECT cannot "
                        f"tell its builds apart: sweep the balance unless its PIN is "
                        f"blocked (then it is stranded, SECURITY-MODEL #14), and reinstall "
-                       f"the 0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+                       f"the tracked CAP (docs/HARDWARE_DEPLOYMENT.md)")
+    if ver == (0, 4):
+        # Sound, but the holder cannot take the PIN off (D15). Said here so
+        # that a `clear-pin` that fails later is not a surprise; not a FAIL,
+        # because nothing about the card's money is wrong.
+        return True, "version 0.4 (no CLEAR_PIN; added in 0.5)"
     return True, f"version {ver[0]}.{ver[1]}"
 
 
@@ -1314,6 +1364,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("old")
     s.add_argument("new")
     s.set_defaults(func=cmd_change_pin)
+
+    s = sub.add_parser("clear-pin", help="remove the PIN: the card is a bearer card again (applet 0.5, D15)")
+    s.add_argument("--pin", required=True, help="the current PIN (verified, then presented again)")
+    s.set_defaults(func=cmd_clear_pin)
 
     s = sub.add_parser("lock", help="permanently disable writes (IRREVERSIBLE)")
     s.add_argument("--pin")

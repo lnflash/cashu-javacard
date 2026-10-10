@@ -115,6 +115,7 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `dump --mint URL [--unit U] [--out PATH] [--force] [--unspent-only]` | Write the card's slots out as a card file. `--out` refuses to overwrite without `--force`. |
 | `clear-spent [--pin P]` | free spent slots |
 | `verify-pin` / `set-pin` / `change-pin` | PIN management |
+| `clear-pin --pin` | remove the PIN; the card is a bearer card again (applet 0.5, D15). Verifies the PIN first, refuses a card without the capability bit |
 | `lock [--yes]` | **irreversibly** disable writes |
 | `apdu <hex>` | send a raw APDU |
 

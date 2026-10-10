@@ -13,11 +13,11 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * jCardSim test suite for CashuApplet.
  *
- * Tests cover all 14 APDU commands across 5 categories:
+ * Tests cover all 15 APDU commands across 5 categories:
  *   - Read:     GET_INFO, GET_PUBKEY, GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS
  *   - Spend:    SPEND_PROOF, SIGN_ARBITRARY
  *   - Write:    LOAD_PROOF, CLEAR_SPENT
- *   - Auth:     VERIFY_PIN, SET_PIN, CHANGE_PIN
+ *   - Auth:     VERIFY_PIN, SET_PIN, CHANGE_PIN, CLEAR_PIN
  *   - Admin:    LOCK_CARD
  *
  * ENG-181 complete: secp256k1 curve params set + BIP-340 Schnorr implemented.
@@ -44,6 +44,7 @@ class CashuAppletTest {
     static final byte INS_VERIFY_PIN       = (byte) 0x40;
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
+    static final byte INS_CLEAR_PIN        = (byte) 0x43;
     static final byte INS_LOCK_CARD        = (byte) 0x50;
 
     // Status words
@@ -100,10 +101,10 @@ class CashuAppletTest {
         byte[] data = resp.getData();
         assertEquals(2, data.length, "Version response must be 2 bytes");
         assertEquals(0x00, data[0], "Major version = 0");
-        assertEquals(0x04, data[1],
-            "Minor version = 4 (ENG-620: a slot's status byte is written last, D14). A fixed "
-                + "card must not answer SELECT like the 0.3 build main tracked with the old "
-                + "write order, nor like the ENG-615 builds below it.");
+        assertEquals(0x05, data[1],
+            "Minor version = 5 (CLEAR_PIN, D15). A card that answers 0x43 must not answer "
+                + "SELECT like a 0.4 build, which answers it 6D00; nor like the 0.3 build main "
+                + "tracked with the old write order (ENG-620), nor the ENG-615 builds below it.");
     }
 
     // =========================================================================
@@ -118,13 +119,14 @@ class CashuAppletTest {
         byte[] d = resp.getData();
         assertEquals(8, d.length, "GET_INFO must return 8 bytes");
         assertEquals(0x00, d[0] & 0xFF, "major version");
-        assertEquals(0x04, d[1] & 0xFF, "minor version");
+        assertEquals(0x05, d[1] & 0xFF, "minor version");
         assertEquals(MAX_PROOFS, d[2] & 0xFF, "max slots = 32");
         assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
         assertEquals(0, d[4] & 0xFF, "spent = 0 initially");
         assertEquals(MAX_PROOFS, d[5] & 0xFF, "empty = 32 initially");
-        // bit0 = secp256k1 native, bit1 = Schnorr, bit2 = PIN (all set after ENG-181)
-        assertEquals(0x07, d[6] & 0xFF, "Capabilities must be 0x07 (secp256k1+Schnorr+PIN)");
+        // bit0 = secp256k1 native, bit1 = Schnorr, bit2 = PIN (all set after ENG-181),
+        // bit3 = CLEAR_PIN (applet 0.5, D15)
+        assertEquals(0x0F, d[6] & 0xFF, "Capabilities must be 0x0F (secp256k1+Schnorr+PIN+CLEAR_PIN)");
         assertEquals(0, d[7] & 0xFF, "PIN state = 0 (unset) initially");
     }
 
@@ -1412,6 +1414,232 @@ class CashuAppletTest {
 
     private int changePin(byte[] data) {
         return transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW();
+    }
+
+    // =========================================================================
+    // D15 — CLEAR_PIN: a holder removes the PIN and the card is bearer again
+    // =========================================================================
+
+    /** CLEAR_PIN data: 1-byte PIN length, PIN — CHANGE_PIN's old-PIN framing, nothing after it. */
+    static byte[] clearPinData(byte[] pin) {
+        byte[] data = new byte[1 + pin.length];
+        data[0] = (byte) pin.length;
+        System.arraycopy(pin, 0, data, 1, pin.length);
+        return data;
+    }
+
+    private int clearPin(byte[] pin) {
+        return transmit(new CommandAPDU(CLA, INS_CLEAR_PIN, 0, 0, clearPinData(pin))).getSW();
+    }
+
+    private int pinState() {
+        return transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF;
+    }
+
+    private int reselect() {
+        return transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getSW();
+    }
+
+    @Test @Order(40)
+    @DisplayName("CLEAR_PIN needs a verified session: 6982 on a fresh card, a personalised card, and after a failed check (D15)")
+    void testClearPinNeedsAVerifiedSession() {
+        assertEquals(SW_OK, loadProof1().getSW());
+
+        // No PIN: nothing to clear, and nothing to verify, so the session gate
+        // answers before the data is read. Not 6984 — the gate is the same
+        // one CHANGE_PIN has, and it runs first.
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "CLEAR_PIN on a card with no PIN");
+        assertEquals(0, pinState());
+
+        // A PIN, no VERIFY_PIN: the right PIN in the data field is not enough.
+        // A thief who knows the PIN can verify anyway; one who does not must
+        // not get a second oracle. Nothing changes and no try is spent.
+        personalise();
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "CLEAR_PIN without VERIFY_PIN");
+        assertEquals(1, pinState(), "the PIN is still set");
+        assertGatedCommandsRefuse("after an unverified CLEAR_PIN");
+        assertEquals(0x63C2, verify(WRONG_PIN), "the unverified CLEAR_PIN cost no try");
+
+        // A verified session that a wrong VERIFY_PIN then ended.
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(0x63C2, verify(WRONG_PIN));
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "CLEAR_PIN after the session ended");
+        assertEquals(1, pinState());
+    }
+
+    @Test @Order(41)
+    @DisplayName("a wrong PIN in CLEAR_PIN costs a try, ends the session, counts toward the block, and a blocked PIN is never cleared (D15, ENG-615)")
+    void testClearPinWrongPinCountsTowardTheBlockAndABlockedPinStays() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+
+        // The wrong PIN goes through failPinCheck like CHANGE_PIN's: 63C2, and
+        // the session is over. The next CLEAR_PIN, right PIN or wrong, stops
+        // at the gate without reaching the check, so the counter holds at 2:
+        // CLEAR_PIN cannot be guessed against faster than VERIFY_PIN can.
+        assertEquals(0x63C2, clearPin(WRONG_PIN), "a wrong PIN costs a try");
+        assertEquals(1, pinState(), "the PIN is still set");
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(WRONG_PIN), "the next CLEAR_PIN never reaches the check");
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "not even with the right PIN: the session is gone");
+        assertGatedCommandsRefuse("after a failed CLEAR_PIN");
+
+        // The failure counted: two more wrong VERIFY_PINs block the card.
+        assertEquals(0x63C1, verify(WRONG_PIN));
+        assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN), "the CLEAR_PIN failure counted toward the block");
+        assertEquals(2, pinState(), "GET_INFO reports the PIN as blocked");
+
+        // Blocked is not clearable. The one ENG-615 shape this command could
+        // reintroduce is "state 2 reads as clearable": a holder — or anyone,
+        // VERIFY_PIN is unauthenticated — blocks the PIN and then removes it,
+        // which is the unblock path D13 says does not exist, open to all. The
+        // gate refuses in this session, in the next, and with the right PIN.
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "CLEAR_PIN with the right PIN on a blocked card");
+        assertEquals(2, pinState(), "still blocked");
+        assertGatedCommandsRefuse("after CLEAR_PIN on a blocked card");
+        assertEquals(SW_OK, reselect(), "re-SELECT starts a new session");
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "CLEAR_PIN in the new session");
+        assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "VERIFY_PIN cannot open one");
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "CLEAR_PIN after that");
+        assertEquals(2, pinState(), "a blocked PIN stays blocked");
+        assertGatedCommandsRefuse("after every attempt to clear a blocked card");
+    }
+
+    @Test @Order(42)
+    @DisplayName("CLEAR_PIN removes the PIN: GET_INFO 0.5 / 0x0F / state 0, VERIFY_PIN 6984, and spend, sign, load and clear open with no PIN (D15)")
+    void testClearPinRemovesThePinAndTheCardIsBearerAgain() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+
+        assertEquals(SW_OK, clearPin(TEST_PIN));
+
+        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
+        assertEquals(0x00, info[0] & 0xFF, "major version");
+        assertEquals(0x05, info[1] & 0xFF, "minor version: 0.5 is the first build with CLEAR_PIN");
+        assertEquals(0x0F, info[6] & 0xFF, "capability bit 3 says the card answers CLEAR_PIN");
+        assertEquals(0, info[7] & 0xFF, "PIN state is unset again");
+        assertEquals(SW_PIN_NOT_SET, verify(TEST_PIN), "VERIFY_PIN has nothing to verify");
+        assertEquals(SW_PIN_NOT_SET, verify(WRONG_PIN), "and nothing to count a try against");
+
+        // D12 semantics, in this session with no VERIFY_PIN having succeeded
+        // since the clear: every gated command is open, as on a card that was
+        // never personalised.
+        ResponseAPDU spend = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
+        assertEquals(SW_OK, spend.getSW(), "SPEND_PROOF with no PIN");
+        assertEquals(64, spend.getData().length);
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "SIGN_ARBITRARY with no PIN");
+        ResponseAPDU load = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1));
+        assertEquals(SW_OK, load.getSW(), "LOAD_PROOF with no PIN");
+        assertEquals(1, load.getData()[0], "into the next free slot");
+        ResponseAPDU cleared = transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
+        assertEquals(SW_OK, cleared.getSW(), "CLEAR_SPENT with no PIN");
+        assertEquals(1, cleared.getData()[0], "the spent slot was freed");
+
+        // And in the next session, which starts with no verification at all.
+        assertEquals(SW_OK, reselect());
+        assertEquals(0, pinState());
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "SPEND_PROOF in a fresh session with no PIN");
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(TEST_PIN), "nothing left to clear");
+    }
+
+    @Test @Order(43)
+    @DisplayName("SET_PIN works again after CLEAR_PIN and re-gates spending with fresh tries; the cleared session does not carry over (D15)")
+    void testSetPinAfterClearPinRegatesSpending() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, clearPin(TEST_PIN));
+
+        // "Once" is once per PIN lifecycle: the card is back where SET_PIN
+        // found it.
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length)).getSW(),
+            "SET_PIN after CLEAR_PIN");
+        assertEquals(1, pinState());
+        assertEquals(SW_CONDITIONS_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW(),
+            "and only once: the second SET_PIN is refused as before");
+
+        // The VERIFY_PIN that authorised the clear verified a PIN that is
+        // gone. CLEAR_PIN ended that session, so the new PIN gates at once.
+        assertGatedCommandsRefuse("after SET_PIN in the session that cleared the old PIN");
+        assertEquals(SW_SECURITY_NOT_SATIS, clearPin(NEW_PIN), "CLEAR_PIN needs a fresh VERIFY_PIN too");
+
+        // The old PIN is gone, the counter is fresh (3 tries), and the new
+        // PIN opens the gate.
+        assertEquals(0x63C2, verify(TEST_PIN), "the old PIN is refused, and the counter started at 3");
+        assertEquals(SW_OK, verify(NEW_PIN));
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "the new PIN spends");
+
+        // The cycle closes: the new PIN clears too.
+        assertEquals(SW_OK, clearPin(NEW_PIN));
+        assertEquals(0, pinState());
+    }
+
+    @Test @Order(44)
+    @DisplayName("CLEAR_PIN after LOCK_CARD is 6986, before the session gate and the check (D15)")
+    void testClearPinOnLockedCard() {
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)).getSW());
+
+        // Locked is locked: a verified session with the right PIN cannot
+        // clear it, and the refusal is the lock's (6986), not the gate's.
+        assertEquals(ISO7816.SW_COMMAND_NOT_ALLOWED, clearPin(TEST_PIN), "CLEAR_PIN on a locked card");
+        assertEquals(1, pinState(), "the PIN is still set");
+        assertEquals(0x63C2, verify(WRONG_PIN), "the refused CLEAR_PIN cost no try");
+        assertEquals(ISO7816.SW_COMMAND_NOT_ALLOWED, clearPin(TEST_PIN),
+            "6986 whether or not the session is verified");
+
+        // A card locked with no PIN set cannot gain one either way (SET_PIN
+        // is 6986 on a locked card), so CLEAR_PIN's 6986 there is just the
+        // lock; the fresh-card case is covered in testClearPinNeedsAVerifiedSession.
+    }
+
+    @Test @Order(45)
+    @DisplayName("CLEAR_PIN with a bad length is 6700 and costs no try (D15)")
+    void testClearPinWrongLength() {
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+
+        // Empty data: no length byte to read.
+        assertEquals(SW_WRONG_LENGTH,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_PIN, 0, 0, new byte[0])).getSW(),
+            "no data");
+        // A length byte outside 4..8.
+        assertEquals(SW_WRONG_LENGTH,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_PIN, 0, 0, new byte[] { 3, 0x31, 0x32, 0x33 })).getSW(),
+            "PIN length 3");
+        assertEquals(SW_WRONG_LENGTH,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_PIN, 0, 0, new byte[] { 9, 1, 2, 3, 4, 5, 6, 7, 8, 9 })).getSW(),
+            "PIN length 9");
+        // A length byte that does not match Lc: a stray byte is never read as
+        // PIN, and a short PIN is never checked.
+        byte[] stray = new byte[1 + TEST_PIN.length + 1];
+        System.arraycopy(clearPinData(TEST_PIN), 0, stray, 0, 1 + TEST_PIN.length);
+        assertEquals(SW_WRONG_LENGTH,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_PIN, 0, 0, stray)).getSW(),
+            "a byte after the PIN");
+        byte[] truncated = { (byte) TEST_PIN.length, 0x31, 0x32, 0x33 };
+        assertEquals(SW_WRONG_LENGTH,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_PIN, 0, 0, truncated)).getSW(),
+            "a PIN shorter than its length byte");
+
+        // None of that reached the PIN check: the session is still verified,
+        // the PIN still set, the counter untouched.
+        assertEquals(1, pinState());
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "the session is still verified");
+        assertEquals(SW_OK, clearPin(TEST_PIN), "and the well-formed CLEAR_PIN works");
+        assertEquals(0, pinState());
     }
 
     /**

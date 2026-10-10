@@ -499,20 +499,54 @@ _RANGE_LENGTH = {"VERIFY_PIN", "SET_PIN"}
 #   * CHANGE_PIN documents `Lc | Variable` — old PIN length prefix + two PINs
 #     of 4–8 bytes each, so even its endpoints are not a single pair.
 #     test_apdu.py pins its encoding against the driver.
+#   * CLEAR_PIN documents `Lc | Variable` — PIN length prefix + one PIN of 4–8
+#     bytes, so its Lc is 05–09: one more than the PIN range, and not the
+#     PIN_MIN_LEN..PIN_MAX_LEN pair _RANGE_LENGTH compares against. The
+#     framing is pinned in test_apdu.py, and the prefix-plus-PIN shape is
+#     checked against CHANGE_PIN's below.
 #   * LOCK_CARD is a bare 4-byte APDU — it carries no data and expects no
 #     response body, so it documents neither Lc nor Le. Its P2 is the
 #     confirmation byte, checked in test_lock_card_p2_is_the_confirmation_byte.
-_NOT_FIXED_LENGTH = {"CHANGE_PIN", "LOCK_CARD"}
+_NOT_FIXED_LENGTH = {"CHANGE_PIN", "CLEAR_PIN", "LOCK_CARD"}
 
-# Every documented command, driven through the real encoder. The four above are
+# Every documented command, driven through the real encoder. The five above are
 # absent from _LENGTH_CASES but their headers are still checked, so they are
 # added back here.
 _WIRE_CASES = _LENGTH_CASES + (
     ("VERIFY_PIN", "verify_pin", (b"1234",), b""),
     ("SET_PIN", "set_pin", (b"1234",), b""),
     ("CHANGE_PIN", "change_pin", (b"1234", b"5678"), b""),
+    ("CLEAR_PIN", "clear_pin", (b"1234",), b""),
     ("LOCK_CARD", "lock_card", (), b""),
 )
+
+
+def test_clear_pin_is_change_pin_without_the_new_pin():
+    """
+    CLEAR_PIN's data is documented as CHANGE_PIN's old-PIN framing with
+    nothing after it, and the applet reads it that way: `[len][pin]`, Lc
+    exactly 1 + len. The two encoders have to agree on the prefix, or a reader
+    built from one doc section sends the other command's bytes. The applet's
+    own exact-length rule is pinned in CashuAppletTest.
+    """
+    change = make_card([(b"", 0x9000)])
+    change.change_pin(b"1234", b"5678")
+    clear = make_card([(b"", 0x9000)])
+    clear.clear_pin(b"1234")
+    sent_change, sent_clear = change.connection.last, clear.connection.last
+    assert sent_clear[5:] == sent_change[5:5 + 1 + 4], (
+        f"CLEAR_PIN sends {sent_clear[5:].hex()}, CHANGE_PIN's old-PIN field is "
+        f"{sent_change[5:10].hex()}"
+    )
+    assert sent_clear[4] == 1 + 4, f"CLEAR_PIN's Lc is {sent_clear[4]}, expected 1 + len(pin)"
+
+    row = re.search(r"^\| Data \| (.+?) \|$", _section("CLEAR_PIN"), re.M)
+    assert row, "CLEAR_PIN has no parsable Data row"
+    assert "1-byte PIN length" in row.group(1) and "4–8" in row.group(1), row.group(1)
+    assert re.search(r"^\| Lc \| Variable \|$", _section("CLEAR_PIN"), re.M), (
+        "CLEAR_PIN's Lc is no longer documented as Variable; if it became a range, move it "
+        "from _NOT_FIXED_LENGTH and say how the range relates to PIN_MIN_LEN/PIN_MAX_LEN"
+    )
 
 # Commands whose P1 carries a caller-chosen slot index rather than a fixed byte.
 # These are the two that move money: a P1 documented as a literal `00` sends a
@@ -1006,9 +1040,13 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
     and the floor moved with it: a guide still saying `00 03` passes the card
     the bump exists to catch.
 
-    The floor is the tracked version because every build below it is one a
-    card is reinstalled from (D13, D14). A version bump that leaves the floor
-    where it was has to say why, here.
+    The floor is cardctl.SELFTEST_MIN_VERSION, and it was the tracked version
+    while every build below it was one a card is reinstalled from (D13, D14).
+    A version bump that leaves the floor where it was has to say why, here:
+    0.5 added CLEAR_PIN (D15) and fixed nothing, so a 0.4 card is sound and
+    stays installed; selftest passes it and names the missing command. The
+    floor must still sit at or below the tracked version, fail the version
+    under it, and pass the tracked one.
     """
     version = dict(re.findall(
         r"static final byte VERSION_(MAJOR|MINOR)\s*=\s*\(byte\)\s*0x([0-9A-Fa-f]{2})",
@@ -1044,12 +1082,70 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
 
     ok, detail = cardctl._select_verdict(bytes([major, minor]))
     assert ok, f"selftest fails the applet this repo builds: {detail}"
-    if minor:
-        ok, detail = cardctl._select_verdict(bytes([major, minor - 1]))
+    assert detail == f"version {major}.{minor}", (
+        f"selftest passes the tracked applet with a caveat it should not need: {detail}"
+    )
+
+    floor = cardctl.SELFTEST_MIN_VERSION
+    assert floor <= (major, minor), (
+        f"selftest's floor {floor} is above the tracked applet {major}.{minor}"
+    )
+    # The guide-mentions-every-passed-version loop below walks minors under
+    # one major. With the floor at 0.4 and the applet at 1.0, range(4, 0) is
+    # empty and the ratchet checks nothing while still passing, so the loop
+    # must be rewritten over (major, minor) pairs when the floor and the
+    # applet part ways on the major, and this assertion is what says so.
+    assert floor[0] == major, (
+        f"selftest's floor {floor} and the tracked applet {major}.{minor} differ in "
+        f"major version: the versions-between loop in this test walks minors under one "
+        f"major and would silently check nothing; rewrite it over (major, minor) pairs"
+    )
+    assert cardctl._select_verdict(bytes(floor))[0], f"selftest fails its own floor {floor}"
+    if floor[1]:
+        ok, detail = cardctl._select_verdict(bytes([floor[0], floor[1] - 1]))
         assert not ok, (
-            f"selftest passes applet {major}.{minor - 1}, below the tracked "
-            f"{major}.{minor}: {detail}"
+            f"selftest passes applet {floor[0]}.{floor[1] - 1}, below its floor "
+            f"{floor[0]}.{floor[1]}: {detail}"
         )
+    # The guide tells an operator what a card between the floor and the
+    # tracked version is missing, so a selftest pass on it is not read as
+    # "nothing to do".
+    for v in range(floor[1], minor):
+        assert _select_answer(major, v) in guide, (
+            f"{DEPLOYMENT_MD.name} says nothing about a card answering {major:02X} {v:02X}, "
+            f"which selftest passes though it is below the tracked {major}.{minor}"
+        )
+
+
+def _select_answer(major, minor):
+    """
+    The two-byte `SELECT` answer the deployment guide writes for an applet
+    version, in the guide's own notation: `MM mm`, each a two-digit upper-case
+    hex byte in backticks, as in `00 04` or `01 00`.
+    """
+    return f"`{major:02X} {minor:02X}`"
+
+
+def test_select_answer_spells_the_guide_notation_for_any_version():
+    """
+    The versions-between loop above once hardcoded the major as `00` (and spelt
+    the minor as `0{v}`), so it passed only while both the floor and the applet
+    sat under major 0. With the floor at 1.0 and the applet at 1.2, it demanded
+    `00 00` and `00 01` in a guide that correctly says `01 00`, and blamed the
+    guide for a sentence it had; at minor 10 the `0{v}` spelling asked for
+    `00 010`. The notation must be the guide's for every (major, minor).
+    """
+    assert _select_answer(0, 4) == "`00 04`"
+    assert _select_answer(1, 0) == "`01 00`"
+    assert _select_answer(1, 2) == "`01 02`"
+    assert _select_answer(0, 10) == "`00 0A`"
+    assert _select_answer(0, 255) == "`00 FF`"
+    # And the guide's current text is written in exactly this notation.
+    guide = DEPLOYMENT_MD.read_text(encoding="utf-8")
+    assert _select_answer(*cardctl.SELFTEST_MIN_VERSION) in guide, (
+        f"{DEPLOYMENT_MD.name} does not mention the floor "
+        f"{cardctl.SELFTEST_MIN_VERSION} in the `MM mm` notation this test expects"
+    )
 
 
 def test_every_documented_status_word_is_translated_by_cardctl():

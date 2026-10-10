@@ -187,7 +187,22 @@ def test_get_info_decodes_capabilities_and_pin_state():
     assert i["version"] == "0.1" and i["max_slots"] == 32
     assert i["unspent"] == 3 and i["spent"] == 1 and i["empty"] == 28
     assert i["secp256k1_native"] and i["schnorr"]
+    assert i["clear_pin"] is False, "bit 3 clear: a pre-0.5 card has no CLEAR_PIN"
     assert i["pin_state"] == "set"
+
+    # v0.5 answers caps=0x0F: bit 3 is CLEAR_PIN (spec/APDU.md, GET_INFO).
+    i = make_card([(bytes([0, 5, 32, 0, 0, 32, 0x0F, 0]), 0x9000)]).get_info()
+    assert i["version"] == "0.5" and i["clear_pin"] is True
+    assert i["secp256k1_native"] and i["schnorr"]
+    assert i["pin_state"] == "unset"
+
+
+def test_cmd_info_names_the_clear_pin_capability():
+    card = make_card([(bytes([0, 5, 32, 0, 0, 32, 0x0F, 1]), 0x9000), (bytes(4), 0x9000)])
+    args = cardctl.build_parser().parse_args(["info"])
+    with stubbed_connect(card) as out:
+        assert args.func(args) == 0
+    assert "clear_pin=True" in out.getvalue(), out.getvalue()
 
 
 # ── spend commands ───────────────────────────────────────────────────────────
@@ -258,6 +273,60 @@ def test_change_pin_prefixes_the_old_pin_length():
     assert sent[5] == 4              # old PIN length prefix
     assert sent[6:10] == b"1234"
     assert sent[10:16] == b"567890"
+
+
+def test_clear_pin_prefixes_the_pin_length_and_sends_nothing_after_it():
+    card = make_card()
+    card.clear_pin(b"567890")
+    sent = card.connection.last
+    assert sent[:4] == bytes.fromhex("B0430000")
+    assert sent[4] == 1 + 6            # Lc: exactly one more than the PIN
+    assert sent[5] == 6                # PIN length prefix
+    assert sent[6:12] == b"567890"
+    assert len(sent) == 12, "no Le, no trailing bytes: the card refuses Lc != 1 + len with 6700"
+
+
+def test_cmd_clear_pin_verifies_first_then_clears_with_the_same_pin():
+    """The order the card requires (spec/APDU.md, CLEAR_PIN): VERIFY_PIN opens
+    the session, then CLEAR_PIN carries the PIN again. Sending CLEAR_PIN alone
+    is 6982 on every card, and a wrong PIN in it costs a try."""
+    info = bytes([0, 5, 32, 0, 0, 32, 0x0F, 1])
+    card = make_card([(info, 0x9000), (b"", 0x9000), (b"", 0x9000)])
+    args = cardctl.build_parser().parse_args(["clear-pin", "--pin", "1234"])
+    with stubbed_connect(card) as out:
+        assert args.func(args) == 0
+    sent = card.connection.sent
+    assert [apdu[1] for apdu in sent] == [
+        cardctl.INS_GET_INFO, cardctl.INS_VERIFY_PIN, cardctl.INS_CLEAR_PIN,
+    ], [apdu.hex() for apdu in sent]
+    assert sent[1][5:9] == b"1234"
+    assert sent[2] == bytes.fromhex("B0430000") + bytes([5, 4]) + b"1234"
+    assert "PIN cleared" in out.getvalue(), out.getvalue()
+
+
+def test_cmd_clear_pin_refuses_a_card_without_the_capability_before_verifying():
+    """A 0.4 card answers CLEAR_PIN with 6D00, which reads like a bad INS byte.
+    The capability bit says so first, and no VERIFY_PIN is spent on it."""
+    info = bytes([0, 4, 32, 0, 0, 32, 0x07, 1])
+    card = make_card([(info, 0x9000)])
+    args = cardctl.build_parser().parse_args(["clear-pin", "--pin", "1234"])
+    with stubbed_connect(card):
+        try:
+            args.func(args)
+        except SystemExit as exc:
+            assert "no CLEAR_PIN" in str(exc) and "0.4" in str(exc), str(exc)
+        else:
+            raise AssertionError("clear-pin ran against a card without the capability")
+    assert [apdu[1] for apdu in card.connection.sent] == [cardctl.INS_GET_INFO]
+
+
+def test_clear_pin_requires_the_pin_flag():
+    try:
+        cardctl.build_parser().parse_args(["clear-pin"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("clear-pin parsed without --pin")
 
 
 def test_lock_card_sends_the_confirmation_byte_in_p2():
@@ -687,7 +756,7 @@ def test_selftest_fails_every_0_3_card_blocked_or_not():
         assert rc == 1, f"{label}\n{out}"
         assert "FAIL  SELECT applet" in out, f"{label}\n{out}"
         assert "applet 0.3 may carry ENG-620" in out, f"{label}\n{out}"
-        assert "reinstall the 0.4 CAP" in out, f"{label}\n{out}"
+        assert "reinstall the tracked CAP" in out, f"{label}\n{out}"
         assert "unless its PIN is blocked" in out, f"{label}\n{out}"
         assert "checks passed" not in out, f"{label}\n{out}"
         if pin_state == 2:
@@ -696,16 +765,20 @@ def test_selftest_fails_every_0_3_card_blocked_or_not():
 
 
 def test_select_verdict_passes_only_a_known_fixed_version():
-    assert cardctl._select_verdict(bytes([0, 4])) == (True, "version 0.4")
+    # 0.4 passes — it fixed ENG-620 and nothing since is a fix — but is told
+    # it lacks CLEAR_PIN (0.5, D15), so a later `clear-pin` 6D00 is no surprise.
+    ok, detail = cardctl._select_verdict(bytes([0, 4]))
+    assert ok is True and detail == "version 0.4 (no CLEAR_PIN; added in 0.5)", detail
+    assert cardctl._select_verdict(bytes([0, 5])) == (True, "version 0.5")
     assert cardctl._select_verdict(bytes([1, 0]))[0] is True
     for version in (bytes([0, 1]), bytes([0, 2])):
         ok, detail = cardctl._select_verdict(version)
         assert ok is False and "ENG-615" in detail, detail
-        assert "reinstall the 0.4 CAP" in detail, detail
+        assert "reinstall the tracked CAP" in detail, detail
     # 0.3 has the ENG-615 fix, but SELECT cannot tell the build main tracked
     # with the old slot write order (ENG-620) from one with the fix.
     ok, detail = cardctl._select_verdict(bytes([0, 3]))
-    assert ok is False and "ENG-620" in detail and "reinstall the 0.4 CAP" in detail, detail
+    assert ok is False and "ENG-620" in detail and "reinstall the tracked CAP" in detail, detail
     # No version at all cannot be told apart from an ENG-615 or ENG-620 build.
     ok, detail = cardctl._select_verdict(b"")
     assert ok is False and "no applet version" in detail, detail
