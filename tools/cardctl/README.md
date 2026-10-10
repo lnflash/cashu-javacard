@@ -74,8 +74,18 @@ byte before its data ([D14](../../docs/DECISIONS.md#d14)), and nothing on the
 card tells it apart from another 0.3 build. Either way, sweep the balance and
 reinstall the 0.4 CAP, except that a 0.3 card whose PIN is blocked cannot be
 swept. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also fails before
-any signing round, since no PIN can verify on it again; on 0.3 and later that
-means the balance is stranded (SECURITY-MODEL #14).
+any signing round, since no PIN can verify on it again; on 0.3 to 0.5 that
+means the balance is stranded (SECURITY-MODEL #14). On 0.6 with a PUK set
+(byte 8 = 1) it is not: `selftest` names `unblock-pin`, and the balance is a
+`verify-pin` away once the PIN is replaced (D16). A 0.6 card with no PUK, or
+an exhausted one, is as stranded as a 0.5 card.
+
+| `info` on 0.6 | meaning |
+|---|---|
+| `PUK : unset` | no PUK yet; `set-puk` works (with `--pin` if the card has a PIN) |
+| `PUK : set` | `unblock-pin` recovers a blocked PIN |
+| `PUK : exhausted` | ten wrong PUKs; no recovery path, no new PUK |
+| `PUK : none (applet 0.5 …)` | the card has no PUK byte at all; reinstall for one |
 
 ## Loading the applet
 
@@ -116,6 +126,8 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | `clear-spent [--pin P]` | free spent slots |
 | `verify-pin` / `set-pin` / `change-pin` | PIN management |
 | `clear-pin --pin` | remove the PIN; the card is a bearer card again (applet 0.5, D15). Verifies the PIN first, refuses a card without the capability bit |
+| `set-puk --puk P [--pin Q]` | set the provisioning PUK, once (applet 0.6, D16). Needs `--pin` on a card that has a PIN (verified first); refuses a card without the capability bit, one whose PUK is already set or exhausted, and a blocked card with no PUK. Record the PUK off the card: it is never read back |
+| `unblock-pin --puk P --new-pin N` | replace a blocked or forgotten PIN with the PUK (applet 0.6, D16). Sends no `VERIFY_PIN`; refuses, before spending a PUK try, a card with no PUK, an exhausted PUK, no PIN, or no capability bit. The new PIN then needs `verify-pin` as usual |
 | `lock [--yes]` | **irreversibly** disable writes |
 | `apdu <hex>` | send a raw APDU |
 
