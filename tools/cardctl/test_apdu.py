@@ -369,6 +369,9 @@ INFO_06_PIN_PUK_EXHAUSTED = bytes([0, 6, 32, 0, 0, 32, 0x1F, 1, 2])
 # SET_PIN with nothing issued between — so a personaliser who sees it on a
 # fresh card is holding one armed by someone else (SECURITY-MODEL #16).
 INFO_06_NO_PIN_PUK = bytes([0, 6, 32, 0, 0, 32, 0x1F, 0, 1])
+# The same state on a card that is not empty: a bearer card (never PIN'd) the
+# holder loaded with 3 proofs, then a stranger's SET_PUK. Byte 3 is unspent.
+INFO_06_NO_PIN_PUK_LOADED = bytes([0, 6, 32, 3, 0, 29, 0x1F, 0, 1])
 INFO_05_PIN = bytes([0, 5, 32, 0, 0, 32, 0x0F, 1])
 
 
@@ -481,7 +484,10 @@ def test_cmd_set_puk_names_a_foreign_puk_on_a_card_with_no_pin():
         assert "reports a PUK but has no PIN" in msg, msg
         # The personaliser's half: a fresh card nobody should issue.
         assert "personalising a fresh card" in msg and "someone else armed it" in msg, msg
-        assert "do not issue it" in msg and "sweep nothing" in msg, msg
+        assert "do not issue it" in msg, msg
+        # Empty card: nothing to sweep, and the message says why it knows.
+        assert "sweep nothing (GET_INFO reports no unspent proofs)" in msg, msg
+        assert "it holds" not in msg and "strands them" not in msg, msg
         assert "reinstall the CAP" in msg and "cannot be replaced" in msg, msg
         # The holder's half: their own card after clear-pin keeps its PUK.
         assert "clear-pin" in msg, "must name clear-pin as the legitimate producer: " + msg
@@ -489,6 +495,21 @@ def test_cmd_set_puk_names_a_foreign_puk_on_a_card_with_no_pin():
         assert "no second PUK" in msg, msg
         assert "already set" not in msg, "must not read as a duplicate run: " + msg
         assert [a[1] for a in card.connection.sent] == [cardctl.INS_GET_INFO], "nothing was sent"
+    # "Fresh" is the personaliser's assumption, not the card's state. A bearer
+    # card (never PIN'd) that the holder loaded, then a stranger's SET_PUK,
+    # reports this same state with GET_INFO byte 3 > 0. "Sweep nothing" there
+    # sends the operator to a reinstall that regenerates the key and strands
+    # the proofs (SECURITY-MODEL #14), so the refusal must name them instead.
+    card = make_card([(INFO_06_NO_PIN_PUK_LOADED, 0x9000)])
+    msg = _refuses(card, "set-puk", "--puk", "12345678")
+    assert "reports a PUK but has no PIN" in msg, msg
+    assert "sweep nothing" not in msg, "must not call a loaded card empty: " + msg
+    assert "it holds 3 unspent proof(s)" in msg, msg
+    assert "`cardctl dump`" in msg and "spend them first" in msg, msg
+    assert "regenerates the key and strands them" in msg and "SECURITY-MODEL #14" in msg, msg
+    assert "reinstall the CAP" in msg and "cannot be replaced" in msg, msg
+    assert "the PUK is yours" in msg and "run set-pin" in msg, msg
+    assert [a[1] for a in card.connection.sent] == [cardctl.INS_GET_INFO], "nothing was sent"
     # A PUK on a card that has a PIN is the ordinary duplicate-run case and
     # keeps its wording: the holder's session was needed to attach it.
     card = make_card([(INFO_06_PIN_PUK, 0x9000)])

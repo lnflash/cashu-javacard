@@ -1183,10 +1183,24 @@ def cmd_set_puk(args) -> int:
         # on a card with a balance regenerates the key and strands it
         # (SECURITY-MODEL #14). Either way the card's 6A89 is correct and
         # this is not a duplicate run.
+        #
+        # "Fresh" is the personaliser's assumption, not the card's state: a
+        # bearer card never PIN'd can carry proofs, and a stranger's SET_PUK
+        # on it lands in exactly this state. GET_INFO byte 3 is already in
+        # hand, so name the proofs before advising the reinstall that would
+        # strand them.
+        if info["unspent"] == 0:
+            balance = "sweep nothing (GET_INFO reports no unspent proofs)"
+        else:
+            balance = (
+                f"it holds {info['unspent']} unspent proof(s): `cardctl dump` / spend "
+                f"them first — a reinstall regenerates the key and strands them "
+                f"(SECURITY-MODEL #14)"
+            )
         raise SystemExit(
             "this card reports a PUK but has no PIN. If you are personalising a fresh "
-            "card, someone else armed it: do not issue it, sweep nothing (it is empty) "
-            "and reinstall the CAP — the PUK cannot be replaced (spec/APDU.md, "
+            f"card, someone else armed it: do not issue it, {balance}, then "
+            "reinstall the CAP — the PUK cannot be replaced (spec/APDU.md, "
             "Personalisation; SECURITY-MODEL #16). If this is your own card after "
             "clear-pin, the PUK is yours and still works: run set-pin, no second PUK "
             "is needed"
