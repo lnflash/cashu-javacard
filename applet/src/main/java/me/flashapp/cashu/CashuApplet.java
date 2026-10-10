@@ -634,17 +634,27 @@ public class CashuApplet extends Applet {
      * Data: [len][pin] — CHANGE_PIN's old-PIN framing with no new PIN after
      * it. Lc must be exactly 1 + len, so a stray byte is 6700, never a PIN.
      *
-     * The write: pinState to 0 first, then the OwnerPIN's counter reset,
-     * inside one transaction. The order is the guarantee, as D14's is. A
-     * card pulled between the two leaves state 0 with a stale counter, which
-     * nothing reads: VERIFY_PIN answers 6984 in state 0, and the next
-     * SET_PIN's OwnerPIN.update resets the counter with the new PIN. The
-     * other order could leave state 1 with three fresh tries — a reset the
-     * holder never finished asking for, on a PIN they still have. The
-     * transaction covers the pinState byte; the JavaCard API lets an
-     * OwnerPIN's internal state stay outside a transaction, so the order
-     * cannot be dropped in the transaction's favour. ClearPinTest scans for
-     * both.
+     * The write is the one byte pinState, after the check — the byte SET_PIN
+     * writes last, the other way. The JCRE writes a byte atomically, so there is no half-done CLEAR_PIN
+     * for a pulled card to leave: the card is PIN-set or it is not. The try
+     * counter needs no write of its own, because the successful pin.check
+     * just above already reset it to its limit (OwnerPIN.check's contract:
+     * a match sets the validated flag and resets the tries remaining), so
+     * the card leaves here as SET_PIN found it, counter full, with pinState
+     * the only persistent byte this command touches. A pin.resetAndUnblock()
+     * after the check would reset a counter that is already full, and a
+     * JCSystem transaction would wrap a single atomic write; neither would
+     * add a guarantee, and an earlier draft that had both described a write
+     * order as load-bearing when it was not. ClearPinTest scans for the
+     * check preceding the write and for this being the only persistent
+     * write.
+     *
+     * pinState 0 is a gate the counter never sits behind: VERIFY_PIN,
+     * CHANGE_PIN and CLEAR_PIN all answer 6984 or 6982 before any check
+     * runs, and the next SET_PIN's OwnerPIN.update starts its PIN at the
+     * full count. ClearPinTest sets a no-PIN card over a partly spent
+     * counter directly and shows nothing reads it — a defensive property,
+     * not a state this command can leave.
      *
      * The old PIN value stays in the OwnerPIN until SET_PIN overwrites it.
      * Nothing can check against it: VERIFY_PIN, CHANGE_PIN and CLEAR_PIN all
@@ -666,12 +676,9 @@ public class CashuApplet extends Applet {
         boolean ok = pin.check(buf, off, pinLen);
         if (!ok) failPinCheck();
 
-        JCSystem.beginTransaction();
         pinState[0] = (byte) 0;
-        pin.resetAndUnblock();
-        JCSystem.commitTransaction();
         // The session verified a PIN that no longer exists. Transient, so it
-        // sits outside the transaction and touches no EEPROM (D10).
+        // touches no EEPROM (D10).
         pinVerifiedFlag[0] = (byte) 0;
     }
 

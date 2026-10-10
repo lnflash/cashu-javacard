@@ -398,17 +398,29 @@ holding a card with a feature they cannot turn off.
   [SECURITY-MODEL #14](SECURITY-MODEL.md)) is still `UNBLOCK_PIN` + PUK's
   (ENG-617) to solve, not this command's.
 
-The two writes — `pinState` to 0, then `OwnerPIN.resetAndUnblock()` — go in
-that order inside one `JCSystem` transaction. The order is the guarantee, as
-[D14](#d14)'s is: a card pulled between them leaves a no-PIN card with a
-stale counter, which nothing reads (`VERIFY_PIN` stops at `6984`, and the
-next `SET_PIN`'s `OwnerPIN.update` starts the new PIN at the full count). The
-other order could leave a PIN-set card with three fresh tries, a reset no
-command grants. The transaction is the belt, not the braces: the JavaCard API
-lets an `OwnerPIN` keep its internal state outside a transaction, so the
-order cannot be dropped in the transaction's favour. jCardSim cannot tear a
-write or roll one back, so `ClearPinTest` scans the source for the order and
-sets the torn state directly, as `SlotWriteOrderTest` does.
+The write is one byte: `pinState` to 0, after the check — the byte `SET_PIN`
+writes last, the other way. The JCRE writes a byte atomically, so a card pulled
+mid-command is PIN-set or it is not; there is no state between. The try
+counter needs no write of its own: `OwnerPIN.check`'s contract is that a
+match sets the validated flag and resets the tries remaining, so the
+successful check `CLEAR_PIN` runs just before the write has already left
+the counter at its limit, and the card leaves as `SET_PIN` found it with
+`pinState` the only persistent byte the command touches.
+
+*Corrected before merge:* the first draft followed the byte with
+`OwnerPIN.resetAndUnblock()` inside a `JCSystem` transaction and described
+the order of the two as load-bearing, as [D14](#d14)'s is. It was not. The
+reset re-filled a counter the check had already filled, so neither tear it
+guarded against — state 0 over a stale counter, state 1 over a fresh one —
+could happen; the "fresh counter" is one the holder had already earned by
+verifying. A write order documented as a guarantee when it is not is worse
+than none, since the next change protects the wrong thing, so both calls
+went and `ClearPinTest` now scans for the opposite: the check precedes the
+write, and the state byte is the only persistent write. The test still sets
+`pinState` 0 over a partly spent counter and shows nothing reads it
+(`VERIFY_PIN` stops at `6984`; the next `SET_PIN`'s `OwnerPIN.update`
+starts its PIN at the full count), as a property of state 0 the applet must
+keep, not a state `CLEAR_PIN` can leave.
 
 Readers: `pinState` 1 is no longer a one-way state, so a terminal reads
 `GET_INFO` byte 7 on every tap rather than remembering a card as PIN-set.

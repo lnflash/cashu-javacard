@@ -1090,6 +1090,16 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
     assert floor <= (major, minor), (
         f"selftest's floor {floor} is above the tracked applet {major}.{minor}"
     )
+    # The guide-mentions-every-passed-version loop below walks minors under
+    # one major. With the floor at 0.4 and the applet at 1.0, range(4, 0) is
+    # empty and the ratchet checks nothing while still passing, so the loop
+    # must be rewritten over (major, minor) pairs when the major bumps, and
+    # this assertion is what says so.
+    assert floor[0] == major, (
+        f"selftest's floor {floor} and the tracked applet {major}.{minor} differ in "
+        f"major version: the versions-between loop in this test walks minors under one "
+        f"major and would silently check nothing; rewrite it over (major, minor) pairs"
+    )
     assert cardctl._select_verdict(bytes(floor))[0], f"selftest fails its own floor {floor}"
     if floor[1]:
         ok, detail = cardctl._select_verdict(bytes([floor[0], floor[1] - 1]))

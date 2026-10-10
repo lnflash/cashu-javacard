@@ -81,7 +81,7 @@ gp --list
 ## Install
 
 The CAP tracked in this repo is **applet version 0.5**, sha256
-`fdee73dc8422b14d326cbe679c4478ec24ba2614c905b4d0f47f97548aec18a4`. A CAP you
+`7b02ad469fe521926c9009819bc6a45aa35a7cf33feb9004479d5b2aa1edcad2`. A CAP you
 build yourself hashes differently even from identical source, because the
 converter writes a creation timestamp into `META-INF/MANIFEST.MF`. Every other
 entry is byte-identical when built with JDK 17 and the kit CI pins
@@ -101,7 +101,7 @@ diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the 
 Any output from `diff` means the two CAPs differ; do not install. After
 installing, `SELECT` must answer `00 05` (below).
 
-**Install only a CAP that matches the tracked one** (sha256 `fdee73dc…`, or the
+**Install only a CAP that matches the tracked one** (sha256 `7b02ad46…`, or the
 entry comparison above). The file name and the CAP's package version read 0.1
 on every build (`applet/build.xml` pins the package version), so neither can
 tell a fixed build from a vulnerable one; only the applet version `SELECT`

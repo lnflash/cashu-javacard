@@ -441,11 +441,14 @@ whose GET_INFO byte 7 is `2` answers `6982` here, with the right PIN, in
 every session. Anything else would be an unblock path open to whoever holds
 the card, since `VERIFY_PIN` is unauthenticated (ENG-615; D13).
 
-**Write order.** The card sets the PIN state to `0`, then resets the try
-counter, in one transaction. A card that leaves the field between the two
-leaves a no-PIN card with a stale counter, which nothing reads: `VERIFY_PIN`
-stops at `6984`, and the next `SET_PIN` starts its PIN with the full try
-count. The other order could leave a PIN-set card with a fresh counter.
+**Write order.** There is one persistent write: the PIN state byte, set to
+`0` after the PIN check, which the card writes atomically. A card that
+leaves the field mid-command is PIN-set or it is not. The try counter is not
+written by this command; the successful check that precedes the write has
+already reset it to its limit (that is `OwnerPIN.check`'s contract), which
+is what "the try counter is back at its limit" above rests on. Nothing reads
+the counter behind state `0` in any case: `VERIFY_PIN` stops at `6984`, and
+the next `SET_PIN` starts its PIN with the full try count.
 
 | Field | Value |
 |-------|-------|
