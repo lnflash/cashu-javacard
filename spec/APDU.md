@@ -44,7 +44,7 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | P2 | 00 |
 | Le | 00 |
 
-**Response (8 bytes):**
+**Response (9 bytes):**
 
 | Offset | Length | Description |
 |--------|--------|-------------|
@@ -55,7 +55,12 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 4 | 1 | Spent proof count |
 | 5 | 1 | Empty slot count |
 | 6 | 1 | Capabilities flags (see below) |
-| 7 | 1 | PIN state (0=unset, 1=set, 2=locked — the PIN is blocked, tries exhausted; 1 returns to 0 only through `CLEAR_PIN`) |
+| 7 | 1 | PIN state (0=unset, 1=set, 2=locked — the PIN is blocked, tries exhausted; 1 returns to 0 only through `CLEAR_PIN`, and 2 returns to 1 only through `UNBLOCK_PIN`) |
+| 8 | 1 | PUK state (0=unset, 1=set, 2=exhausted — ten wrong PUKs; terminal). Applet 0.6 and later; a 0.5 card answers 8 bytes |
+
+Byte 8 was appended by applet 0.6 (D16), so a reader built for the 8-byte
+answer parses a 0.6 card unchanged. A reader that needs the PUK state reads
+capability bit 4 (or the response length) before it reads byte 8.
 
 **Capabilities flags (byte 6):**
 
@@ -65,13 +70,23 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 1 | Schnorr signing supported |
 | 2 | PIN protection available |
 | 3 | `CLEAR_PIN` (0x43) supported — applet 0.5 and later; a build without it answers 0x43 with `6D00` |
-| 4–7 | Reserved (0) |
+| 4 | PUK: `SET_PUK` (0x44) and `UNBLOCK_PIN` (0x45) supported, and byte 8 present — applet 0.6 and later; a build without it answers both with `6D00` |
+| 5–7 | Reserved (0) |
 
 **PIN state 2 is not "no PIN".** A blocked card still has a PIN; it can never
 be verified again (`VERIFY_PIN` answers `6983`), so every PIN-gated command
-answers `6982` permanently. There is no unblock path in this profile, and
-`CLEAR_PIN` is not one: it needs a verified session, which a blocked card can
-never grant. A reader must treat 2 as "a PIN exists", never as 0.
+answers `6982` until the PIN is unblocked. `UNBLOCK_PIN` (0x45) with the
+card's PUK is the one path out (D16); `CLEAR_PIN` is not one: it needs a
+verified session, which a blocked card can never grant. A card with no PUK
+(byte 8 = 0, or an applet before 0.6) or an exhausted one (byte 8 = 2) has no
+path out, and its balance is stranded. A reader must treat 2 as "a PIN
+exists", never as 0.
+
+**PUK state is the card's, not the PIN's.** The PUK is set once, at
+personalisation, and survives `CLEAR_PIN` and the `SET_PIN` after it: one
+PUK per card, for every PIN the holder sets. The card never reveals it, so
+the personaliser records it off the card (see
+[Personalisation](#personalisation)).
 
 **PIN state 1 is not for keeps.** The holder can remove the PIN with
 `CLEAR_PIN` (D15), after which the card answers 0 again and spends with no
@@ -186,7 +201,7 @@ Lightweight bulk status read. Returns a 1-byte status for every slot (0=empty, 1
 
 ## Category 0x2x — Spend (PIN required if PIN is set — Profile B+)
 
-If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). "A PIN is set" includes the blocked state (GET_INFO byte 7 = 2): `VERIFY_PIN` can never succeed there, so every spend and sign command answers `6982` permanently. Cards provisioned without a PIN keep tap-and-go behaviour, and so does a card whose holder has removed the PIN with `CLEAR_PIN (0x43)` (D15). The PIN session flag is transient: cleared on card deselect / tap end, by any failed PIN check, and by a successful `CLEAR_PIN` (see [Session State](#session-state-transient)).
+If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). "A PIN is set" includes the blocked state (GET_INFO byte 7 = 2): `VERIFY_PIN` can never succeed there, so every spend and sign command answers `6982` until `UNBLOCK_PIN (0x45)` replaces the PIN with the card's PUK (D16) — permanently, on a card with no PUK. Cards provisioned without a PIN keep tap-and-go behaviour, and so does a card whose holder has removed the PIN with `CLEAR_PIN (0x43)` (D15). The PIN session flag is transient: cleared on card deselect / tap end, by any failed PIN or PUK check, and by a successful `CLEAR_PIN` or `UNBLOCK_PIN` (see [Session State](#session-state-transient)).
 
 ### SPEND_PROOF (0x20)
 
@@ -195,9 +210,9 @@ Atomically marks a proof as spent (irreversible) and returns a NUT-11 P2PK Schno
 This is the **core payment operation**.
 
 **PIN:** if a PIN is set, `VERIFY_PIN` must precede this command in the same
-session (D13). A blocked PIN counts as set, and refuses for good. The gate runs
-*before* the slot burn, so a wrong, missing or blocked PIN never consumes a
-proof.
+session (D13). A blocked PIN counts as set, and refuses until `UNBLOCK_PIN`
+(for good, on a card with no PUK). The gate runs *before* the slot burn, so a
+wrong, missing or blocked PIN never consumes a proof.
 
 | Field | Value |
 |-------|-------|
@@ -217,7 +232,7 @@ proof.
 | 6985 | Proof already spent — double-spend blocked |
 | 6A88 | Slot is empty |
 | 6A83 | Slot index out of range |
-| 6982 | PIN set (or blocked) and not verified in this session; permanent once the PIN is blocked |
+| 6982 | PIN set (or blocked) and not verified in this session; once the PIN is blocked, until `UNBLOCK_PIN` |
 | 6F00 | Signing failed (hardware error) |
 
 **Note on message construction:** The reader computes
@@ -261,14 +276,14 @@ session.
 
 | SW | Meaning |
 |----|---------|
-| 6982 | PIN set (or blocked) and not verified in this session; permanent once the PIN is blocked |
+| 6982 | PIN set (or blocked) and not verified in this session; once the PIN is blocked, until `UNBLOCK_PIN` |
 | 6F00 | Signing failed |
 
 ---
 
 ## Category 0x3x — Write (PIN required if PIN is set)
 
-If PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before calling write commands. "PIN is set" includes the blocked state (GET_INFO byte 7 = 2), in which every write command answers `6982` permanently. A card with no PIN — never personalised, or cleared with `CLEAR_PIN (0x43)` — writes without one. The PIN session flag is transient: cleared on card deselect / tap end, by any failed PIN check, and by a successful `CLEAR_PIN` (see [Session State](#session-state-transient)).
+If PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before calling write commands. "PIN is set" includes the blocked state (GET_INFO byte 7 = 2), in which every write command answers `6982` until `UNBLOCK_PIN (0x45)` (D16). A card with no PIN — never personalised, or cleared with `CLEAR_PIN (0x43)` — writes without one. The PIN session flag is transient: cleared on card deselect / tap end, by any failed PIN or PUK check, and by a successful `CLEAR_PIN` or `UNBLOCK_PIN` (see [Session State](#session-state-transient)).
 
 ### LOAD_PROOF (0x30)
 
@@ -357,7 +372,7 @@ Verifies the provisioning PIN. On success, sets a transient session flag that pe
 | SW | Meaning |
 |----|---------|
 | 63 CX | Wrong PIN — X retries remaining (e.g. `63 C2` = 2 retries left); the session's verification ends |
-| 6983 | PIN blocked — max retries exhausted, GET_INFO byte 7 now 2. Answered by the try that exhausts the counter (not `63 C0`) and by every `VERIFY_PIN` after it; there is no unblock path |
+| 6983 | PIN blocked — max retries exhausted, GET_INFO byte 7 now 2. Answered by the try that exhausts the counter (not `63 C0`) and by every `VERIFY_PIN` after it, until `UNBLOCK_PIN` (0x45) replaces the PIN with the PUK (D16) |
 | 6984 | PIN not set (use SET_PIN first) |
 
 ---
@@ -439,7 +454,12 @@ is listed below because the failure handling is shared.
 is one a blocked card never grants (`VERIFY_PIN` answers `6983`), so a card
 whose GET_INFO byte 7 is `2` answers `6982` here, with the right PIN, in
 every session. Anything else would be an unblock path open to whoever holds
-the card, since `VERIFY_PIN` is unauthenticated (ENG-615; D13).
+the card, since `VERIFY_PIN` is unauthenticated (ENG-615; D13). The unblock
+path is [`UNBLOCK_PIN`](#unblock_pin-0x45), gated by the PUK (D16).
+
+**The PUK is not cleared.** `CLEAR_PIN` removes the PIN and nothing else:
+GET_INFO byte 8 is unchanged, `SET_PUK` still answers `6A89`, and after the
+next `SET_PIN` the same PUK drives `UNBLOCK_PIN`.
 
 **Write order.** There is one persistent write: the PIN state byte, set to
 `0` after the PIN check, which the card writes atomically. A card that
@@ -471,11 +491,123 @@ the next `SET_PIN` starts its PIN with the full try count.
 
 ---
 
+### SET_PUK (0x44)
+
+Sets the provisioning PUK (D16, applet 0.6), once per card. The PUK is the
+one credential that can replace a PIN the holder has lost or blocked (see
+[`UNBLOCK_PIN`](#unblock_pin-0x45)), so who may set it is the whole of this
+command's design:
+
+- **GET_INFO byte 7 = 0 (no PIN):** anyone, with no session. This is the
+  personalisation order: `SET_PUK`, then `SET_PIN`.
+- **Byte 7 = 1 (PIN set):** only a session that has verified the PIN
+  (`6982` otherwise). Without that gate a reader in range could attach a PUK
+  of its own to a personalised card, block the PIN with three guesses, and
+  unblock it with the PUK it chose. The other personalisation order is
+  therefore `SET_PIN`, `VERIFY_PIN`, `SET_PUK`.
+- **Byte 7 = 2 (PIN blocked):** never. The gate is the verified session,
+  which a blocked card never grants, so the reader that blocked a card cannot
+  arm its own recovery. A blocked card with no PUK is stranded, as every card
+  before 0.6 is.
+- **Byte 8 ≠ 0:** never (`6A89`). A PUK is not changed, not replaced, and an
+  exhausted one (byte 8 = 2) is not re-armed, by anyone.
+
+The card never reveals the PUK. The personaliser records it off the card at
+the moment it is set; where (the backend card registry, ENG-618) is not the
+card's concern. `SET_PUK` does not open or end a session, and does not touch
+the PIN or its try counter.
+
+**Write order.** The PUK value is written first, then GET_INFO byte 8 is set
+to `1`, as a single byte the card writes atomically (D14). A card that leaves
+the field between the two holds a PUK that nothing reads — `UNBLOCK_PIN`
+stops at byte 8 = 0 with `6A82` — and the next `SET_PUK` overwrites it.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 44 |
+| P1 | 00 |
+| P2 | 00 |
+| Lc | Variable |
+| Data | 1-byte PUK length + PUK (8–12 bytes, digits as bytes like the PIN); Lc must be exactly one more than the PUK length |
+
+**Errors:**
+
+| SW | Meaning |
+|----|---------|
+| 6A89 | PUK already set, or exhausted — a PUK is set once |
+| 6982 | PIN set (or blocked) and not verified in this session |
+| 6986 | Card locked (`LOCK_CARD`) |
+| 6700 | Wrong data length (no length byte, PUK length outside 8–12, or Lc ≠ 1 + PUK length) |
+
+---
+
+### UNBLOCK_PIN (0x45)
+
+Replaces the PIN, authorised by the PUK (D16, applet 0.6). The only path out
+of GET_INFO byte 7 = 2: a blocked PIN gates every command until this
+succeeds (ENG-615), and nothing else — not `CLEAR_PIN`, not `SET_PIN`, not
+a reinstall with the balance intact — takes a card out of that state. It
+also serves a PIN the holder has forgotten on a card that is not blocked:
+byte 7 = 1 goes to 1 with the new PIN, byte 7 = 2 goes to 1, and the holder
+cannot tell the two cases apart, so the card does not either.
+
+No `VERIFY_PIN` precedes it: the PUK is the authority, and the card this
+command rescues cannot open a session. On success GET_INFO byte 7 is `1`,
+the new PIN's try counter is at its limit (3), the old PIN is gone, byte 8
+is unchanged (a successful unblock does not consume the PUK; the same PUK
+unblocks the card again), and **no session is open**: the command proved the
+PUK, not the new PIN, so the session's verification — if there was one — ends,
+and the holder sends `VERIFY_PIN` with the new PIN as usual.
+
+**A wrong PUK** ends the session's PIN verification (as every failed check
+does), costs one of the PUK's ten tries, and answers `63 CX` with the PUK
+tries left: `63 C9` after the first wrong PUK. Unlike `VERIFY_PIN`, the try
+that exhausts the counter answers `63 C0`, so a reader counting down sees the
+count reach zero; it also sets byte 8 to `2`, after which every `UNBLOCK_PIN`
+answers `6983` before any check runs, with the right PUK, in every session.
+Exhaustion is terminal: `SET_PUK` refuses an exhausted card (`6A89`), so a
+card that has lost its PUK to guessing has lost its recovery path, and a PIN
+blocked on it is stranded. The PIN and its counter are never touched by a
+failed `UNBLOCK_PIN`.
+
+**Write order.** The PUK is checked first; nothing is written on a wrong PUK
+but the PUK's own try counter (and byte 8, after the exhausting try). On a
+right PUK the new PIN is written with its counter at the limit, then GET_INFO
+byte 7 is set to `1`, last, as a single byte the card writes atomically (D14).
+A card that leaves the field before that byte is `2` over the new PIN: the
+card refuses `VERIFY_PIN` with `6983` on byte 7 alone (not only on an empty
+counter), every gate holds, and the next `UNBLOCK_PIN` with the same PUK
+finishes it. Nothing a reader can do with the torn card differs from what it
+could do with the blocked one.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 45 |
+| P1 | 00 |
+| P2 | 00 |
+| Lc | Variable |
+| Data | 1-byte PUK length + PUK (8–12 bytes) + 1-byte new PIN length + new PIN (4–8 bytes); Lc must be exactly 2 + PUK length + new PIN length |
+
+**Errors:**
+
+| SW | Meaning |
+|----|---------|
+| 6A82 | PUK not set (GET_INFO byte 8 = 0) — nothing can unblock this card |
+| 6983 | PUK exhausted (byte 8 = 2) — ten wrong PUKs; terminal. In this command the blocked authentication method is always the PUK, never the PIN |
+| 6984 | PIN not set — nothing to unblock or replace; use `SET_PIN` |
+| 63 CX | Wrong PUK — X PUK tries remaining (`63 C0` on the try that exhausts it, which also sets byte 8 to 2); the session's PIN verification ends |
+| 6986 | Card locked (`LOCK_CARD`) — refused before the PUK gate, so no try is spent; a blocked PIN on a locked card stays blocked |
+| 6700 | Wrong data length (a length byte missing, PUK length outside 8–12, new PIN length outside 4–8, or Lc ≠ 2 + PUK length + new PIN length) |
+
+---
+
 ## Category 0x5x — Admin
 
 ### LOCK_CARD (0x50)
 
-Permanently disables all write operations. Useful for lost/stolen card mitigation if the card is recovered. **Irreversible.** Requires PIN when one is set; a blocked PIN counts as set, so a blocked card cannot be locked. A locked card keeps the PIN it has: `SET_PIN`, `CHANGE_PIN` and `CLEAR_PIN` all answer `6986`.
+Permanently disables all write operations. Useful for lost/stolen card mitigation if the card is recovered. **Irreversible.** Requires PIN when one is set; a blocked PIN counts as set, so a blocked card cannot be locked. A locked card keeps the PIN and the PUK it has: `SET_PIN`, `CHANGE_PIN`, `CLEAR_PIN`, `SET_PUK` and `UNBLOCK_PIN` all answer `6986` — so a PIN that is blocked *after* the lock stays blocked, PUK or no PUK; the lock is the holder's irreversible choice and the PUK does not override it.
 
 | Field | Value |
 |-------|-------|
@@ -498,16 +630,18 @@ Permanently disables all write operations. Useful for lost/stolen card mitigatio
 | SW | Meaning |
 |----|---------|
 | 90 00 | Success |
-| 63 CX | Wrong PIN, X retries remaining (the session's verification ends) |
+| 63 CX | Wrong PIN, X retries remaining (the session's verification ends); from `UNBLOCK_PIN`, wrong PUK, X PUK tries remaining |
 | 67 00 | Wrong length (Lc/Le) |
 | 69 82 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
-| 69 83 | Authentication method blocked (PIN blocked, GET_INFO byte 7 = 2) |
+| 69 83 | Authentication method blocked (PIN blocked, GET_INFO byte 7 = 2; from `UNBLOCK_PIN`, PUK exhausted, byte 8 = 2) |
 | 69 84 | Referenced data not usable (PIN not set) |
 | 69 85 | Conditions not satisfied (already spent / already set / card already locked) |
 | 69 86 | Command not allowed (card locked by `LOCK_CARD` — writes disabled) |
+| 6A 82 | File not found (PUK not set — `UNBLOCK_PIN` has nothing to check against) |
 | 6A 83 | Record not found (slot out of range) |
 | 6A 84 | Not enough memory (no empty slots) |
 | 6A 88 | Referenced data not found (slot empty) |
+| 6A 89 | File already exists (PUK already set or exhausted — `SET_PUK` is once per card) |
 | 6D 00 | Instruction not supported |
 | 6E 00 | Class not supported |
 | 6F 00 | No precise diagnosis (hardware / crypto error) |
@@ -546,7 +680,39 @@ The following flags are held in transient RAM and cleared on card deselect:
 
 | Flag | Set by | Cleared by |
 |------|--------|-----------|
-| `pin_verified` | VERIFY_PIN (success) | Deselect / tap end / any failed PIN check (VERIFY_PIN, CHANGE_PIN or CLEAR_PIN) / CLEAR_PIN (success — the verified PIN no longer exists) |
+| `pin_verified` | VERIFY_PIN (success) | Deselect / tap end / any failed PIN check (VERIFY_PIN, CHANGE_PIN or CLEAR_PIN) / any failed PUK check (UNBLOCK_PIN) / CLEAR_PIN or UNBLOCK_PIN (success — the verified PIN no longer exists) |
+
+---
+
+## Personalisation
+
+A card leaves the factory with no PIN and no PUK (GET_INFO bytes 7 and 8
+both `0`). The recommended order is `SET_PUK`, then `SET_PIN`: with no PIN on
+the card `SET_PUK` needs no session, and the card is never in the field with
+a PIN it cannot recover. The other order works too — `SET_PIN`, `VERIFY_PIN`,
+`SET_PUK` — and is the one for a card personalised before 0.6 existed, whose
+holder adds a PUK in their own session.
+
+```
+Personaliser                    Card
+  |                              |
+  |--- SELECT APPLICATION -----> |
+  |<-- 00 06 90 00 -------------|
+  |--- SET_PUK (0x44) ---------> |  (8–12 digits; generated, not chosen)
+  |<-- 90 00 -------------------|
+  |--- SET_PIN (0x41) ---------> |  (the holder's PIN)
+  |<-- 90 00 -------------------|
+  |--- GET_INFO (0x01) --------> |
+  |<-- … 1F 01 01 + 90 00 ------|  (caps, PIN set, PUK set)
+```
+
+The PUK is generated by the personaliser and **recorded off the card** at the
+moment `SET_PUK` succeeds; the card never reveals it, and a PUK that is not
+recorded is a PUK that does not exist. Its custody is the backend card
+registry's (ENG-618), which releases it to the card's owning account after
+authentication; the card does not assume anything about where it lives, only
+that `UNBLOCK_PIN` is answered by whoever presents it. One PUK serves every
+PIN the holder sets afterwards: `CLEAR_PIN` and `SET_PIN` leave it in place.
 
 ---
 

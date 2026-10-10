@@ -383,6 +383,10 @@ Cards running Profile B+ SHOULD set a capability flag in the `GET_INFO` response
 
 A card MAY let its holder return it to Profile B. In this implementation `CLEAR_PIN (0x43)` does so (applet 0.5, [D15](../docs/DECISIONS.md#d15)): it requires the PIN to have been verified in the current session and presented again, and leaves the card with no PIN set, so `SPEND_PROOF` no longer checks `pinVerifiedFlag` and `SET_PIN` may be called again. A blocked PIN cannot be cleared. Because the profile can change between taps, readers MUST read the PIN state from `GET_INFO` on every tap rather than remembering it per card.
 
+**A blocked PIN:**
+
+A card MAY provide a PIN unblocking key. In this implementation `SET_PUK (0x44)` sets one at personalisation, once, and `UNBLOCK_PIN (0x45)` replaces the PIN — blocked or merely forgotten — on presentation of the PUK (applet 0.6, [D16](../docs/DECISIONS.md#d16)). The PUK has ten tries and is exhausted for good after them; the card never reveals it, so the personaliser records it off the card. `UNBLOCK_PIN` opens no session: the holder presents the new PIN with `VERIFY_PIN` as usual. Readers SHOULD read `GET_INFO` byte 8 to tell a blocked card that can be recovered (PUK set) from one that cannot (no PUK, or exhausted).
+
 **NUT scope:** Profile B+ is not formally specified in this NUT. Implementors are encouraged to propose a Profile B+ amendment or separate NUT once the base Profile B implementation is stable.
 
 ---
