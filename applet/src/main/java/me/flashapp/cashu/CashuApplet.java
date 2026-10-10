@@ -29,6 +29,8 @@ import javacardx.crypto.*;
  *   0x41  SET_PIN          — set PIN (first-time, personalization only)
  *   0x42  CHANGE_PIN       — change PIN (current PIN session required)
  *   0x43  CLEAR_PIN        — remove the PIN; bearer card again (current PIN session required, D15)
+ *   0x44  SET_PUK          — set the provisioning PUK, once (personalisation; D16)
+ *   0x45  UNBLOCK_PIN      — PUK-gated: unblock or replace the PIN with a new one (D16)
  *   0x50  LOCK_CARD        — permanently disable write operations
  *
  * @see <a href="https://github.com/lnflash/cashu-javacard">cashu-javacard</a>
@@ -50,10 +52,13 @@ public class CashuApplet extends Applet {
     // but main tracked a 0.3 CAP with the old order, and SELECT's version is
     // all an installed card reports about its build. 0.5 adds CLEAR_PIN (D15):
     // a new instruction and a new capability bit, so a reader can tell from
-    // SELECT or GET_INFO whether 0x43 will answer or 6D00.
+    // SELECT or GET_INFO whether 0x43 will answer or 6D00. 0.6 adds SET_PUK
+    // and UNBLOCK_PIN (D16): two instructions, capability bit 4, and a ninth
+    // GET_INFO byte for the PUK state, so a 0.5 card answers 0x44 and 0x45
+    // with 6D00 and GET_INFO with eight bytes.
     // -------------------------------------------------------------------------
     static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x05;
+    static final byte VERSION_MINOR = (byte) 0x06;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
@@ -72,6 +77,8 @@ public class CashuApplet extends Applet {
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
     static final byte INS_CLEAR_PIN        = (byte) 0x43;
+    static final byte INS_SET_PUK          = (byte) 0x44;
+    static final byte INS_UNBLOCK_PIN      = (byte) 0x45;
     static final byte INS_LOCK_CARD        = (byte) 0x50;
 
     // -------------------------------------------------------------------------
@@ -110,6 +117,18 @@ public class CashuApplet extends Applet {
     static final short SW_SLOT_OUT_OF_RANGE     = (short) 0x6A83;
     static final short SW_CRYPTO_ERROR          = (short) 0x6F00;
     static final short SW_CARD_LOCKED           = (short) 0x6985;
+    // D16. Their own status words, not 0x6985 a third time: UNBLOCK_PIN is the
+    // recovery command, and the tool driving it has to tell "no PUK on this
+    // card" from "already spent" without looking at which command it sent.
+    // ISO 7816-4 meanings, read for the PUK: 6A82 "file not found" is a PUK
+    // the card does not have, 6A89 "file already exists" is one it does.
+    static final short SW_PUK_NOT_SET           = (short) 0x6A82;
+    static final short SW_PUK_ALREADY_SET       = (short) 0x6A89;
+    // 6983 is ISO's "authentication method blocked". For UNBLOCK_PIN that
+    // method is the PUK and nothing else: a blocked PIN is what the command is
+    // for, so the status word is never ambiguous there, and GET_INFO byte 8
+    // says 2 whenever this is the answer.
+    static final short SW_PUK_BLOCKED           = (short) 0x6983;
 
     // LOCK_CARD confirmation byte
     static final byte LOCK_CONFIRM_BYTE = (byte) 0xDE;
@@ -118,6 +137,15 @@ public class CashuApplet extends Applet {
     static final short PIN_MIN_LEN  = (short) 4;
     static final short PIN_MAX_LEN  = (short) 8;
     static final byte  PIN_MAX_TRIES = (byte) 3;
+
+    // PUK constraints (D16). Digits as bytes, the PIN's encoding; longer than
+    // the PIN because it is the one credential that can replace the PIN, and
+    // ten tries because it is presented by a tool from a registry, not typed
+    // on a POS, so a slip costs little and a guess still has at most ten
+    // attempts at 10^8 or more.
+    static final short PUK_MIN_LEN  = (short) 8;
+    static final short PUK_MAX_LEN  = (short) 12;
+    static final byte  PUK_MAX_TRIES = (byte) 10;
 
     // -------------------------------------------------------------------------
     // secp256k1 curve parameters (JavaCard byte arrays)
@@ -179,6 +207,20 @@ public class CashuApplet extends Applet {
     /** The provisioning PIN (up to PIN_MAX_LEN bytes) */
     private OwnerPIN pin;
 
+    /**
+     * PUK state: 0=unset, 1=set, 2=exhausted (D16). Exhausted is terminal:
+     * SET_PUK refuses anything but 0, so a card whose PUK is spent keeps no
+     * recovery path, and UNBLOCK_PIN answers SW_PUK_BLOCKED for good.
+     */
+    private byte[] pukState;     // 1-byte array (persistent)
+
+    /**
+     * The provisioning PUK (up to PUK_MAX_LEN bytes). Set once, by SET_PUK;
+     * never read back, never changed. Where its value lives off the card is
+     * not the applet's business (D16: the personaliser records it, ENG-618).
+     */
+    private OwnerPIN puk;
+
     // -------------------------------------------------------------------------
     // Card keypair (persistent, generated once on install)
     // -------------------------------------------------------------------------
@@ -224,6 +266,8 @@ public class CashuApplet extends Applet {
         cardLocked      = new byte[1];
         pinState        = new byte[1];
         pin             = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
+        pukState        = new byte[1];
+        puk             = new OwnerPIN(PUK_MAX_TRIES, (byte) PUK_MAX_LEN);
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         initCardKeypair();
 
@@ -314,6 +358,8 @@ public class CashuApplet extends Applet {
             case INS_SET_PIN:          processSetPin(apdu);         break;
             case INS_CHANGE_PIN:       processChangePin(apdu);      break;
             case INS_CLEAR_PIN:        processClearPin(apdu);       break;
+            case INS_SET_PUK:          processSetPuk(apdu);         break;
+            case INS_UNBLOCK_PIN:      processUnblockPin(apdu);     break;
             case INS_LOCK_CARD:        processLockCard(apdu);       break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
@@ -345,9 +391,14 @@ public class CashuApplet extends Applet {
         //   bit2 = PIN supported (always set)
         //   bit3 = CLEAR_PIN supported (applet 0.5, D15): the PIN can go away
         //          again, so byte 7 is read every tap, never cached
-        buf[6] = (byte) 0x0F; // secp256k1 + Schnorr + PIN + CLEAR_PIN
+        //   bit4 = SET_PUK / UNBLOCK_PIN supported (applet 0.6, D16): byte 8
+        //          exists, and a blocked PIN is recoverable when it says 1
+        buf[6] = (byte) 0x1F; // secp256k1 + Schnorr + PIN + CLEAR_PIN + PUK
         buf[7] = pinState[0];
-        apdu.setOutgoingAndSend((short) 0, (short) 8);
+        // Appended, never inserted: a reader built for 0.5 reads eight bytes
+        // and parses them as before. 0=no PUK, 1=set, 2=exhausted.
+        buf[8] = pukState[0];
+        apdu.setOutgoingAndSend((short) 0, (short) 9);
     }
 
     private void processGetPubkey(APDU apdu) {
@@ -538,7 +589,16 @@ public class CashuApplet extends Applet {
 
     private void processVerifyPin(APDU apdu) {
         if (pinState[0] == (byte) 0) ISOException.throwIt(SW_PIN_NOT_SET);
-        if (pin.getTriesRemaining() == 0) ISOException.throwIt(SW_PIN_BLOCKED);
+        // Both halves of "blocked", because UNBLOCK_PIN (D16) writes the PIN
+        // and its counter before it writes pinState 1: a card pulled between
+        // the two is state 2 over a fresh PIN with full tries. The state byte
+        // is the commit (D14), so it has to be refused on its own, or that
+        // torn card would verify while GET_INFO still reported it blocked —
+        // the ENG-615 shape again. In every state the applet can reach whole,
+        // the two conditions are the same condition.
+        if (pinState[0] == (byte) 2 || pin.getTriesRemaining() == 0) {
+            ISOException.throwIt(SW_PIN_BLOCKED);
+        }
 
         short pinLen = apdu.setIncomingAndReceive();
         if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) {
@@ -659,6 +719,11 @@ public class CashuApplet extends Applet {
      * The old PIN value stays in the OwnerPIN until SET_PIN overwrites it.
      * Nothing can check against it: VERIFY_PIN, CHANGE_PIN and CLEAR_PIN all
      * stop at pinState 0 before any check runs.
+     *
+     * The PUK (D16) is not touched. It belongs to the card, not to the PIN:
+     * after CLEAR_PIN then SET_PIN the same PUK still drives UNBLOCK_PIN, so
+     * a card personalised once keeps its recovery path through every PIN its
+     * holder sets. The only way out of pukState 1 is to exhaust it.
      */
     private void processClearPin(APDU apdu) {
         requireNotLocked();
@@ -680,6 +745,139 @@ public class CashuApplet extends Applet {
         // The session verified a PIN that no longer exists. Transient, so it
         // touches no EEPROM (D10).
         pinVerifiedFlag[0] = (byte) 0;
+    }
+
+    /**
+     * D16: the personaliser gives the card a PUK, once. The PUK is the one
+     * credential that can take a PIN off a blocked card (UNBLOCK_PIN), so who
+     * may set it matters as much as what it is:
+     *
+     * - pinState 0: anyone, freely. The card has no PIN to protect, and this
+     *   is the personalisation order (SET_PUK, then SET_PIN).
+     * - pinState 1: only a session that verified the PIN (6982 otherwise).
+     *   Without that, a reader in range could attach a PUK of its own to a
+     *   personalised card, block the PIN with three guesses, and unblock it
+     *   with the PUK it chose — the PIN bypass D13 says must not exist.
+     * - pinState 2: never. requirePinVerified is the gate, and a blocked card
+     *   never grants the session, so the same reader cannot block first and
+     *   attach a PUK second.
+     * - pukState 1 or 2: never (SW_PUK_ALREADY_SET). A PUK is not changed or
+     *   replaced, and an exhausted one is not re-armed: ten wrong PUKs ends
+     *   the card's recovery path for good.
+     *
+     * Data: [len][puk], CLEAR_PIN's framing. Lc must be exactly 1 + len and
+     * len within PUK_MIN_LEN..PUK_MAX_LEN, else 6700 before anything is read.
+     *
+     * Write order (D14): the PUK value first, the state byte last. A card
+     * pulled between the two holds a PUK that nothing reads — UNBLOCK_PIN
+     * stops at pukState 0 — and the next SET_PUK overwrites it. PukTest scans
+     * for this order.
+     */
+    private void processSetPuk(APDU apdu) {
+        requireNotLocked();
+        if (pukState[0] != (byte) 0) ISOException.throwIt(SW_PUK_ALREADY_SET);
+        if (pinState[0] != (byte) 0) requirePinVerified();
+
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen < (short) 1) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte[] buf = apdu.getBuffer();
+        short off = ISO7816.OFFSET_CDATA;
+
+        byte pukLen = buf[off++];
+        if (pukLen < PUK_MIN_LEN || pukLen > PUK_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (dataLen != (short)(1 + pukLen)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+        puk.update(buf, off, pukLen);
+        pukState[0] = (byte) 1;
+    }
+
+    /**
+     * D16: the PUK replaces the PIN. The only path out of pinState 2 (the
+     * ENG-615 invariant: a blocked PIN gates until this succeeds), and also
+     * the path for a forgotten PIN on a card that is not blocked — state 1
+     * and state 2 both go to state 1 with the new PIN, because to the holder
+     * they are the same problem.
+     *
+     * Gates, in order: the card is not locked (6986); a PUK exists
+     * (SW_PUK_NOT_SET) and is not exhausted (SW_PUK_BLOCKED); a PIN exists
+     * (SW_PIN_NOT_SET — a card with no PIN has nothing to unblock, and
+     * SET_PIN is the way to a new one there). No verified session is needed:
+     * the PUK is the authority, and the card it rescues cannot grant one.
+     *
+     * Data: [pukLen][puk][newPinLen][newPin], each length within its range
+     * and Lc exactly 2 + pukLen + newPinLen, else 6700 before any check.
+     *
+     * A wrong PUK ends this session's PIN verification (there is seldom one
+     * to end; the rule is failPinCheck's), costs a PUK try, and answers 63CX
+     * with the PUK tries left — the exhausting try answers 63C0 and sets
+     * pukState 2, after which every UNBLOCK_PIN answers SW_PUK_BLOCKED. The
+     * PIN and its counter are not touched by a failure.
+     *
+     * On success pin.update writes the new PIN and, by OwnerPIN.update's
+     * contract, refills the try counter to its limit — the same contract
+     * SET_PIN after CLEAR_PIN rests on (D15), so no resetAndUnblock here: it
+     * would reset a counter update has just reset, and D15 records why a
+     * redundant counter write is worse than none. Then pinState 1, last, the
+     * commit (D14). A card pulled before it is state 2 over a fresh PIN, and
+     * state 2 refuses VERIFY_PIN on its own (see processVerifyPin), so the
+     * torn card is as blocked as it was; the next UNBLOCK_PIN with the same
+     * PUK finishes the job. PukTest scans for the order and sets the torn
+     * state directly.
+     *
+     * The session is not opened: unblocking proves the PUK, not the new PIN,
+     * and the holder verifies with the new PIN in the ordinary way.
+     */
+    private void processUnblockPin(APDU apdu) {
+        requireNotLocked();
+        if (pukState[0] == (byte) 0) ISOException.throwIt(SW_PUK_NOT_SET);
+        if (pukState[0] == (byte) 2) ISOException.throwIt(SW_PUK_BLOCKED);
+        if (pinState[0] == (byte) 0) ISOException.throwIt(SW_PIN_NOT_SET);
+
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen < (short) 2) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte[] buf = apdu.getBuffer();
+        short off = ISO7816.OFFSET_CDATA;
+
+        byte pukLen = buf[off++];
+        if (pukLen < PUK_MIN_LEN || pukLen > PUK_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (dataLen < (short)(2 + pukLen)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        short pukOff = off;
+        off += pukLen;
+
+        byte newLen = buf[off++];
+        if (newLen < PIN_MIN_LEN || newLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (dataLen != (short)(2 + pukLen + newLen)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+        boolean ok = puk.check(buf, pukOff, pukLen);
+        if (!ok) failPukCheck();
+
+        pin.update(buf, off, newLen);
+        pinState[0] = (byte) 1;
+        // Transient (D10): the holder verifies the new PIN themselves.
+        pinVerifiedFlag[0] = (byte) 0;
+    }
+
+    /**
+     * A PUK check failed. failPinCheck's shape for the PUK: end the session's
+     * PIN verification first, move the PUK to exhausted when the last try
+     * just went, and report the tries left as 63CX. Unlike the PIN's helper
+     * the exhausting try answers 63C0 rather than 6983, so a reader counting
+     * down sees the count reach zero; from the next command on it is
+     * SW_PUK_BLOCKED, gated by pukState before any check runs.
+     *
+     * The OwnerPIN decremented its counter inside check; pukState 2 is
+     * written after. A card pulled between the two is pukState 1 over a
+     * counter at zero: the next UNBLOCK_PIN's check fails without a decrement,
+     * lands here again, and writes the 2 — never a card that recovered a try.
+     */
+    private void failPukCheck() {
+        pinVerifiedFlag[0] = (byte) 0;
+        byte remaining = puk.getTriesRemaining();
+        if (remaining == 0) {
+            pukState[0] = (byte) 2;
+        }
+        short sw = (short)(0x63C0 | (remaining & 0x0F));
+        ISOException.throwIt(sw);
     }
 
     // -------------------------------------------------------------------------

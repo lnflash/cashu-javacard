@@ -13,11 +13,11 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * jCardSim test suite for CashuApplet.
  *
- * Tests cover all 15 APDU commands across 5 categories:
+ * Tests cover all 17 APDU commands across 5 categories:
  *   - Read:     GET_INFO, GET_PUBKEY, GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS
  *   - Spend:    SPEND_PROOF, SIGN_ARBITRARY
  *   - Write:    LOAD_PROOF, CLEAR_SPENT
- *   - Auth:     VERIFY_PIN, SET_PIN, CHANGE_PIN, CLEAR_PIN
+ *   - Auth:     VERIFY_PIN, SET_PIN, CHANGE_PIN, CLEAR_PIN (SET_PUK and UNBLOCK_PIN live in PukTest)
  *   - Admin:    LOCK_CARD
  *
  * ENG-181 complete: secp256k1 curve params set + BIP-340 Schnorr implemented.
@@ -45,6 +45,8 @@ class CashuAppletTest {
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
     static final byte INS_CLEAR_PIN        = (byte) 0x43;
+    static final byte INS_SET_PUK          = (byte) 0x44;
+    static final byte INS_UNBLOCK_PIN      = (byte) 0x45;
     static final byte INS_LOCK_CARD        = (byte) 0x50;
 
     // Status words
@@ -101,10 +103,11 @@ class CashuAppletTest {
         byte[] data = resp.getData();
         assertEquals(2, data.length, "Version response must be 2 bytes");
         assertEquals(0x00, data[0], "Major version = 0");
-        assertEquals(0x05, data[1],
-            "Minor version = 5 (CLEAR_PIN, D15). A card that answers 0x43 must not answer "
-                + "SELECT like a 0.4 build, which answers it 6D00; nor like the 0.3 build main "
-                + "tracked with the old write order (ENG-620), nor the ENG-615 builds below it.");
+        assertEquals(0x06, data[1],
+            "Minor version = 6 (SET_PUK + UNBLOCK_PIN, D16). A card that answers 0x44 and 0x45 "
+                + "must not answer SELECT like a 0.5 build, which answers them 6D00; nor like a "
+                + "0.4 build, which answers 0x43 6D00 too; nor like the 0.3 build main tracked "
+                + "with the old write order (ENG-620), nor the ENG-615 builds below it.");
     }
 
     // =========================================================================
@@ -112,22 +115,23 @@ class CashuAppletTest {
     // =========================================================================
 
     @Test @Order(2)
-    @DisplayName("GET_INFO returns 8-byte structure with correct initial values")
+    @DisplayName("GET_INFO returns 9-byte structure with correct initial values")
     void testGetInfo() {
         ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256));
         assertEquals(SW_OK, resp.getSW());
         byte[] d = resp.getData();
-        assertEquals(8, d.length, "GET_INFO must return 8 bytes");
+        assertEquals(9, d.length, "GET_INFO must return 9 bytes (8 before 0.6; the PUK state is appended, D16)");
         assertEquals(0x00, d[0] & 0xFF, "major version");
-        assertEquals(0x05, d[1] & 0xFF, "minor version");
+        assertEquals(0x06, d[1] & 0xFF, "minor version");
         assertEquals(MAX_PROOFS, d[2] & 0xFF, "max slots = 32");
         assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
         assertEquals(0, d[4] & 0xFF, "spent = 0 initially");
         assertEquals(MAX_PROOFS, d[5] & 0xFF, "empty = 32 initially");
         // bit0 = secp256k1 native, bit1 = Schnorr, bit2 = PIN (all set after ENG-181),
-        // bit3 = CLEAR_PIN (applet 0.5, D15)
-        assertEquals(0x0F, d[6] & 0xFF, "Capabilities must be 0x0F (secp256k1+Schnorr+PIN+CLEAR_PIN)");
+        // bit3 = CLEAR_PIN (applet 0.5, D15), bit4 = SET_PUK/UNBLOCK_PIN (applet 0.6, D16)
+        assertEquals(0x1F, d[6] & 0xFF, "Capabilities must be 0x1F (secp256k1+Schnorr+PIN+CLEAR_PIN+PUK)");
         assertEquals(0, d[7] & 0xFF, "PIN state = 0 (unset) initially");
+        assertEquals(0, d[8] & 0xFF, "PUK state = 0 (unset) initially");
     }
 
     // =========================================================================
@@ -1506,7 +1510,7 @@ class CashuAppletTest {
     }
 
     @Test @Order(42)
-    @DisplayName("CLEAR_PIN removes the PIN: GET_INFO 0.5 / 0x0F / state 0, VERIFY_PIN 6984, and spend, sign, load and clear open with no PIN (D15)")
+    @DisplayName("CLEAR_PIN removes the PIN: GET_INFO 0.6 / 0x1F / state 0, VERIFY_PIN 6984, and spend, sign, load and clear open with no PIN (D15)")
     void testClearPinRemovesThePinAndTheCardIsBearerAgain() {
         assertEquals(SW_OK, loadProof1().getSW());
         personalise();
@@ -1516,8 +1520,8 @@ class CashuAppletTest {
 
         byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
         assertEquals(0x00, info[0] & 0xFF, "major version");
-        assertEquals(0x05, info[1] & 0xFF, "minor version: 0.5 is the first build with CLEAR_PIN");
-        assertEquals(0x0F, info[6] & 0xFF, "capability bit 3 says the card answers CLEAR_PIN");
+        assertEquals(0x06, info[1] & 0xFF, "minor version: 0.5 was the first build with CLEAR_PIN, 0.6 adds the PUK");
+        assertEquals(0x1F, info[6] & 0xFF, "capability bit 3 says the card answers CLEAR_PIN (bit 4: UNBLOCK_PIN)");
         assertEquals(0, info[7] & 0xFF, "PIN state is unset again");
         assertEquals(SW_PIN_NOT_SET, verify(TEST_PIN), "VERIFY_PIN has nothing to verify");
         assertEquals(SW_PIN_NOT_SET, verify(WRONG_PIN), "and nothing to count a try against");

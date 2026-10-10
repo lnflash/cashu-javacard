@@ -4,7 +4,7 @@ Each entry records a call that was made, what was rejected, and why. If you are
 about to change one of these, read the entry first — most were made against a
 real alternative, and several were made *after* getting it wrong once.
 
-Anchors are stable (`#d1` … `#d15`); other docs link to them.
+Anchors are stable (`#d1` … `#d16`); other docs link to them.
 
 ---
 
@@ -255,6 +255,10 @@ this profile — a blocked card is replaced at re-provisioning. An
 `UNBLOCK_PIN` command gated by a provisioning PUK is the designated follow-up
 **before volume issuance**; do not ship consumer cards at scale without it.
 
+**Resolved by [`D16`](#d16): `UNBLOCK_PIN` gated by a provisioning PUK, applet 0.6.**
+A card personalised with a PUK is no longer replaced when its PIN is blocked;
+one without a PUK still is, and the lockout paragraph above describes it.
+
 *Correction (ENG-615, after v0.2.0):* "dead" was not what the applet did. The
 gate checked `pinState == 1`, and a blocked card has `pinState == 2`, so
 exhausting the tries **removed** the gate: every PIN-gated command opened up
@@ -282,7 +286,8 @@ reinstall regenerates the card key. [D14](#d14) later moved that floor to
 card's P2PK-locked proofs, so a blocked card's balance is unrecoverable, and
 `VERIFY_PIN` is unauthenticated: any reader in range can block a card with
 three APDUs ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #14). That loss is what
-`UNBLOCK_PIN` + PUK (ENG-617) has to remove.
+`UNBLOCK_PIN` + PUK (ENG-617) had to remove, and [D16](#d16) does, for every
+card that was given a PUK at personalisation.
 
 Provisioning: POS cards are personalised with a PIN by default
 (`cardctl set-pin` during personalisation; `fund-card --pin` when the funding
@@ -395,8 +400,8 @@ holding a card with a feature they cannot turn off.
   `requirePinVerified`, which a blocked card can never pass, so state 2
   answers `6982` with the right PIN, in this session and the next. The test
   for it sends exactly that sequence. The stranded-balance problem ([D13](#d13),
-  [SECURITY-MODEL #14](SECURITY-MODEL.md)) is still `UNBLOCK_PIN` + PUK's
-  (ENG-617) to solve, not this command's.
+  [SECURITY-MODEL #14](SECURITY-MODEL.md)) was `UNBLOCK_PIN` + PUK's
+  (ENG-617) to solve, not this command's; [D16](#d16) solves it.
 
 The write is one byte: `pinState` to 0, after the check — the byte `SET_PIN`
 writes last, the other way. The JCRE writes a byte atomically, so a card pulled
@@ -434,6 +439,117 @@ are wire-visible, and a 0.4 card answers `0x43` with `6D00`. A 0.4 card is
 not vulnerable and need not be reinstalled; it lacks the feature. 0.5 is a
 fresh install (delete + install, sweep first), as every applet version is —
 there is no in-place upgrade.
+
+---
+
+## <a id="d16"></a>D16 — A provisioning PUK unblocks the PIN (resolves D13's lockout)
+
+`SET_PUK` (`0x44`) gives a card a PUK, once, at personalisation. `UNBLOCK_PIN`
+(`0x45`) replaces the PIN — blocked or forgotten — on presentation of that
+PUK, with no session and without consuming it. Applet 0.6, capability bit 4,
+GET_INFO byte 8 for the PUK state (0 unset, 1 set, 2 exhausted). This is the
+follow-up D13 named before volume issuance: three unauthenticated APDUs no
+longer destroy a card's balance, provided the card was given a PUK and the
+PUK was recorded.
+
+**The ENG-615 line holds.** A blocked PIN gates every command until
+`UNBLOCK_PIN` succeeds, and `UNBLOCK_PIN` is the only path out of state 2.
+`CLEAR_PIN` still refuses it ([D15](#d15)), `SET_PIN` still refuses it, and
+a wrong PUK leaves it exactly as blocked. State 1 goes to 1 and state 2 to
+1: to the holder a forgotten PIN and a blocked one are the same problem, so
+the card does not tell them apart either.
+
+**Custody is off the card, and not the applet's question.** The card never
+reveals the PUK, so the personaliser generates it and records it at the
+moment `SET_PUK` succeeds; the backend card registry (ENG-618) is its
+designated home, releasing it to the card's owning account after
+authentication. The applet assumes nothing about where the PUK lives, only
+that `UNBLOCK_PIN` is answered by whoever presents it. That is the trade:
+the PUK is a PIN bypass for that one card ([SECURITY-MODEL #16](SECURITY-MODEL.md)),
+so the card's recovery is exactly as safe as the registry's custody, and a
+PUK recorded nowhere is a card that is still a 0.5 card.
+
+**Who may set it.** `SET_PUK` is free on a card with no PIN (the
+personalisation order: `SET_PUK`, then `SET_PIN`), needs the holder's
+verified session on a card with one (`SET_PIN`, `VERIFY_PIN`, `SET_PUK`),
+and is refused on a blocked card in every session, because the session gate
+is one a blocked card never passes. Without that, a reader in range could
+attach a PUK of its own to a personalised card, block the PIN with three
+guesses, and unblock it with the PUK it chose; or block first and attach
+second. A PUK is set once: not changed, not replaced, not re-armed.
+
+**Ten tries, then terminal.** The PUK is 8–12 digits, longer than the PIN
+because it is the credential that replaces the PIN, and it has ten tries
+because it is presented by a tool from a registry, not typed at a POS, so a
+slip is cheap and a guess still has at most ten attempts at 10^8 or more
+([SECURITY-MODEL #15](SECURITY-MODEL.md)). A wrong PUK answers `63 CX` with
+the PUK tries left; the exhausting try answers `63 C0` (not `6983`, so a
+reader counting down sees zero) and sets byte 8 to 2, after which
+`UNBLOCK_PIN` is `6983` for good and `SET_PUK` is `6A89`. Exhaustion costs
+the recovery path, not the balance: a card whose PUK was guessed at ten
+times is a 0.5 card, stranded only if its PIN is then blocked. The
+alternative — `SET_PUK` allowed again after exhaustion, in a verified
+session — was rejected because the card cannot tell the holder re-arming
+their own card from the thief who exhausted the PUK and then guessed the
+PIN; a terminal state at least tells the holder, through byte 8, that this
+card should be swept and replaced.
+
+**Why state 0 is refused.** `UNBLOCK_PIN` on a card with no PIN answers
+`6984`. There is nothing to unblock, `SET_PIN` is the way to a PIN there, and
+letting the PUK set a first PIN would make `UNBLOCK_PIN` a second `SET_PIN`
+with a different gate. One command per transition.
+
+**Rejected:**
+
+- *A PUK the holder chooses, or one the card shows once.* Either puts the
+  PUK where the PIN is, on the holder, and a credential the holder loses
+  with the PIN is no recovery. Generated by the personaliser, recorded by
+  the registry.
+- *Unblocking on the verified session, or `CHANGE_PIN` from a blocked
+  state.* A blocked card grants no session; that is D13 and ENG-615. The
+  PUK is a second credential precisely because the first is gone.
+- *`UNBLOCK_PIN` opening a session.* It proves the PUK, not the new PIN. The
+  holder's first `VERIFY_PIN` with the new PIN is the first time that PIN is
+  known to work, and a terminal that got a session from the registry's
+  credential rather than the holder's would be spending on the registry's
+  authority.
+- *`pin.resetAndUnblock()` before `pin.update()`.* `OwnerPIN.update` resets
+  the try counter itself — the contract `SET_PIN` after `CLEAR_PIN` already
+  rests on — so the reset would re-fill a counter the next call re-fills, and
+  [D15](#d15) records why a redundant counter write is worse than none.
+  `PukTest` scans for its absence.
+- *A `JCSystem` transaction around the PIN write and the state byte.* The
+  state byte is the commit ([D14](#d14)): `VERIFY_PIN` now refuses state 2 on
+  its own, not only an empty counter, so a card torn between the two is
+  state 2 over a fresh PIN, gated everywhere, and finished by the next
+  `UNBLOCK_PIN`. The order gives the guarantee; a transaction would give the
+  same one at the cost of commit-buffer space on every unblock.
+
+**The write orders.** `SET_PUK`: PUK value, then byte 8 = 1. A tear leaves a
+PUK nothing reads (`UNBLOCK_PIN` stops at state 0), overwritten by the next
+`SET_PUK`. `UNBLOCK_PIN`: PUK check, then the new PIN with its full counter,
+then byte 7 = 1. A tear leaves state 2 over the new PIN, refused by
+`VERIFY_PIN` on the state byte, finished by the same PUK. `failPukCheck`:
+the counter (decremented inside `OwnerPIN.check`), then byte 8 = 2. A tear
+leaves state 1 over an empty counter, which the next `UNBLOCK_PIN` turns
+into `63 C0` and the 2 — never a recovered try. `PukTest` scans the three
+orders in the source and sets the three torn states directly.
+
+Readers: byte 8 is read with byte 7 on every tap. A terminal shows a card
+reporting `2 / 1` as recoverable and `2 / 0` or `2 / 2` as stranded.
+`cardctl set-puk --puk [--pin]` and `cardctl unblock-pin --puk --new-pin`
+drive the two commands; `info` names the capability and the PUK state;
+`selftest` names `unblock-pin` on a blocked card whose PUK is set. The
+follow-ups are the registry (ENG-618) and flash-mobile's unblock screen,
+offered when byte 6 bit 4 is set and byte 8 is 1.
+
+The applet version moved to 0.6: two new instructions, a capability bit and
+a ninth GET_INFO byte are wire-visible, and a 0.5 card answers `0x44` and
+`0x45` with `6D00`. A 0.5 card is not vulnerable and need not be reinstalled;
+it lacks the feature, and so lacks the recovery. 0.6 is a fresh install
+(delete + install, sweep first), as every applet version is — there is no
+in-place upgrade, and so no way to add a PUK to a card in the field without
+regenerating its key.
 
 ---
 

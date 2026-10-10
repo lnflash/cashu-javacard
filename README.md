@@ -93,6 +93,8 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 | `B0` | `31` | CLEAR_SPENT | ✔ | Reclaim spent slots |
 | `B0` | `40`–`42` | VERIFY/SET/CHANGE_PIN | — / ✔ | PIN management |
 | `B0` | `43` | CLEAR_PIN | ✔ | Remove the PIN; the card is bearer again (applet 0.5) |
+| `B0` | `44` | SET_PUK | ✔ (if set) | Set the provisioning PUK, once (applet 0.6) |
+| `B0` | `45` | UNBLOCK_PIN | PUK | Replace a blocked or forgotten PIN with the PUK (applet 0.6) |
 | `B0` | `50` | LOCK_CARD | ✔ | Irreversibly disable writes |
 
 **Spending is PIN-gated once a PIN is set** (D13, v0.2.0): `SPEND_PROOF`,
@@ -100,14 +102,16 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 until `VERIFY_PIN` succeeds in the same session. A card ships with **no PIN**,
 and until one is set it has bearer semantics — a hostile reader in range can
 drain it — so setting a PIN is the holder's first job. Three wrong tries block
-the card for good and strand its balance: nothing else can sign for its
-proofs, there is no unblock path in this profile, and any reader in range can
-send those three tries (threat #14 in the
-[security model](docs/SECURITY-MODEL.md)). See
+the card, and any reader in range can send those three tries. Since applet
+0.6 a card personalised with a PUK (`SET_PUK`, set once and recorded off the
+card) recovers from that with `UNBLOCK_PIN`, which replaces the PIN
+([D16](docs/DECISIONS.md#d16)); a card with no PUK, or whose PUK has been
+guessed at ten times, strands its balance for good: nothing else can sign for
+its proofs (threat #14 in the [security model](docs/SECURITY-MODEL.md)). See
 [D13](docs/DECISIONS.md#d13); D12 records the earlier no-PIN design. A holder
 who has the PIN can take it off again with `CLEAR_PIN` (applet 0.5,
 [D15](docs/DECISIONS.md#d15)): the card is bearer again, and `SET_PIN` works
-once more. A blocked PIN cannot be cleared.
+once more. A blocked PIN cannot be cleared; only the PUK unblocks it.
 
 Every applet build before 0.3 stopped gating once the PIN was blocked (ENG-615,
 fixed in 0.3), and 0.1 builds from before D13 gate no spend at all. Builds
@@ -117,7 +121,8 @@ mid-write can show a phantom proof (ENG-620, fixed in 0.4,
 whose `SELECT` answers anything below `00 04` (`00 01`, `00 02` or `00 03`)
 needs the CAP reinstalled; sweep its balance first, because the reinstall
 regenerates the card key. A card answering `00 04` is sound but has no
-`CLEAR_PIN` (added in 0.5); reinstall it only if the holder wants that, and
+`CLEAR_PIN` (added in 0.5) and no PUK (added in 0.6); one answering `00 05`
+has no PUK. Reinstall either only if the holder wants what it lacks, and
 sweep first just the same.
 
 **AID:** package `D2 76 00 00 85 01 02`, applet `…02 01`.

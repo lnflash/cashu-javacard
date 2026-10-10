@@ -20,7 +20,7 @@ get around it rather than through it.
 | # | Threat | Protected? | Notes |
 |---|---|---|---|
 | 1 | Passive read of card memory | **Partially** | An attacker gets keyset id, amount, nonce and `C` — the secret string is never stored on the card, but it is reconstructible from the nonce plus the card pubkey, so treat it as leaked too. What does not leak is the private key, so the proofs stay unspendable. Balance and history leak. |
-| 2 | Hostile reader spends the card | **Once a PIN is set** | `SPEND_PROOF` and `SIGN_ARBITRARY` are gated on `VERIFY_PIN` in the same session (D13), and a failed PIN check ends that session. A card with no PIN set — the factory state — can be drained by anyone in NFC range, so the holder must set one before carrying value. Three wrong tries block the card; the gate keeps refusing in the blocked state (ENG-615 closed a bug where it stopped), and there is no unblock path (D13). That dead end is its own threat: see #14. |
+| 2 | Hostile reader spends the card | **Once a PIN is set** | `SPEND_PROOF` and `SIGN_ARBITRARY` are gated on `VERIFY_PIN` in the same session (D13), and a failed PIN check ends that session. A card with no PIN set — the factory state — can be drained by anyone in NFC range, so the holder must set one before carrying value. Three wrong tries block the card; the gate keeps refusing in the blocked state (ENG-615 closed a bug where it stopped), and the only way out is `UNBLOCK_PIN` with the card's PUK (D16), which replaces the PIN and opens no session. On a card with no PUK that dead end is its own threat: see #14. |
 | 3 | Card lost or destroyed | ❌ **By design** | No seed, no backup, no recovery. See [D5](DECISIONS.md#d5). |
 | 4 | Cloning the chip | **Yes** | Cloning EEPROM copies the proofs but not the key; a clone cannot sign. Cards should be CC EAL 5+ to resist invasive extraction. |
 | 5 | Offline double-spend from copied data | ❌ **No** | Fundamental. An offline merchant cannot know a proof was already melted. See below. |
@@ -32,7 +32,9 @@ get around it rather than through it.
 | 11 | Tear-off (card pulled mid-write) | **Yes, by write order** (applet 0.4 on); not yet on silicon | Every slot write changes the data first and commits the status byte last, as a single byte the JCRE writes atomically ([D14](DECISIONS.md#d14)). A card whose `SELECT` answers below `00 04` may write the status byte first and needs the CAP reinstalled. A torn `LOAD_PROOF` leaves the slot empty and a torn `CLEAR_SPENT` leaves it spent; neither state is counted in the balance or signed for. The empty slot's bytes are never read. The half-cleared spent slot still answers `GET_PROOF`, as status `02` with some fields zeroed, and its data is not a proof: a reader that uses a spent slot's data must check it ([`spec/APDU.md`](../spec/APDU.md#clear_spent-0x31)), and `cardctl dump` skips one that fails. `SPEND_PROOF` writes only the status byte, before it signs ([D7](DECISIONS.md#d7)): a tear after the burn loses that signature, which flash-pos re-derives with `SIGN_ARBITRARY` (`resignWitness`). The order is enforced by a source scan and the torn states are tested in jCardSim; no card has been pulled mid-write. |
 | 12 | Counterfeit physical cards | **Not a concern** | Value is bound to the chip's key. A look-alike with no valid chip holds nothing. |
 | 13 | Supply-chain / pre-personalised cards | ⚠️ **Unaddressed** | Nothing currently attests that a card's key was generated on-card by an untampered applet. |
-| 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs), balance unrecoverable | ❌ **No** | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. Once blocked, nothing can sign for its proofs: they are P2PK-locked to the card key with only a `sigflag` tag (no refund key, no locktime; [D5](DECISIONS.md#d5)'s recovery proposal is unmerged), and a reinstall regenerates the key. The balance is gone. Mitigations: small balances, a shielded sleeve, and `UNBLOCK_PIN` + PUK (ENG-617) before volume issuance. See below. |
+| 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs), balance unrecoverable | **Mitigated** (applet 0.6, when the PUK is in custody); ❌ **No** on a card with no PUK | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. Since applet 0.6 a card personalised with a PUK recovers: `UNBLOCK_PIN` replaces the PIN on presentation of the PUK, which the personaliser recorded off the card and the backend card registry (ENG-618) releases to the owning account ([D16](DECISIONS.md#d16)). The attacker gains nothing but a trip to the registry for the holder. On a card with no PUK — every build before 0.6, a 0.6 card nobody gave one, or one whose PUK was exhausted (#15) — nothing can sign for its proofs: they are P2PK-locked to the card key with only a `sigflag` tag (no refund key, no locktime; [D5](DECISIONS.md#d5)'s recovery proposal is unmerged), and a reinstall regenerates the key. That balance is gone. Mitigations there: small balances and a shielded sleeve. See below. |
+| 15 | PUK brute force: a reader guesses the PUK to replace the PIN | **Yes** | The PUK is 8–12 digits with ten tries (`63 C9` … `63 C0`), and exhaustion is terminal: `UNBLOCK_PIN` answers `6983` for good and `SET_PUK` will not re-arm the card ([D16](DECISIONS.md#d16)). Ten guesses at 10^8 or more is noise. The cost of exhaustion is the recovery path, not the balance: a card whose PUK was guessed at ten times is a 0.5 card again (#14), so a reader in range can take a card's recovery away with thirteen APDUs, three for the PIN and ten for the PUK. That is a denial of recovery, not a theft, and the holder keeps the balance until the PIN is blocked. |
+| 16 | PUK leaked: whoever holds it owns the card's PIN | **By custody**, not by the card | The PUK bypasses the PIN for that one card: `UNBLOCK_PIN` needs no session and sets whatever PIN the presenter chooses, so a PUK plus possession is the balance. The card cannot distinguish the holder from a thief with the registry's copy; the registry (ENG-618) can, and releases a PUK only to the card's owning account after authentication. One PUK per card, never reused across cards, generated rather than chosen, and never shown to the card after `SET_PUK`. `SET_PUK` itself is gated so no reader can attach a PUK the holder did not sanction: freely only on a card with no PIN, in the holder's verified session on a card with one, never on a blocked card ([D16](DECISIONS.md#d16)). The free case is the pre-issuance window: a card with no PIN takes a PUK from any reader, so the personaliser must verify GET_INFO bytes 7 and 8 are both `0` before `SET_PUK` — a card that already reports a PUK and no PIN was armed by someone else, and if issued, three wrong PINs and one `UNBLOCK_PIN` later its balance is theirs. The `6A89` the card then gives is correct but reads as a duplicate run; it is not. Do not issue that card: the PUK cannot be replaced, reinstall the CAP (spec/APDU.md, Personalisation; `cardctl set-puk` says so on that state). |
 
 ## The offline double-spend problem (#5)
 
@@ -101,7 +103,8 @@ holder's first job. Since applet 0.5 the holder can also take it off again:
 `CLEAR_PIN` ([D15](DECISIONS.md#d15)) needs a verified session and the PIN
 once more, costs a try when the PIN is wrong, and returns the card to the
 no-PIN state above by the holder's choice. It is not an unblock path: a
-blocked card never grants the session it needs, so #14 stands as written.
+blocked card never grants the session it needs. The unblock path is
+`UNBLOCK_PIN` with the PUK (applet 0.6, [D16](DECISIONS.md#d16)); see #14.
 
 **The blocked state had its own bug (ENG-615).** Every build before applet 0.3
 gated on `pinState == 1`, and a blocked card has `pinState == 2`, so three
@@ -117,17 +120,35 @@ silicon. A card whose `SELECT` answers anything below `00 03` (`00 01` or
 [D14](DECISIONS.md#d14) so does one answering `00 03` (#11). Sweep it first: a
 reinstall regenerates the key the proofs are locked to.
 
-**A blocked card strands its balance (#14).** `VERIFY_PIN` is unauthenticated,
-so any reader in NFC range can send the three wrong PINs. Nothing but the card
-key can sign for the card's proofs: the P2PK secret carries only a `sigflag`
-tag, with no refund key and no locktime, and D5's recovery proposal is not
-merged. ENG-615 therefore turned "three wrong PINs = theft" into "three wrong
-PINs = destruction of funds". The thief gets nothing, the holder loses the
-balance, and there is no unblock path in this profile.
+**A blocked card without a PUK strands its balance (#14).** `VERIFY_PIN` is
+unauthenticated, so any reader in NFC range can send the three wrong PINs.
+Nothing but the card key can sign for the card's proofs: the P2PK secret
+carries only a `sigflag` tag, with no refund key and no locktime, and D5's
+recovery proposal is not merged. ENG-615 therefore turned "three wrong PINs =
+theft" into "three wrong PINs = destruction of funds". The thief gets nothing,
+and on a card with no PUK the holder loses the balance.
 
-Mitigations today: small balances and a shielded sleeve. `UNBLOCK_PIN` gated by
-a provisioning PUK (ENG-617) is what removes the loss, and it blocks volume
-issuance.
+**With a PUK the holder gets the card back (#14, D16).** Applet 0.6 adds
+`SET_PUK`, once at personalisation, and `UNBLOCK_PIN`, which replaces the PIN
+— blocked or forgotten — on presentation of the PUK, with no session and
+without consuming the PUK. The PUK has ten tries and is then exhausted for
+good (#15), and leaking it hands that one card's PIN to whoever holds the card
+(#16), so its custody is the whole of its security: the personaliser generates
+it, records it off the card at the moment `SET_PUK` succeeds, and the backend
+card registry (ENG-618) releases it to the owning account after
+authentication. The card never reveals it and never assumes where it lives.
+`SET_PUK` is gated so no one can attach a PUK the holder did not sanction: a
+card with no PIN takes one freely (the personalisation order), a card with a
+PIN only in the holder's verified session, a blocked card never — so the
+reader that blocked a card cannot arm its own recovery. `UNBLOCK_PIN` writes
+the new PIN and its full counter first and commits the PIN state last
+([D14](DECISIONS.md#d14)); a card torn between the two refuses `VERIFY_PIN` on
+the state byte alone and is finished by the next `UNBLOCK_PIN`. All of it is
+verified in jCardSim only.
+
+Mitigations for a card without a PUK: small balances and a shielded sleeve.
+Volume issuance is no longer blocked on the applet; it is blocked on the
+registry holding the PUKs (ENG-618) and on the flash-mobile unblock flow.
 
 ## What has and has not been tested
 
@@ -158,6 +179,9 @@ An earlier card, a J3R452 on applet 0.1, ran the read and sign path on
 **Not yet run on silicon:**
 - A blocked PIN on any build: neither ENG-615 nor its 0.3 fix (the
   blocked-state gate and the failed-check session rule) has run on a card
+- `SET_PUK` and `UNBLOCK_PIN` (applet 0.6, [D16](DECISIONS.md#d16)): the PUK
+  lifecycle, the recovery of a blocked PIN, and the torn `UNBLOCK_PIN` state
+  are tested in jCardSim only
 - `LOCK_CARD`, deliberately not run on a card holding value
 - EEPROM wear and lifetime
 - A card pulled mid-write: the slot write order ([D14](DECISIONS.md#d14)) is
@@ -175,16 +199,19 @@ a few hundred taps. Treat simulator results accordingly — see
 
 ## Open items
 
-1. **`UNBLOCK_PIN` + PUK** (ENG-617, #14) — today three unauthenticated APDUs
-   strand a card's balance for good. Blocks volume issuance
-   ([D13](DECISIONS.md#d13)).
+1. **PUK custody and the unblock flow** (ENG-618, #14, #16) — the applet
+   side shipped in 0.6 ([D16](DECISIONS.md#d16)); what still blocks volume
+   issuance is the backend card registry that holds each card's PUK and
+   releases it to the owning account, and the flash-mobile screen that
+   drives `UNBLOCK_PIN` with it. Until then a 0.6 card whose PUK was recorded
+   nowhere is a 0.5 card.
 2. **Tear-off on silicon** (#11) — the write order is analysed and enforced
-   ([D14](DECISIONS.md#d14)); pulling a card mid-`LOAD_PROOF` and
-   mid-`CLEAR_SPENT` on hardware is still owed.
+   ([D14](DECISIONS.md#d14)); pulling a card mid-`LOAD_PROOF`,
+   mid-`CLEAR_SPENT` and mid-`UNBLOCK_PIN` on hardware is still owed.
 3. **Recovery** (#3) — [PR #4](https://github.com/lnflash/cashu-javacard/pull/4),
    closed unmerged, is the starting point; see [D5](DECISIONS.md#d5) for the
-   flaw to fix first. A refund path would also rescue a blocked card's balance
-   (#14).
+   flaw to fix first. A refund path would also rescue the balance of a
+   blocked card that has no PUK (#14).
 4. **Card attestation** (#13) — no proof a key was generated on-card by genuine
    firmware.
 5. **Side-channel review** of `SchnorrHW` — the modular arithmetic was written

@@ -58,20 +58,31 @@ INS_VERIFY_PIN = 0x40
 INS_SET_PIN = 0x41
 INS_CHANGE_PIN = 0x42
 INS_CLEAR_PIN = 0x43
+INS_SET_PUK = 0x44
+INS_UNBLOCK_PIN = 0x45
 INS_LOCK_CARD = 0x50
 
 # GET_INFO byte 6 (spec/APDU.md, GET_INFO). Bit 3 arrived with applet 0.5: a
 # card without it answers CLEAR_PIN with 6D00, so `clear-pin` reads the bit
-# before it sends the command, and `info` names it.
+# before it sends the command, and `info` names it. Bit 4 arrived with 0.6
+# (D16): SET_PUK and UNBLOCK_PIN answer, and GET_INFO has a ninth byte, the
+# PUK state. `set-puk` and `unblock-pin` read the bit the same way.
 CAP_SECP256K1_NATIVE = 0x01
 CAP_SCHNORR = 0x02
 CAP_PIN = 0x04
 CAP_CLEAR_PIN = 0x08
+CAP_UNBLOCK_PIN = 0x10
+
+# GET_INFO byte 8 (applet 0.6 and later). A card that answers eight bytes has
+# no PUK at all, which get_info() reports as None rather than "unset": the
+# difference between a card that can take a PUK and one that cannot.
+PUK_STATE_NAMES = {0: "unset", 1: "set", 2: "exhausted"}
 
 # The lowest applet version selftest passes. Every build below it is one a card
 # is reinstalled from (ENG-615 below 0.3, ENG-620 below 0.4: D13, D14). 0.5
-# added CLEAR_PIN and fixed nothing, so the floor stayed at 0.4: a 0.4 card is
-# sound, it lacks a feature, and selftest says which.
+# added CLEAR_PIN and 0.6 added the PUK (D15, D16); neither fixed anything, so
+# the floor stayed at 0.4: a 0.4 or 0.5 card is sound, it lacks a feature or
+# two, and selftest says which.
 SELFTEST_MIN_VERSION = (0, 4)
 
 LOCK_CONFIRM_BYTE = 0xDE
@@ -96,16 +107,27 @@ SW_MEANINGS = {
     0x6984: "PIN not set",
     0x6985: "conditions not satisfied (already spent / PIN already set or blocked / card already locked)",
     0x6986: "card locked by LOCK_CARD — writes disabled",
+    0x6A82: "PUK not set — nothing can unblock this card's PIN",
     0x6A83: "slot index out of range",
     0x6A84: "no space — all slots occupied",
     0x6A88: "slot is empty",
+    0x6A89: "PUK already set (or exhausted) — a PUK is set once, at personalisation",
     0x6D00: "instruction not supported",
     0x6E00: "class not supported",
     0x6F00: "signing failed (hardware error)",
 }
 
 
-def describe_sw(sw: int) -> str:
+def describe_sw(sw: int, context: str = "") -> str:
+    # UNBLOCK_PIN is the one command whose 63CX and 6983 count the PUK, not
+    # the PIN (spec/APDU.md, UNBLOCK_PIN). Naming the wrong credential there
+    # sends an operator back to --new-pin when it is --puk that was mistyped,
+    # and every retry spends a PUK try that is terminal at zero (#15).
+    if context == "UNBLOCK_PIN":
+        if (sw & 0xFFF0) == 0x63C0:
+            return f"wrong PUK — {sw & 0x0F} PUK tries remaining (0 = exhausted for good)"
+        if sw == 0x6983:
+            return "PUK exhausted — ten wrong PUKs; UNBLOCK_PIN answers 6983 for good"
     if sw in SW_MEANINGS:
         return SW_MEANINGS[sw]
     if (sw & 0xFFF0) == 0x63C0:
@@ -117,7 +139,7 @@ class CardError(Exception):
     def __init__(self, sw: int, context: str = ""):
         self.sw = sw
         where = f" during {context}" if context else ""
-        super().__init__(f"card returned {sw:04X}{where}: {describe_sw(sw)}")
+        super().__init__(f"card returned {sw:04X}{where}: {describe_sw(sw, context)}")
 
 
 # ── APDU timing ───────────────────────────────────────────────────────────────
@@ -289,8 +311,13 @@ class Card:
     def get_info(self) -> dict:
         b = self.send(INS_GET_INFO, le=0x00, context="GET_INFO")
         if len(b) < 8:
-            raise SystemExit(f"GET_INFO returned {len(b)} bytes, expected 8: {_hex(b)}")
+            raise SystemExit(f"GET_INFO returned {len(b)} bytes, expected 8 or 9: {_hex(b)}")
         caps = b[6]
+        # Byte 8 is appended by applet 0.6 (D16). An eight-byte answer is a
+        # card from before the PUK existed, which is not the same as a 0.6
+        # card whose PUK is unset: None, so that callers that only know the
+        # three states cannot read "no such byte" as "set".
+        puk_state = PUK_STATE_NAMES.get(b[8], f"unknown({b[8]})") if len(b) > 8 else None
         return {
             "version": f"{b[0]}.{b[1]}",
             "max_slots": b[2],
@@ -301,7 +328,9 @@ class Card:
             "secp256k1_native": bool(caps & CAP_SECP256K1_NATIVE),
             "schnorr": bool(caps & CAP_SCHNORR),
             "clear_pin": bool(caps & CAP_CLEAR_PIN),
+            "unblock_pin": bool(caps & CAP_UNBLOCK_PIN),
             "pin_state": {0: "unset", 1: "set", 2: "locked"}.get(b[7], f"unknown({b[7]})"),
+            "puk_state": puk_state,
         }
 
     def get_pubkey(self, raw: bool = False) -> bytes:
@@ -397,6 +426,25 @@ class Card:
         """
         self.send(INS_CLEAR_PIN, data=bytes([len(pin)]) + pin, context="CLEAR_PIN")
 
+    def set_puk(self, puk: bytes) -> None:
+        """SET_PUK: [len][puk], CLEAR_PIN's framing (spec/APDU.md, SET_PUK).
+
+        Once per card. On a card with a PIN the caller sends VERIFY_PIN first,
+        as cmd_set_puk does; on a card with none, nothing is needed.
+        """
+        self.send(INS_SET_PUK, data=bytes([len(puk)]) + puk, context="SET_PUK")
+
+    def unblock_pin(self, puk: bytes, new_pin: bytes) -> None:
+        """UNBLOCK_PIN: [pukLen][puk][newPinLen][newPin] (spec/APDU.md, UNBLOCK_PIN).
+
+        No VERIFY_PIN before it: the PUK is the authority, and the blocked
+        card this exists for cannot open a session anyway. A wrong PUK costs a
+        PUK try, so the caller checks the PUK state first, as cmd_unblock_pin
+        does. Success opens no session; the holder verifies the new PIN.
+        """
+        data = bytes([len(puk)]) + puk + bytes([len(new_pin)]) + new_pin
+        self.send(INS_UNBLOCK_PIN, data=data, context="UNBLOCK_PIN")
+
     def lock_card(self) -> None:
         self.transmit(bytes([CLA, INS_LOCK_CARD, 0x00, LOCK_CONFIRM_BYTE]), "LOCK_CARD")
 
@@ -447,10 +495,20 @@ def cmd_info(args) -> int:
           f"{i['unspent']} unspent, {i['spent']} spent, {i['empty']} empty")
     print(f"capabilities     : 0x{i['caps_raw']:02X} "
           f"(secp256k1 native={i['secp256k1_native']}, schnorr={i['schnorr']}, "
-          f"clear_pin={i['clear_pin']})")
+          f"clear_pin={i['clear_pin']}, unblock_pin={i['unblock_pin']})")
     print(f"PIN              : {i['pin_state']}")
+    print(f"PUK              : {_puk_state_text(i)}")
     print(f"balance          : {card.get_balance()}")
     return 0
+
+
+def _puk_state_text(info: dict) -> str:
+    """GET_INFO byte 8 for an operator, or why there is none."""
+    if info["puk_state"] is None:
+        return f"none (applet {info['version']} has no PUK; added in 0.6)"
+    if info["puk_state"] == "exhausted":
+        return "exhausted (ten wrong PUKs; UNBLOCK_PIN is 6983 for good, a blocked PIN is stranded)"
+    return info["puk_state"]
 
 
 def cmd_pubkey(args) -> int:
@@ -1096,6 +1154,115 @@ def cmd_clear_pin(args) -> int:
     return 0
 
 
+def _require_puk_capability(info: dict, what: str) -> None:
+    """A 0.5 card answers 0x44 and 0x45 with 6D00, which reads like a bad INS
+    byte. The capability bit says so before anything is sent."""
+    if not info["unblock_pin"]:
+        raise SystemExit(
+            f"applet {info['version']} has no {what} (GET_INFO capability bit 4 clear): "
+            f"it arrived in applet 0.6. Reinstall the card to get it — sweep first "
+            f"(docs/HARDWARE_DEPLOYMENT.md)"
+        )
+
+
+def cmd_set_puk(args) -> int:
+    card = connect(args)
+    info = card.get_info()
+    _require_puk_capability(info, "SET_PUK")
+    # Every refusal the card would give is known from GET_INFO, so say it
+    # here, before a VERIFY_PIN is spent on a card that will refuse anyway.
+    if info["puk_state"] == "set" and info["pin_state"] == "unset":
+        # Two audiences see this state and need opposite advice. A
+        # personaliser with a fresh card: SET_PUK is free on a card with no
+        # PIN, so a PUK on one is something somebody attached pre-issuance,
+        # and the card is armed for whoever holds it — three wrong PINs and
+        # an UNBLOCK_PIN later, the balance is theirs (SECURITY-MODEL #16).
+        # A holder after `clear-pin`: CLEAR_PIN leaves the PUK alone, so
+        # their own card reports exactly this, and the PUK is still theirs.
+        # The wording must not send that holder to a reinstall — a reinstall
+        # on a card with a balance regenerates the key and strands it
+        # (SECURITY-MODEL #14). Either way the card's 6A89 is correct and
+        # this is not a duplicate run.
+        #
+        # "Fresh" is the personaliser's assumption, not the card's state: a
+        # bearer card never PIN'd can carry proofs, and a stranger's SET_PUK
+        # on it lands in exactly this state. GET_INFO byte 3 is already in
+        # hand, so name the proofs before advising the reinstall that would
+        # strand them.
+        if info["unspent"] == 0:
+            balance = "sweep nothing (GET_INFO reports no unspent proofs)"
+        else:
+            balance = (
+                f"it holds {info['unspent']} unspent proof(s): `cardctl dump` / spend "
+                f"them first — a reinstall regenerates the key and strands them "
+                f"(SECURITY-MODEL #14)"
+            )
+        raise SystemExit(
+            "this card reports a PUK but has no PIN. If you are personalising a fresh "
+            f"card, someone else armed it: do not issue it, {balance}, then "
+            "reinstall the CAP — the PUK cannot be replaced (spec/APDU.md, "
+            "Personalisation; SECURITY-MODEL #16). If this is your own card after "
+            "clear-pin, the PUK is yours and still works: run set-pin, no second PUK "
+            "is needed"
+        )
+    if info["puk_state"] != "unset":
+        raise SystemExit(
+            f"this card's PUK is already {info['puk_state']}: a PUK is set once, at "
+            f"personalisation, and is never replaced (spec/APDU.md, SET_PUK)"
+        )
+    if info["pin_state"] == "locked":
+        raise SystemExit(
+            "this card's PIN is blocked and it has no PUK: SET_PUK needs a verified PIN "
+            "session, which a blocked card never grants (D16). The balance is stranded "
+            "(SECURITY-MODEL #14)"
+        )
+    if info["pin_state"] == "set" and not args.pin:
+        raise SystemExit(
+            "this card has a PIN: pass --pin, since SET_PUK on a PIN card needs the "
+            "holder's verified session (D16)"
+        )
+    if args.pin:
+        if info["pin_state"] == "set":
+            card.verify_pin(args.pin.encode())
+        else:
+            # A fresh card answers VERIFY_PIN with 6984, which would abort a
+            # SET_PUK the card was going to accept. A personalisation script
+            # that passes --pin uniformly must still work on every blank card.
+            print("note: --pin ignored, this card has no PIN (SET_PUK needs no session on it)")
+    card.set_puk(args.puk.encode())
+    print("PUK set — record it off the card now; the card never reveals it, and it is the "
+          "only way to unblock or replace this card's PIN (D16)")
+    return 0
+
+
+def cmd_unblock_pin(args) -> int:
+    card = connect(args)
+    info = card.get_info()
+    _require_puk_capability(info, "UNBLOCK_PIN")
+    # The card's own gates, read from GET_INFO first so that nothing is sent
+    # that spends a PUK try for no reason.
+    if info["puk_state"] == "unset":
+        raise SystemExit(
+            "this card has no PUK (GET_INFO byte 8 = 0): nothing can unblock its PIN. "
+            "A PUK is set at personalisation with set-puk"
+            + ("; this card's PIN is blocked, so its balance is stranded (SECURITY-MODEL #14)"
+               if info["pin_state"] == "locked" else "")
+        )
+    if info["puk_state"] == "exhausted":
+        raise SystemExit(
+            "this card's PUK is exhausted (GET_INFO byte 8 = 2): ten wrong PUKs, and "
+            "UNBLOCK_PIN answers 6983 for good. A blocked PIN on it is stranded"
+        )
+    if info["pin_state"] == "unset":
+        raise SystemExit(
+            "this card has no PIN to unblock or replace: use set-pin"
+        )
+    card.unblock_pin(args.puk.encode(), args.new_pin.encode())
+    print("PIN replaced — VERIFY_PIN with the new PIN opens a session; the old PIN and its "
+          "try count are gone, and the PUK is unchanged")
+    return 0
+
+
 def cmd_lock(args) -> int:
     card = connect(args)
     if not args.yes:
@@ -1141,7 +1308,8 @@ def cmd_selftest(args) -> int:
 
     info = card.get_info()
     record("GET_INFO", True,
-           f"v{info['version']}, {info['max_slots']} slots, PIN {info['pin_state']}")
+           f"v{info['version']}, {info['max_slots']} slots, PIN {info['pin_state']}"
+           + (f", PUK {info['puk_state']}" if info["puk_state"] is not None else ""))
     record("Schnorr capability advertised", info["schnorr"],
            f"caps=0x{info['caps_raw']:02X}")
 
@@ -1154,7 +1322,7 @@ def cmd_selftest(args) -> int:
     # anyone in range could spend.
     pin_blocked = info["pin_state"] == "locked"
     if pin_blocked:
-        record("PIN state", False, _blocked_pin_detail(version))
+        record("PIN state", False, _blocked_pin_detail(version, info["puk_state"]))
     elif info["pin_state"] == "set":
         if getattr(args, "pin", None):
             try:
@@ -1260,29 +1428,40 @@ def _select_verdict(version: bytes) -> Tuple[bool, str]:
                        f"blocked (then it is stranded, SECURITY-MODEL #14), and reinstall "
                        f"the tracked CAP (docs/HARDWARE_DEPLOYMENT.md)")
     if ver == (0, 4):
-        # Sound, but the holder cannot take the PIN off (D15). Said here so
-        # that a `clear-pin` that fails later is not a surprise; not a FAIL,
+        # Sound, but the holder cannot take the PIN off (D15) and a blocked
+        # PIN cannot be recovered (D16). Said here so that a `clear-pin` or
+        # `unblock-pin` that fails later is not a surprise; not a FAIL,
         # because nothing about the card's money is wrong.
-        return True, "version 0.4 (no CLEAR_PIN; added in 0.5)"
+        return True, "version 0.4 (no CLEAR_PIN or UNBLOCK_PIN; added in 0.5 and 0.6)"
+    if ver == (0, 5):
+        # Sound; it has CLEAR_PIN but no PUK, so three wrong PINs still
+        # strand it (D16).
+        return True, "version 0.5 (no UNBLOCK_PIN; added in 0.6)"
     return True, f"version {ver[0]}.{ver[1]}"
 
 
-def _blocked_pin_detail(version: bytes) -> str:
+def _blocked_pin_detail(version: bytes, puk_state=None) -> str:
     """
     What a blocked PIN (GET_INFO byte 7 = 2) means on the card in hand.
 
-    Two opposite things, told apart by the applet version SELECT answered.
-    From 0.3 the gate holds for good, so the balance is stranded: nothing but
-    the card key can sign for its P2PK-locked proofs. Every 0.1 and 0.2 build
-    checked `pinState == 1`, so on those the block *removed* the gate (ENG-615)
-    and anyone in range can spend; the balance can still be swept, and the
-    card has to be reinstalled.
+    Three things, told apart by the applet version SELECT answered and, from
+    0.6, by the PUK state. From 0.3 the gate holds for good; with no PUK (any
+    build before 0.6, or a 0.6 card whose PUK is unset or exhausted) the
+    balance is stranded: nothing but the card key can sign for its
+    P2PK-locked proofs. With a PUK set, `unblock-pin` recovers it (D16).
+    Every 0.1 and 0.2 build checked `pinState == 1`, so on those the block
+    *removed* the gate (ENG-615) and anyone in range can spend; the balance
+    can still be swept, and the card has to be reinstalled.
     """
     ver = tuple(version[:2])
     if len(ver) == 2 and ver < (0, 3):
         return (f"blocked (GET_INFO byte 7 = 2) on applet {ver[0]}.{ver[1]}, a build "
                 f"that stops gating once the PIN is blocked (ENG-615): anyone in "
                 f"range can spend it. Sweep the balance, then reinstall the CAP")
+    if puk_state == "set":
+        return ("blocked (GET_INFO byte 7 = 2): spend/sign refuse until the PIN is "
+                "unblocked; the PUK is set, so `unblock-pin --puk … --new-pin …` "
+                "recovers the balance (D16)")
     return ("blocked (GET_INFO byte 7 = 2): spend/sign refuse for good, balance "
             "stranded (SECURITY-MODEL #14)")
 
@@ -1368,6 +1547,17 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("clear-pin", help="remove the PIN: the card is a bearer card again (applet 0.5, D15)")
     s.add_argument("--pin", required=True, help="the current PIN (verified, then presented again)")
     s.set_defaults(func=cmd_clear_pin)
+
+    s = sub.add_parser("set-puk", help="set the provisioning PUK, once (applet 0.6, D16)")
+    s.add_argument("--puk", required=True, help="the PUK to set (8–12 digits); record it off the card")
+    s.add_argument("--pin", help="the current PIN, needed when the card has one (verified first)")
+    s.set_defaults(func=cmd_set_puk)
+
+    s = sub.add_parser("unblock-pin",
+                       help="unblock or replace the PIN with the PUK (applet 0.6, D16)")
+    s.add_argument("--puk", required=True, help="the card's PUK (8–12 digits)")
+    s.add_argument("--new-pin", required=True, help="the new PIN (4–8 digits)")
+    s.set_defaults(func=cmd_unblock_pin)
 
     s = sub.add_parser("lock", help="permanently disable writes (IRREVERSIBLE)")
     s.add_argument("--pin")

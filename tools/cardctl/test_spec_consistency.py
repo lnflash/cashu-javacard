@@ -507,7 +507,14 @@ _RANGE_LENGTH = {"VERIFY_PIN", "SET_PIN"}
 #   * LOCK_CARD is a bare 4-byte APDU — it carries no data and expects no
 #     response body, so it documents neither Lc nor Le. Its P2 is the
 #     confirmation byte, checked in test_lock_card_p2_is_the_confirmation_byte.
-_NOT_FIXED_LENGTH = {"CHANGE_PIN", "CLEAR_PIN", "LOCK_CARD"}
+#   * SET_PUK documents `Lc | Variable` — PUK length prefix + one PUK of 8–12
+#     bytes, CLEAR_PIN's framing over the PUK range. The framing is pinned in
+#     test_apdu.py and the range against the applet's PUK_MIN_LEN/PUK_MAX_LEN
+#     in test_puk_length_ranges_match_the_applet below.
+#   * UNBLOCK_PIN documents `Lc | Variable` — PUK length prefix + PUK + new
+#     PIN length prefix + new PIN, so its Lc spans both ranges. Pinned in
+#     test_apdu.py and checked below with SET_PUK's.
+_NOT_FIXED_LENGTH = {"CHANGE_PIN", "CLEAR_PIN", "LOCK_CARD", "SET_PUK", "UNBLOCK_PIN"}
 
 # Every documented command, driven through the real encoder. The five above are
 # absent from _LENGTH_CASES but their headers are still checked, so they are
@@ -517,6 +524,8 @@ _WIRE_CASES = _LENGTH_CASES + (
     ("SET_PIN", "set_pin", (b"1234",), b""),
     ("CHANGE_PIN", "change_pin", (b"1234", b"5678"), b""),
     ("CLEAR_PIN", "clear_pin", (b"1234",), b""),
+    ("SET_PUK", "set_puk", (b"12345678",), b""),
+    ("UNBLOCK_PIN", "unblock_pin", (b"12345678", b"1234"), b""),
     ("LOCK_CARD", "lock_card", (), b""),
 )
 
@@ -548,6 +557,68 @@ def test_clear_pin_is_change_pin_without_the_new_pin():
         "from _NOT_FIXED_LENGTH and say how the range relates to PIN_MIN_LEN/PIN_MAX_LEN"
     )
 
+
+def _puk_limits() -> dict:
+    src = APPLET_JAVA.read_text(encoding="utf-8")
+    limits = {
+        n: int(v) for n, v in
+        re.findall(r"static final short (PUK_MIN_LEN|PUK_MAX_LEN)\s*=\s*\(short\)\s*(\d+)", src)
+    }
+    assert set(limits) == {"PUK_MIN_LEN", "PUK_MAX_LEN"}, (
+        f"could not scrape PUK limits from {APPLET_JAVA.name}: {limits}"
+    )
+    return limits
+
+
+def test_puk_length_ranges_match_the_applet():
+    """
+    SET_PUK and UNBLOCK_PIN document the PUK as `8–12 bytes` and the applet
+    enforces PUK_MIN_LEN/PUK_MAX_LEN (D16). A personalisation tool built from
+    a doc that said `6–12` would set a 6-digit PUK, get 6700, and ship the
+    card with no PUK: exactly the card UNBLOCK_PIN exists to prevent. The new
+    PIN in UNBLOCK_PIN is a PIN, so its range is the PIN's.
+    """
+    puk = _puk_limits()
+    pin_src = APPLET_JAVA.read_text(encoding="utf-8")
+    pin = {
+        n: int(v) for n, v in
+        re.findall(r"static final short (PIN_MIN_LEN|PIN_MAX_LEN)\s*=\s*\(short\)\s*(\d+)", pin_src)
+    }
+    for name in ("SET_PUK", "UNBLOCK_PIN"):
+        row = re.search(r"^\| Data \| (.+?) \|$", _section(name), re.M)
+        assert row, f"{name} has no parsable Data row"
+        m = re.search(r"PUK \((\d+)[–-](\d+) bytes", row.group(1))
+        assert m, f"{name}'s Data row no longer gives the PUK length as a range: {row.group(1)!r}"
+        assert (int(m.group(1)), int(m.group(2))) == (puk["PUK_MIN_LEN"], puk["PUK_MAX_LEN"]), (
+            f"{name} documents a {m.group(1)}–{m.group(2)} byte PUK, applet enforces "
+            f"{puk['PUK_MIN_LEN']}–{puk['PUK_MAX_LEN']}"
+        )
+        assert re.search(r"^\| Lc \| Variable \|$", _section(name), re.M), (
+            f"{name}'s Lc is no longer documented as Variable; if it became a range, move it "
+            "from _NOT_FIXED_LENGTH and say how the range relates to PUK_MIN_LEN/PUK_MAX_LEN"
+        )
+    row = re.search(r"^\| Data \| (.+?) \|$", _section("UNBLOCK_PIN"), re.M)
+    m = re.search(r"new PIN \((\d+)[–-](\d+) bytes", row.group(1))
+    assert m, f"UNBLOCK_PIN's Data row no longer gives the new PIN length as a range: {row.group(1)!r}"
+    assert (int(m.group(1)), int(m.group(2))) == (pin["PIN_MIN_LEN"], pin["PIN_MAX_LEN"]), (
+        f"UNBLOCK_PIN documents a {m.group(1)}–{m.group(2)} byte new PIN, applet enforces "
+        f"{pin['PIN_MIN_LEN']}–{pin['PIN_MAX_LEN']}"
+    )
+
+    # The PUK framing is CLEAR_PIN's over the PUK, and UNBLOCK_PIN is that
+    # framing twice: Lc exactly 1 + len(puk) and 2 + len(puk) + len(pin).
+    puk_bytes, pin_bytes = b"1234567890", b"5678"
+    one = make_card([(b"", 0x9000)])
+    one.set_puk(puk_bytes)
+    sent = one.connection.last
+    assert sent[4] == 1 + len(puk_bytes) and sent[5] == len(puk_bytes) and sent[6:] == puk_bytes, sent.hex()
+    two = make_card([(b"", 0x9000)])
+    two.unblock_pin(puk_bytes, pin_bytes)
+    sent = two.connection.last
+    assert sent[4] == 2 + len(puk_bytes) + len(pin_bytes), sent.hex()
+    assert sent[5] == len(puk_bytes) and sent[6:6 + len(puk_bytes)] == puk_bytes, sent.hex()
+    assert sent[6 + len(puk_bytes)] == len(pin_bytes) and sent[7 + len(puk_bytes):] == pin_bytes, sent.hex()
+
 # Commands whose P1 carries a caller-chosen slot index rather than a fixed byte.
 # These are the two that move money: a P1 documented as a literal `00` sends a
 # reader author to slot 0 on every tap, which for SPEND_PROOF is an irreversible
@@ -558,7 +629,7 @@ _SLOT_INDEXED = {"GET_PROOF", "SPEND_PROOF"}
 # constants where the driver has one, so a coordinated doc+encoder edit still has
 # to face cardctl's model of the card.
 _RESPONSE_SIZES = {
-    "GET_INFO": 8,
+    "GET_INFO": 9,
     "GET_PUBKEY": 33,
     "GET_BALANCE": 4,
     "GET_PROOF_COUNT": 1,
@@ -921,15 +992,15 @@ def test_get_info_response_table_matches_the_decoder():
     layout = {int(off): (int(ln), desc) for off, ln, desc in rows}
 
     # The table must tile the documented response exactly: contiguous one-byte
-    # fields covering all 8 bytes, so a row added or dropped fails before the
+    # fields covering all 9 bytes, so a row added or dropped fails before the
     # per-field checks do.
     assert sorted(layout) == list(range(_RESPONSE_SIZES["GET_INFO"])), (
-        f"GET_INFO's table offsets are {sorted(layout)}, expected 0..7"
+        f"GET_INFO's table offsets are {sorted(layout)}, expected 0..{_RESPONSE_SIZES['GET_INFO'] - 1}"
     )
     assert all(ln == 1 for ln, _ in layout.values()), "GET_INFO fields are all single bytes"
 
     # Every byte distinguishable, driven through the real decoder.
-    info = make_card([(bytes([9, 8, 7, 6, 5, 4, 0x01, 1]), 0x9000)]).get_info()
+    info = make_card([(bytes([9, 8, 7, 6, 5, 4, 0x01, 1, 2]), 0x9000)]).get_info()
     assert info["version"] == "9.8"
     assert info["max_slots"] == 7
     assert info["unspent"] == 6
@@ -938,11 +1009,26 @@ def test_get_info_response_table_matches_the_decoder():
     assert info["secp256k1_native"] is True
     assert info["schnorr"] is False
     assert info["pin_state"] == "set"
+    assert info["puk_state"] == "exhausted"
+    # Byte 8 was appended by 0.6 (D16): the eight-byte answer of every earlier
+    # build still decodes, and reports the PUK as absent rather than unset.
+    assert make_card([(bytes([9, 8, 7, 6, 5, 4, 0x01, 1]), 0x9000)]).get_info()["puk_state"] is None
+
+    # The three PUK states the doc names are the three the decoder names, in
+    # the doc's order (0, 1, 2).
+    puk_desc = layout[8][1]
+    for value, name in cardctl.PUK_STATE_NAMES.items():
+        assert f"{value}={name}" in puk_desc, (
+            f"GET_INFO byte 8 is described as {puk_desc!r}, expected it to say {value}={name}"
+        )
+    assert "pin" not in puk_desc.lower().replace("unblock_pin", ""), (
+        f"GET_INFO byte 8 describes the PIN, not the PUK: {puk_desc!r}"
+    )
 
     # Each documented description must name the field the decoder reads there.
     keywords = {
         0: "major", 1: "minor", 2: "max", 3: "unspent", 4: "spent",
-        5: "empty", 6: "capabilit", 7: "pin",
+        5: "empty", 6: "capabilit", 7: "pin", 8: "puk",
     }
     for off, (_, desc) in sorted(layout.items()):
         assert keywords[off] in desc.lower(), (
@@ -961,6 +1047,17 @@ def test_get_info_response_table_matches_the_decoder():
     assert "schnorr" in bit_desc.get(1, ""), (
         f"capability bit 1 no longer names Schnorr: {bit_desc.get(1)!r}"
     )
+    assert "clear_pin" in bit_desc.get(3, ""), (
+        f"capability bit 3 no longer names CLEAR_PIN: {bit_desc.get(3)!r}"
+    )
+    assert "unblock_pin" in bit_desc.get(4, "") and "set_puk" in bit_desc.get(4, ""), (
+        f"capability bit 4 no longer names SET_PUK and UNBLOCK_PIN: {bit_desc.get(4)!r}"
+    )
+    # And the decoder reads those two bits where the doc puts them.
+    caps = make_card([(bytes([0, 6, 32, 0, 0, 32, 0x18, 0, 0]), 0x9000)]).get_info()
+    assert caps["clear_pin"] is True and caps["unblock_pin"] is True
+    assert caps["secp256k1_native"] is False and caps["schnorr"] is False
+    assert cardctl.CAP_CLEAR_PIN == 1 << 3 and cardctl.CAP_UNBLOCK_PIN == 1 << 4
 
 
 def _applet_ins() -> dict:
@@ -1043,10 +1140,11 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
     The floor is cardctl.SELFTEST_MIN_VERSION, and it was the tracked version
     while every build below it was one a card is reinstalled from (D13, D14).
     A version bump that leaves the floor where it was has to say why, here:
-    0.5 added CLEAR_PIN (D15) and fixed nothing, so a 0.4 card is sound and
-    stays installed; selftest passes it and names the missing command. The
-    floor must still sit at or below the tracked version, fail the version
-    under it, and pass the tracked one.
+    0.5 added CLEAR_PIN (D15) and 0.6 added SET_PUK and UNBLOCK_PIN (D16),
+    and neither fixed anything, so a 0.4 or 0.5 card is sound and stays
+    installed; selftest passes it and names the missing commands. The floor
+    must still sit at or below the tracked version, fail the version under
+    it, and pass the tracked one.
     """
     version = dict(re.findall(
         r"static final byte VERSION_(MAJOR|MINOR)\s*=\s*\(byte\)\s*0x([0-9A-Fa-f]{2})",
@@ -1068,8 +1166,11 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
     # install rule, the SELECT response (`MMmm 9000`) and GET_INFO's 8 bytes.
     answers = re.findall(r"`SELECT` must answer `([0-9A-F]{2}) ([0-9A-F]{2})`", guide)
     answers += re.findall(r"^# Response: ([0-9A-F]{2})([0-9A-F]{2}) 9000\b", guide, re.M)
+    # GET_INFO's answer is version + the rest of its documented size, so a
+    # guide still showing the 8-byte answer of a 0.5 card fails here.
     answers += re.findall(
-        r"^# Response: ([0-9A-F]{2}) ([0-9A-F]{2})(?: [0-9A-F]{2}){6}\s*$", guide, re.M)
+        r"^# Response: ([0-9A-F]{2}) ([0-9A-F]{2})(?: [0-9A-F]{2}){%d}\s*$"
+        % (_RESPONSE_SIZES["GET_INFO"] - 2), guide, re.M)
     assert len(answers) == 3, (
         f"expected the guide's three version answers (the install rule, SELECT and "
         f"GET_INFO), found {answers}"
