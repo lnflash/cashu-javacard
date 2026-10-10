@@ -1093,8 +1093,8 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
     # The guide-mentions-every-passed-version loop below walks minors under
     # one major. With the floor at 0.4 and the applet at 1.0, range(4, 0) is
     # empty and the ratchet checks nothing while still passing, so the loop
-    # must be rewritten over (major, minor) pairs when the major bumps, and
-    # this assertion is what says so.
+    # must be rewritten over (major, minor) pairs when the floor and the
+    # applet part ways on the major, and this assertion is what says so.
     assert floor[0] == major, (
         f"selftest's floor {floor} and the tracked applet {major}.{minor} differ in "
         f"major version: the versions-between loop in this test walks minors under one "
@@ -1111,10 +1111,41 @@ def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
     # tracked version is missing, so a selftest pass on it is not read as
     # "nothing to do".
     for v in range(floor[1], minor):
-        assert f"`00 0{v}`" in guide or f"`00 {v:02X}`" in guide, (
-            f"{DEPLOYMENT_MD.name} says nothing about a card answering 00 {v:02X}, which "
-            f"selftest passes though it is below the tracked {major}.{minor}"
+        assert _select_answer(major, v) in guide, (
+            f"{DEPLOYMENT_MD.name} says nothing about a card answering {major:02X} {v:02X}, "
+            f"which selftest passes though it is below the tracked {major}.{minor}"
         )
+
+
+def _select_answer(major, minor):
+    """
+    The two-byte `SELECT` answer the deployment guide writes for an applet
+    version, in the guide's own notation: `MM mm`, each a two-digit upper-case
+    hex byte in backticks, as in `00 04` or `01 00`.
+    """
+    return f"`{major:02X} {minor:02X}`"
+
+
+def test_select_answer_spells_the_guide_notation_for_any_version():
+    """
+    The versions-between loop above once hardcoded the major as `00` (and spelt
+    the minor as `0{v}`), so it passed only while both the floor and the applet
+    sat under major 0. With the floor at 1.0 and the applet at 1.2, it demanded
+    `00 00` and `00 01` in a guide that correctly says `01 00`, and blamed the
+    guide for a sentence it had; at minor 10 the `0{v}` spelling asked for
+    `00 010`. The notation must be the guide's for every (major, minor).
+    """
+    assert _select_answer(0, 4) == "`00 04`"
+    assert _select_answer(1, 0) == "`01 00`"
+    assert _select_answer(1, 2) == "`01 02`"
+    assert _select_answer(0, 10) == "`00 0A`"
+    assert _select_answer(0, 255) == "`00 FF`"
+    # And the guide's current text is written in exactly this notation.
+    guide = DEPLOYMENT_MD.read_text(encoding="utf-8")
+    assert _select_answer(*cardctl.SELFTEST_MIN_VERSION) in guide, (
+        f"{DEPLOYMENT_MD.name} does not mention the floor "
+        f"{cardctl.SELFTEST_MIN_VERSION} in the `MM mm` notation this test expects"
+    )
 
 
 def test_every_documented_status_word_is_translated_by_cardctl():
