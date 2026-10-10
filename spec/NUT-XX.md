@@ -379,6 +379,10 @@ This variant is suitable for higher-value cards where the issuer or user wants a
 
 Cards running Profile B+ SHOULD set a capability flag in the `GET_INFO` response indicating PIN-gated spending is enforced. Readers MUST check this flag and prompt the user for their PIN before attempting `SPEND_PROOF`.
 
+**Leaving Profile B+:**
+
+A card MAY let its holder return it to Profile B. In this implementation `CLEAR_PIN (0x43)` does so (applet 0.5, [D15](../docs/DECISIONS.md#d15)): it requires the PIN to have been verified in the current session and presented again, and leaves the card with no PIN set, so `SPEND_PROOF` no longer checks `pinVerifiedFlag` and `SET_PIN` may be called again. A blocked PIN cannot be cleared. Because the profile can change between taps, readers MUST read the PIN state from `GET_INFO` on every tap rather than remembering it per card.
+
 **NUT scope:** Profile B+ is not formally specified in this NUT. Implementors are encouraged to propose a Profile B+ amendment or separate NUT once the base Profile B implementation is stable.
 
 ---

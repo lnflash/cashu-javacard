@@ -97,7 +97,11 @@ silicon (applet 0.2 on the J3R180, in the
 
 The gate does not cover a card with **no PIN**. Cards ship without one, and
 until one is set a reader in range can drain the card. Setting a PIN is the
-holder's first job.
+holder's first job. Since applet 0.5 the holder can also take it off again:
+`CLEAR_PIN` ([D15](DECISIONS.md#d15)) needs a verified session and the PIN
+once more, costs a try when the PIN is wrong, and returns the card to the
+no-PIN state above by the holder's choice. It is not an unblock path: a
+blocked card never grants the session it needs, so #14 stands as written.
 
 **The blocked state had its own bug (ENG-615).** Every build before applet 0.3
 gated on `pinState == 1`, and a blocked card has `pinState == 2`, so three

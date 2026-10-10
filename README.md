@@ -92,6 +92,7 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 | `B0` | `30` | LOAD_PROOF | ✔ | Store a proof in the next free slot |
 | `B0` | `31` | CLEAR_SPENT | ✔ | Reclaim spent slots |
 | `B0` | `40`–`42` | VERIFY/SET/CHANGE_PIN | — / ✔ | PIN management |
+| `B0` | `43` | CLEAR_PIN | ✔ | Remove the PIN; the card is bearer again (applet 0.5) |
 | `B0` | `50` | LOCK_CARD | ✔ | Irreversibly disable writes |
 
 **Spending is PIN-gated once a PIN is set** (D13, v0.2.0): `SPEND_PROOF`,
@@ -103,7 +104,10 @@ the card for good and strand its balance: nothing else can sign for its
 proofs, there is no unblock path in this profile, and any reader in range can
 send those three tries (threat #14 in the
 [security model](docs/SECURITY-MODEL.md)). See
-[D13](docs/DECISIONS.md#d13); D12 records the earlier no-PIN design.
+[D13](docs/DECISIONS.md#d13); D12 records the earlier no-PIN design. A holder
+who has the PIN can take it off again with `CLEAR_PIN` (applet 0.5,
+[D15](docs/DECISIONS.md#d15)): the card is bearer again, and `SET_PIN` works
+once more. A blocked PIN cannot be cleared.
 
 Every applet build before 0.3 stopped gating once the PIN was blocked (ENG-615,
 fixed in 0.3), and 0.1 builds from before D13 gate no spend at all. Builds
@@ -112,7 +116,9 @@ mid-write can show a phantom proof (ENG-620, fixed in 0.4,
 [D14](docs/DECISIONS.md#d14)); `main` tracked a 0.3 build that does. A card
 whose `SELECT` answers anything below `00 04` (`00 01`, `00 02` or `00 03`)
 needs the CAP reinstalled; sweep its balance first, because the reinstall
-regenerates the card key.
+regenerates the card key. A card answering `00 04` is sound but has no
+`CLEAR_PIN` (added in 0.5); reinstall it only if the holder wants that, and
+sweep first just the same.
 
 **AID:** package `D2 76 00 00 85 01 02`, applet `…02 01`.
 
